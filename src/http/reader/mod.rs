@@ -42,20 +42,23 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for LimitedReader<R> {
 }
 
 pub struct ChunkedWriter<R> {
-    buffer: Option<[u8; 3 + CRLF.len() + 4096 + CRLF.len()]>,
-    already_read: usize,
-    max_read: usize,
     reader: R,
+    frame: Vec<u8>,
+    buf: Vec<u8>,
+    pos: usize,
     finished: bool,
 }
 
 impl<R> ChunkedWriter<R> {
+    const MAX_HEADER_SIZE: usize = 5;
+    const MAX_DATA_SIZE: usize = 4096;
+
     pub fn new(reader: R) -> Self {
         Self {
-            buffer: Some([0; 3 + CRLF.len() + 4096 + CRLF.len()]),
-            already_read: 0,
-            max_read: 0,
             reader,
+            frame: Vec::with_capacity(Self::MAX_HEADER_SIZE + CRLF.len() + Self::MAX_DATA_SIZE + CRLF.len()),
+            buf: Vec::with_capacity(Self::MAX_DATA_SIZE),
+            pos: 0,
             finished: false,
         }
     }
@@ -65,57 +68,70 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedWriter<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.finished {
+        if out.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if self.already_read >= self.max_read {
-            self.already_read = 3 + CRLF.len();
-            let mut take = self.buffer.take().unwrap();
-            let mut buf = ReadBuf::new(&mut take[self.already_read..self.already_read + 4096]);
-            if let Poll::Pending = pin!(&mut self.reader).poll_read(cx, &mut buf)? {
-                self.buffer.replace(take);
-                return Poll::Pending;
-            }
-            let n = buf.filled().len();
-            self.finished = n == 0;
-            self.max_read = self.already_read + n;
-            const DIGITS: &[u8] = b"0123456789abcdef";
-            let mut len = if n > 0xff {
-                take[2] = DIGITS[n & 0xf];
-                take[1] = DIGITS[(n >> 4) & 0xf];
-                take[0] = DIGITS[(n >> 8) & 0xf];
-                3
-            } else if n > 0xf {
-                take[2] = DIGITS[n & 0xf];
-                take[1] = DIGITS[(n >> 4) & 0xf];
-                2
-            } else {
-                take[2] = DIGITS[n & 0xf];
-                1
-            };
-            take[3] = CRLF[0];
-            take[4] = CRLF[1];
-            len += CRLF.len();
-            self.already_read -= len;
-            take[self.max_read] = CRLF[0];
-            take[self.max_read + 1] = CRLF[1];
-            self.max_read += CRLF.len();
-            self.buffer.replace(take);
-        }
-        #[allow(unused_mut)]
-        if let Some(mut buffer) = &mut self.buffer {
-            if self.already_read < self.max_read {
-                if let Poll::Pending =
-                    pin!(&mut &buffer[self.already_read..self.max_read]).poll_read(cx, buf)?
-                {
-                    return Poll::Pending;
-                }
-                self.already_read += buf.filled().len();
+        if self.pos >= self.frame.len() {
+            if self.finished {
                 return Poll::Ready(Ok(()));
             }
+            let this = &mut *self;
+            if this.buf.capacity() < Self::MAX_DATA_SIZE {
+                this.buf.reserve(Self::MAX_DATA_SIZE - this.buf.capacity());
+            }
+            if this.buf.len() < Self::MAX_DATA_SIZE {
+                // SAFETY: we extend the vector length to MAX_DATA_SIZE to obtain a writable buffer;
+                // only the first `n` bytes returned by the inner reader are initialized and later read.
+                // We never read uninitialized bytes.
+                unsafe { this.buf.set_len(Self::MAX_DATA_SIZE); }
+            }
+            let n = {
+                let mut rb = ReadBuf::new(&mut this.buf[..Self::MAX_DATA_SIZE]);
+                let Poll::Ready(_) = pin!(&mut this.reader).poll_read(cx, &mut rb)? else {
+                    return Poll::Pending;
+                };
+                rb.filled().len()
+            };
+            let mut n0 = n;
+            let mut i = 0usize;
+            #[allow(const_evaluatable_unchecked)]
+            let mut hex = [0u8; Self::MAX_HEADER_SIZE];
+            if n0 == 0 {
+                hex[0] = b'0';
+                i = 1;
+            } else {
+                while n0 > 0 {
+                    let d = (n0 & 0xf) as u8;
+                    hex[i] = b"0123456789abcdef"[d as usize];
+                    i += 1;
+                    n0 >>= 4;
+                }
+                hex[..i].reverse();
+            }
+            debug_assert!(i <= Self::MAX_HEADER_SIZE);
+            let needed = i + CRLF.len() + n + CRLF.len();
+            if this.frame.capacity() < needed {
+                this.frame.reserve(needed - this.frame.capacity());
+            }
+            this.frame.clear();
+            this.frame.extend_from_slice(&hex[..i]);
+            this.frame.extend_from_slice(CRLF);
+            // Invariant: only the first `n` bytes of `this.buf` are initialized and used below.
+            this.frame.extend_from_slice(&this.buf[..n]);
+            this.frame.extend_from_slice(CRLF);
+            this.pos = 0;
+            if n == 0 {
+                this.finished = true;
+            }
         }
+        let remaining = self.frame.len() - self.pos;
+        let to_copy = remaining.min(out.remaining());
+        let start = self.pos;
+        let end = start + to_copy;
+        out.put_slice(&self.frame[start..end]);
+        self.pos = end;
         Poll::Ready(Ok(()))
     }
 }
@@ -175,7 +191,11 @@ impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
             }
             Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Other,
-                "header line too longs",
+                format!(
+                    "header line too long: scanned {} bytes without CRLF (capacity {})",
+                    buffer.len(),
+                    capacity
+                ),
             )))
         }
         if self.cleaning {
@@ -334,5 +354,317 @@ pub(crate) mod buf_reader {
         fn consume(self: Pin<&mut Self>, amt: usize) {
             self.get_mut().buf.drain(..amt);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkedReader, ChunkedWriter};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+
+    struct MemReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl MemReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self { data, pos: 0 }
+        }
+    }
+
+    impl AsyncRead for MemReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.pos >= self.data.len() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let remaining = self.data.len() - self.pos;
+            let to_copy = remaining.min(buf.remaining());
+            let end = self.pos + to_copy;
+            let src = &self.data[self.pos..end];
+            let dst = buf.initialize_unfilled();
+            dst[..to_copy].copy_from_slice(src);
+            buf.advance(to_copy);
+            self.pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct LimitedMemReader {
+        inner: MemReader,
+        limit_per_poll: usize,
+    }
+
+    impl LimitedMemReader {
+        fn new(data: Vec<u8>, limit_per_poll: usize) -> Self {
+            Self {
+                inner: MemReader::new(data),
+                limit_per_poll,
+            }
+        }
+    }
+
+    impl AsyncRead for LimitedMemReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let remaining = self.inner.data.len().saturating_sub(self.inner.pos);
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let to_copy = remaining.min(buf.remaining()).min(self.limit_per_poll);
+            let end = self.inner.pos + to_copy;
+            let src = &self.inner.data[self.inner.pos..end];
+            let dst = buf.initialize_unfilled();
+            dst[..to_copy].copy_from_slice(src);
+            buf.advance(to_copy);
+            self.inner.pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingOnceReader {
+        inner: MemReader,
+        pending: bool,
+    }
+
+    impl PendingOnceReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self { inner: MemReader::new(data), pending: true }
+        }
+    }
+
+    impl AsyncRead for PendingOnceReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.pending {
+                self.pending = false;
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    struct PendingNReader {
+        inner: MemReader,
+        remaining: usize,
+    }
+
+    impl PendingNReader {
+        fn new(data: Vec<u8>, n: usize) -> Self {
+            Self { inner: MemReader::new(data), remaining: n }
+        }
+    }
+
+    impl AsyncRead for PendingNReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    fn noop_waker() -> std::task::Waker {
+        unsafe fn clone(_: *const ()) -> std::task::RawWaker { std::task::RawWaker::new(std::ptr::null(), &VTABLE) }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+        static VTABLE: std::task::RawWakerVTable = std::task::RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    async fn encode_with<R: AsyncRead + Unpin + Send + Sync>(r: R) -> Vec<u8> {
+        let mut w = ChunkedWriter::new(r);
+        let mut out = Vec::new();
+        w.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    async fn decode_chunked(data: Vec<u8>) -> Vec<u8> {
+        let r = MemReader::new(data);
+        let mut dec = ChunkedReader::data_only(r);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    fn parse_sizes(mut enc: &[u8]) -> Vec<usize> {
+        let mut sizes = Vec::new();
+        loop {
+            let mut j = 0;
+            while j < enc.len() && enc[j] != b'\r' {
+                j += 1;
+            }
+            let len = usize::from_str_radix(std::str::from_utf8(&enc[..j]).unwrap(), 16).unwrap();
+            sizes.push(len);
+            enc = &enc[j + 2..];
+            if len == 0 {
+                assert_eq!(&enc[..2], b"\r\n");
+                break;
+            }
+            enc = &enc[len + 2..];
+        }
+        sizes
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_roundtrip_various_lengths_and_contents() {
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        cases.push(Vec::new());
+        for &n in &[1usize, 2, 15, 16, 17, 255, 256, 4095, 4096, 4097, 10_000] {
+            let v: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            cases.push(v);
+        }
+        cases.push(b"hello\r\nworld".to_vec());
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut rand_bytes = vec![0u8; 12_345];
+        rng.fill(&mut rand_bytes[..]);
+        cases.push(rand_bytes);
+
+        for data in cases {
+            let enc = encode_with(MemReader::new(data.clone())).await;
+            assert!(enc.ends_with(b"0\r\n\r\n"));
+            let dec = decode_chunked(enc).await;
+            assert_eq!(dec, data);
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_respects_read_boundaries() {
+        let data: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let enc = encode_with(LimitedMemReader::new(data.clone(), 1000)).await;
+        let sizes = parse_sizes(&enc);
+        assert_eq!(sizes, vec![1000, 1000, 1000, 0]);
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_boundary_4096() {
+        let data = vec![1u8; 4096];
+        let enc = encode_with(MemReader::new(data.clone())).await;
+        assert!(enc.starts_with(b"1000\r\n"));
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_respects_read_boundaries_large_limit() {
+        let data: Vec<u8> = (0..10000).map(|i| (i % 251) as u8).collect();
+        let enc = encode_with(LimitedMemReader::new(data.clone(), 10000)).await;
+        let sizes = parse_sizes(&enc);
+        assert_eq!(sizes, vec![4096, 4096, 1808, 0]);
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_small_out_buffer_multiwrite() {
+        let data: Vec<u8> = (0..300).map(|i| (i % 251) as u8).collect();
+        let mut w = ChunkedWriter::new(MemReader::new(data.clone()));
+        let mut enc = Vec::new();
+        let mut tmp = [0u8; 2];
+        loop {
+            let n = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
+            if n == 0 { break; }
+            enc.extend_from_slice(&tmp[..n]);
+        }
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_propagates_pending_from_inner() {
+        let data: Vec<u8> = (0..128).map(|i| (i % 251) as u8).collect();
+        let mut w = ChunkedWriter::new(PendingOnceReader::new(data.clone()));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0u8; 8];
+        let mut rb = ReadBuf::new(&mut buf_space);
+        match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+            Poll::Pending => {}
+            _ => panic!("expected Pending on first poll"),
+        }
+        let before = rb.filled().len();
+        assert_eq!(before, 0);
+        match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+            Poll::Ready(Ok(())) => {}
+            _ => panic!("expected Ready after second poll"),
+        }
+        let n = rb.filled().len();
+        assert!(n > 0);
+        let mut enc = Vec::from(&rb.filled()[..]);
+        let mut tmp = [0u8; 256];
+        loop {
+            let m = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
+            if m == 0 { break; }
+            enc.extend_from_slice(&tmp[..m]);
+        }
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_propagates_multiple_pendings() {
+        let data: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+        let mut w = ChunkedWriter::new(PendingNReader::new(data.clone(), 3));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0u8; 16];
+        let mut rb = ReadBuf::new(&mut buf_space);
+        // First several polls should be Pending
+        for _ in 0..3 {
+            match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+                Poll::Pending => {}
+                _ => panic!("expected Pending"),
+            }
+            assert_eq!(rb.filled().len(), 0);
+        }
+        // Then Ready
+        match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+            Poll::Ready(Ok(())) => {}
+            _ => panic!("expected Ready after pendings"),
+        }
+        let mut enc = Vec::from(&rb.filled()[..]);
+        let mut tmp = [0u8; 256];
+        loop {
+            let m = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
+            if m == 0 { break; }
+            enc.extend_from_slice(&tmp[..m]);
+        }
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_full_roundtrip_including_headers() {
+        let data: Vec<u8> = (0..1234).map(|i| (i % 251) as u8).collect();
+        let enc = encode_with(MemReader::new(data)).await;
+        let mut rdr = ChunkedReader::new(MemReader::new(enc.clone()));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, enc);
     }
 }
