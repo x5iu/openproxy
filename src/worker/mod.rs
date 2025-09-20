@@ -1,4 +1,4 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::future::Future;
 use std::io::Cursor;
 use std::mem;
@@ -116,11 +116,18 @@ where
         Box::pin(async move {
             let mut is_invalid_key = false;
             let mut is_bad_request = false;
+            let mut err_msg: Option<Cow<str>> = None;
             loop {
                 let mut request = match http::Request::new(&mut incoming).await {
                     Ok(request) => request,
-                    Err(Error::HeaderTooLarge | Error::InvalidHeader) => {
+                    Err(Error::HeaderTooLarge) => {
                         is_bad_request = true;
+                        err_msg = Some("header too large".into());
+                        break;
+                    }
+                    Err(Error::InvalidHeader) => {
+                        is_bad_request = true;
+                        err_msg = Some("invalid header".into());
                         break;
                     }
                     Err(e) => return Err(ProxyError::Client(e)),
@@ -128,17 +135,20 @@ where
                 let p = crate::program();
                 let Some(host) = request.host() else {
                     is_bad_request = true;
+                    err_msg = Some("missing Host header".into());
                     break;
                 };
                 let p = p.read().await;
                 let Some(provider) = p.select_provider(host, request.path()) else {
                     is_bad_request = true;
+                    err_msg = Some("no provider matched".into());
                     break;
                 };
                 if !provider.authenticate(request.auth_key()).is_ok() {
                     #[cfg(debug_assertions)]
                     log::error!(provider = provider.kind().to_string(), header:serde = request.auth_key().map(|header| header.to_vec()); "authentication_failed");
                     is_invalid_key = true;
+                    err_msg = Some("authentication failed".into());
                     break;
                 }
                 let mut outgoing = self
@@ -168,17 +178,25 @@ where
                 }
             }
             if is_invalid_key {
+                let msg = err_msg.as_deref().unwrap_or("authentication failed");
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.as_bytes().len(),
+                    msg
+                );
                 incoming
-                    .write_all(
-                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
+                    .write_all(resp.as_bytes())
                     .await
                     .map_err(|e| ProxyError::Client(e.into()))?;
             } else if is_bad_request {
+                let msg = err_msg.as_deref().unwrap_or("bad request");
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.as_bytes().len(),
+                    msg
+                );
                 incoming
-                    .write_all(
-                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
+                    .write_all(resp.as_bytes())
                     .await
                     .map_err(|e| ProxyError::Client(e.into()))?;
             }
@@ -194,16 +212,25 @@ where
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static,
     {
         macro_rules! invalid {
-            ($respond:expr, $status:expr) => {{
-                #[allow(unused)]
-                $respond.send_response(
-                    httplib::Response::builder()
-                        .version(httplib::Version::HTTP_2)
-                        .status($status)
-                        .body(())
-                        .unwrap(),
-                    true,
-                );
+            ($respond:expr, $status:expr, $msg:expr) => {{
+                let msg: Cow<str> = $msg.into();
+                let body_bytes = msg.as_bytes();
+                let body: Vec<u8> = Vec::from(body_bytes);
+                let builder = httplib::Response::builder()
+                    .version(httplib::Version::HTTP_2)
+                    .status($status)
+                    .header("content-type", "text/plain; charset=utf-8");
+                let mut send = match $respond.send_response(builder.body(()).unwrap(), false) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
+                        return;
+                    }
+                };
+                if let Err(e) = send.send_data(bytes::Bytes::from(body), true) {
+                    log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
+                    return;
+                }
                 ()
             }};
         }
@@ -217,11 +244,11 @@ where
                 tokio::spawn(async move {
                     let p = crate::program();
                     let Some(authority) = request.uri().authority() else {
-                        return invalid!(respond, 400);
+                        return invalid!(respond, 400, "missing :authority");
                     };
                     let p = p.read().await;
                     let Some(provider) = p.select_provider(authority.host(), request.uri().path()) else {
-                        return invalid!(respond, 400);
+                        return invalid!(respond, 400, "no provider matched");
                     };
                     if provider.has_auth_keys() {
                         let mut auth_key = None;
@@ -245,10 +272,10 @@ where
                             }
                         }
                         let Some(auth_key) = auth_key else {
-                            return invalid!(respond, 401);
+                            return invalid!(respond, 401, "missing authentication");
                         };
                         if !provider.authenticate_key(auth_key).is_ok() {
-                            return invalid!(respond, 401);
+                            return invalid!(respond, 401, "authentication failed");
                         }
                     }
                     let host = authority.host().to_string();
@@ -288,22 +315,25 @@ where
                         Box::new(http::reader::ChunkedWriter::new(h2_stream_reader))
                     };
                     let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
-                    let Ok(mut req) = http::Request::new(req_reader).await else {
-                        return invalid!(respond, 400);
+                    let mut req = match http::Request::new(req_reader).await {
+                        Ok(req) => req,
+                        Err(e) => { return invalid!(respond, 400, e.to_string()); }
                     };
-                    let Ok(mut outgoing) = worker.get_outgoing_conn(provider).await else {
-                        return invalid!(respond, 502);
+                    let mut outgoing = match worker.get_outgoing_conn(provider).await {
+                        Ok(conn) => conn,
+                        Err(e) => { return invalid!(respond, 502, format!("upstream: {}", e.to_string())); }
                     };
-                    if let Err(_) = req.write_to(&mut outgoing).await {
-                        return invalid!(respond, 502);
+                    if let Err(e) = req.write_to(&mut outgoing).await {
+                        return invalid!(respond, 502, format!("upstream: {}", e.to_string()));
                     };
-                    let Ok(mut response) = http::Response::new(&mut outgoing).await else {
-                        return invalid!(respond, 502);
+                    let mut response = match http::Response::new(&mut outgoing).await {
+                        Ok(resp) => resp,
+                        Err(e) => { return invalid!(respond, 502, format!("upstream: {}", e.to_string())); }
                     };
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let mut parser = httparse::Response::new(&mut headers);
-                    if let Err(_) = parser.parse(response.payload.block()) {
-                        return invalid!(respond, 502);
+                    if let Err(e) = parser.parse(response.payload.block()) {
+                        return invalid!(respond, 502, format!("upstream: {}", e.to_string()));
                     };
                     let mut builder = httplib::Response::builder()
                         .version(httplib::Version::HTTP_2)
@@ -337,7 +367,7 @@ where
                         Ok(send) => send,
                         Err(e) => {
                             log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
-                            return invalid!(respond, 502);
+                            return;
                         }
                     };
                     loop {

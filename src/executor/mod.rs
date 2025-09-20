@@ -125,9 +125,15 @@ impl<P: PoolTrait> Executor<P> {
                 Err(ProxyError::Server(e)) => {
                     log::error!(alpn = "http/1.1", error = e.to_string(); "proxy_server_error");
                     #[allow(unused)]
-                    tls_stream.write_all(
-                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    ).await;
+                    {
+                        let body = format!("upstream: {}", e.to_string());
+                        let resp = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.as_bytes().len(),
+                            body
+                        );
+                        tls_stream.write_all(resp.as_bytes()).await;
+                    }
                 }
                 _ => (),
             }
