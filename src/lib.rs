@@ -48,7 +48,9 @@ pub async fn load_config(
         }
     } else {
         let p = program();
-        *p.write().await = np;
+        let mut guard = p.write().await;
+        let _ = guard.shutdown_tx.send(());
+        *guard = np;
     }
     Ok(())
 }
@@ -61,6 +63,7 @@ pub struct Program {
     tls_server_config: Arc<rustls::ServerConfig>,
     providers: Arc<Vec<Box<dyn Provider>>>,
     health_check_interval: u64,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl Program {
@@ -123,10 +126,12 @@ impl Program {
                 )?);
             }
         }
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Ok(Self {
             tls_server_config: Arc::new(tls_server_config),
             providers: Arc::new(providers),
             health_check_interval: config.health_check_interval.unwrap_or(60),
+            shutdown_tx,
         })
     }
 

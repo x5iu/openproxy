@@ -87,61 +87,69 @@ impl<P: PoolTrait> Executor<P> {
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static,
     {
         let p = crate::program();
-        let tls_server_config = p.read().await.tls_server_config.clone();
-        let tls_acceptor =
-            tokio_rustls::TlsAcceptor::from(tls_server_config);
-        let mut tls_stream = match tls_acceptor.accept(stream).await {
-            Ok(tls_stream) => tls_stream,
-            #[cfg_attr(not(debug_assertions), allow(unused))]
-            Err(e) => {
-                #[cfg(debug_assertions)]
-                log::error!(error = e.to_string(); "tls_accept_error");
-                return;
-            }
+        let (tls_server_config, mut shutdown_rx) = {
+            let guard = p.read().await;
+            (guard.tls_server_config.clone(), guard.shutdown_tx.subscribe())
         };
-        let mut worker = W::new(Arc::clone(&self.conn_injector));
-        let alpn = tls_stream.get_ref().1.alpn_protocol();
-        #[cfg(debug_assertions)]
-        log::info!(alpn = alpn.map(|v| String::from_utf8_lossy(v)); "alpn_protocol");
-        if matches!(alpn, Some(b"h2")) {
-            #[cfg_attr(not(debug_assertions), allow(unused))]
-            if let Err(e) = worker.proxy_h2(&mut tls_stream).await {
+        let conn_injector = Arc::clone(&self.conn_injector);
+        tokio::select! {
+            _ = shutdown_rx.recv() => {}
+            _ = async move {
+                let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_server_config);
+                let mut tls_stream = match tls_acceptor.accept(stream).await {
+                    Ok(tls_stream) => tls_stream,
+                    #[cfg_attr(not(debug_assertions), allow(unused))]
+                    Err(e) => {
+                        #[cfg(debug_assertions)]
+                        log::error!(error = e.to_string(); "tls_accept_error");
+                        return;
+                    }
+                };
+                let mut worker = W::new(conn_injector);
+                let alpn = tls_stream.get_ref().1.alpn_protocol();
                 #[cfg(debug_assertions)]
-                log::error!(alpn = "h2", error = e.to_string(); "proxy_h2_error");
-            }
-        } else {
-            match worker.proxy(&mut tls_stream).await {
-                Err(ProxyError::Abort(e)) => {
-                    if cfg!(debug_assertions)
-                        || !matches!(&e, crate::Error::IO(io_error) if io_error.kind() == io::ErrorKind::BrokenPipe)
-                    {
-                        log::error!(alpn = "http/1.1", error = e.to_string(); "proxy_abort_error");
+                log::info!(alpn = alpn.map(|v| String::from_utf8_lossy(v)); "alpn_protocol");
+                if matches!(alpn, Some(b"h2")) {
+                    #[cfg_attr(not(debug_assertions), allow(unused))]
+                    if let Err(e) = worker.proxy_h2(&mut tls_stream).await {
+                        #[cfg(debug_assertions)]
+                        log::error!(alpn = "h2", error = e.to_string(); "proxy_h2_error");
+                    }
+                } else {
+                    match worker.proxy(&mut tls_stream).await {
+                        Err(ProxyError::Abort(e)) => {
+                            if cfg!(debug_assertions)
+                                || !matches!(&e, crate::Error::IO(io_error) if io_error.kind() == io::ErrorKind::BrokenPipe)
+                            {
+                                log::error!(alpn = "http/1.1", error = e.to_string(); "proxy_abort_error");
+                            }
+                        }
+                        #[cfg(debug_assertions)]
+                        Err(ProxyError::Client(e)) => {
+                            log::warn!(alpn = "http/1.1", error = e.to_string(); "proxy_client_error");
+                        }
+                        Err(ProxyError::Server(e)) => {
+                            log::error!(alpn = "http/1.1", error = e.to_string(); "proxy_server_error");
+                            #[allow(unused)]
+                            {
+                                let body = format!("upstream: {}", e.to_string());
+                                let resp = format!(
+                                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.as_bytes().len(),
+                                    body
+                                );
+                                tls_stream.write_all(resp.as_bytes()).await;
+                            }
+                        }
+                        _ => (),
                     }
                 }
-                #[cfg(debug_assertions)]
-                Err(ProxyError::Client(e)) => {
-                    log::warn!(alpn = "http/1.1", error = e.to_string(); "proxy_client_error");
-                }
-                Err(ProxyError::Server(e)) => {
-                    log::error!(alpn = "http/1.1", error = e.to_string(); "proxy_server_error");
-                    #[allow(unused)]
-                    {
-                        let body = format!("upstream: {}", e.to_string());
-                        let resp = format!(
-                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.as_bytes().len(),
-                            body
-                        );
-                        tls_stream.write_all(resp.as_bytes()).await;
-                    }
-                }
-                _ => (),
-            }
+                #[allow(unused)]
+                tls_stream.flush().await;
+                #[allow(unused)]
+                tls_stream.shutdown().await;
+            } => {}
         }
-        #[allow(unused)]
-        tls_stream.flush().await;
-        #[allow(unused)]
-        tls_stream.shutdown().await;
     }
 }
 
