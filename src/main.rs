@@ -7,12 +7,12 @@ use signal_hook::iterator::exfiltrator::SignalOnly;
 use signal_hook::iterator::SignalsInfo;
 use tokio::net::TcpListener;
 
-use llm_proxy::executor::{Executor, Pool};
-use llm_proxy::worker::{Conn, Worker};
+use openproxy::executor::{Executor, Pool};
+use openproxy::worker::{Conn, Worker};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
-struct LLMProxy {
+struct OpenProxy {
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -33,8 +33,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let llm_proxy = LLMProxy::parse();
-    match llm_proxy.command {
+    let openproxy = OpenProxy::parse();
+    match openproxy.command {
         Some(Command::Start {
                  config,
                  enable_health_check,
@@ -48,19 +48,19 @@ async fn start(
     config: PathBuf,
     enable_health_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    llm_proxy::load_config(&config, true).await?;
-    log::info!(tls = true, debug = cfg!(debug_assertions); "start_llm_proxy");
+    openproxy::load_config(&config, true).await?;
+    log::info!(tls = true, debug = cfg!(debug_assertions); "start_openproxy");
     run_background(Arc::new(Executor::new(Pool::new())), enable_health_check);
     let mut signals =
         SignalsInfo::<SignalOnly>::new([signal::SIGTERM, signal::SIGINT, signal::SIGHUP])?;
     for signal in &mut signals {
         match signal {
             signal::SIGTERM | signal::SIGINT => break,
-            signal::SIGHUP => llm_proxy::force_update_config(&config).await?,
+            signal::SIGHUP => openproxy::force_update_config(&config).await?,
             _ => (),
         }
     }
-    log::info!(tls = true, debug = cfg!(debug_assertions); "exit_llm_proxy");
+    log::info!(tls = true, debug = cfg!(debug_assertions); "exit_openproxy");
     Ok(())
 }
 

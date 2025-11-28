@@ -1,4 +1,4 @@
-# LLM Proxy
+# OpenProxy
 
 A high-performance LLM (Large Language Model) proxy server written in Rust, designed to intelligently route requests between multiple LLM providers with advanced features like weighted load balancing, health checks, and connection pooling.
 
@@ -20,8 +20,8 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 ### From Source
 
 ```bash
-git clone https://github.com/x5iu/llm-proxy.git
-cd llm-proxy
+git clone https://github.com/x5iu/openproxy.git
+cd openproxy
 cargo build --release
 ```
 
@@ -30,12 +30,12 @@ cargo build --release
 ```bash
 # Pull and run the pre-built image
 docker run -d \
-  --name llm-proxy \
+  --name openproxy \
   -p 443:443 \
   -v /path/to/config.yml:/config.yml \
   -v /path/to/certificate.pem:/certs/certificate.pem \
   -v /path/to/private-key.pem:/certs/private-key.pem \
-  x5iu/llm-proxy:latest
+  x5iu/openproxy:latest
 ```
 
 ## Configuration
@@ -125,10 +125,10 @@ providers:
 
 ```bash
 # Basic usage
-./llm-proxy start -c config.yml
+./openproxy start -c config.yml
 
 # With health checks enabled
-./llm-proxy start -c config.yml --enable-health-check
+./openproxy start -c config.yml --enable-health-check
 ```
 
 ### Making Requests
