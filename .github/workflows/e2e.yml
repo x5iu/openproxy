@@ -44,6 +44,7 @@ jobs:
           cat > config.yml << EOF
           cert_file: $(pwd)/fullchain.pem
           private_key_file: $(pwd)/privkey.pem
+          https_port: 8443
 
           auth_keys:
             - ${AUTH_KEY}
@@ -63,7 +64,7 @@ jobs:
           ./target/release/openproxy start -c config.yml &
           sleep 3
           # Verify the server is running
-          curl -k https://localhost:443 || true
+          curl -k https://localhost:8443 || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -75,7 +76,7 @@ jobs:
 
       - name: Run E2E tests
         env:
-          OPENAI_BASE_URL: https://localhost:443/v1
+          OPENAI_BASE_URL: https://localhost:8443/v1
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
           REQUESTS_CA_BUNDLE: ${{ github.workspace }}/fullchain.pem
