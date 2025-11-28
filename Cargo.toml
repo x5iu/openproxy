@@ -1,12 +1,12 @@
 [package]
-name = "llm-proxy"
+name = "openproxy"
 authors = ["Hei <xuboyu72@gmail.com>"]
 version = "2.1.21"
 edition = "2021"
 description = "A LLM Proxy"
 
 [[bin]]
-name = "llm-proxy"
+name = "openproxy"
 path = "src/main.rs"
 
 [dependencies]

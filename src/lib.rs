@@ -36,7 +36,7 @@ pub async fn load_config(
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         structured_logger::Builder::with_level("INFO")
-            .with_target_writer("llm-proxy*", new_writer(io::stderr()))
+            .with_target_writer("openproxy*", new_writer(io::stderr()))
             .init();
     });
     log::info!(config:serde = config; "load_config");
