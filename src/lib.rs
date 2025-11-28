@@ -59,8 +59,10 @@ pub async fn force_update_config(path: impl AsRef<Path>) -> Result<(), Box<dyn s
     load_config(path, false).await
 }
 
-pub struct Program {
-    tls_server_config: Arc<rustls::ServerConfig>,
+struct Program {
+    tls_server_config: Option<Arc<rustls::ServerConfig>>,
+    https_port: Option<u16>,
+    http_port: Option<u16>,
     providers: Arc<Vec<Box<dyn Provider>>>,
     health_check_interval: u64,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -68,20 +70,45 @@ pub struct Program {
 
 impl Program {
     fn from_config(mut config: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        // Check if certificate and private key files exist
-        if !Path::new(config.cert_file).exists() {
-            return Err(format!("Certificate file not found: {}", config.cert_file).into());
-        }
-        if !Path::new(config.private_key_file).exists() {
-            return Err(format!("Private key file not found: {}", config.private_key_file).into());
-        }
-        let certs =
-            CertificateDer::pem_file_iter(config.cert_file)?.collect::<Result<Vec<_>, _>>()?;
-        let private_key = PrivateKeyDer::from_pem_file(config.private_key_file)?;
-        let mut tls_server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, private_key)?;
-        tls_server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // Validate configuration: at least one of https_port or http_port must be set
+        let https_port = config.https_port;
+        let http_port = config.http_port;
+
+        // For backwards compatibility, if neither port is specified but cert files exist, default to HTTPS on 443
+        let (https_port, http_port) = match (https_port, http_port, &config.cert_file, &config.private_key_file) {
+            (None, None, Some(_), Some(_)) => (Some(443), None),
+            (None, None, None, None) => {
+                return Err("Either https_port (with cert_file and private_key_file) or http_port must be configured".into());
+            }
+            (Some(_), _, None, _) | (Some(_), _, _, None) => {
+                return Err("https_port requires both cert_file and private_key_file".into());
+            }
+            (https, http, _, _) => (https, http),
+        };
+
+        // Load TLS configuration if HTTPS is enabled
+        let tls_server_config = if https_port.is_some() {
+            let cert_file = config.cert_file.ok_or("cert_file is required for HTTPS")?;
+            let private_key_file = config.private_key_file.ok_or("private_key_file is required for HTTPS")?;
+
+            if !Path::new(cert_file).exists() {
+                return Err(format!("Certificate file not found: {}", cert_file).into());
+            }
+            if !Path::new(private_key_file).exists() {
+                return Err(format!("Private key file not found: {}", private_key_file).into());
+            }
+            let certs =
+                CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
+            let private_key = PrivateKeyDer::from_pem_file(private_key_file)?;
+            let mut tls_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, private_key)?;
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Some(Arc::new(tls_config))
+        } else {
+            None
+        };
+
         let auth_keys = Arc::new(config.auth_keys.unwrap_or_else(Vec::new));
         let mut providers = Vec::new();
         config.providers.sort_by_key(|provider| provider.host);
@@ -128,7 +155,9 @@ impl Program {
         }
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Ok(Self {
-            tls_server_config: Arc::new(tls_server_config),
+            tls_server_config,
+            https_port,
+            http_port,
             providers: Arc::new(providers),
             health_check_interval: config.health_check_interval.unwrap_or(60),
             shutdown_tx,
@@ -174,9 +203,13 @@ impl Program {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Config<'a> {
     #[serde(skip_serializing)]
-    cert_file: &'a str,
+    cert_file: Option<&'a str>,
     #[serde(skip_serializing)]
-    private_key_file: &'a str,
+    private_key_file: Option<&'a str>,
+    /// Port for HTTPS connections (requires cert_file and private_key_file)
+    https_port: Option<u16>,
+    /// Port for HTTP connections (HTTP/1.1 only, no TLS)
+    http_port: Option<u16>,
     providers: Vec<ProviderConfig<'a>>,
     #[serde(skip_serializing)]
     auth_keys: Option<Vec<String>>,
@@ -307,4 +340,73 @@ pub enum Error {
 
     #[error("Invalid header")]
     InvalidHeader,
+}
+
+use executor::{Executor, Pool};
+use tokio::net::TcpListener;
+use worker::{Conn, Worker};
+
+/// Start the proxy server with the configured listeners
+pub async fn serve(enable_health_check: bool) {
+    let executor = Arc::new(Executor::new(Pool::new()));
+    let (https_port, http_port) = {
+        let p = program();
+        let guard = p.read().await;
+        (guard.https_port, guard.http_port)
+    };
+    log::info!(https_port = https_port, http_port = http_port, debug = cfg!(debug_assertions); "start_openproxy");
+
+    if enable_health_check {
+        executor.run_health_check::<Worker<Pool<Conn>>>();
+    }
+
+    // Start HTTPS listener if configured
+    if let Some(port) = https_port {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+                .await
+                .unwrap();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let executor = Arc::clone(&executor);
+                        tokio::spawn(async move {
+                            executor.execute::<Worker<Pool<Conn>>>(stream).await;
+                        });
+                    }
+                    #[cfg_attr(not(debug_assertions), allow(unused))]
+                    Err(e) => {
+                        #[cfg(debug_assertions)]
+                        log::error!(error = e.to_string(); "https_accept_error")
+                    }
+                }
+            }
+        });
+    }
+
+    // Start HTTP listener if configured (HTTP/1.1 only)
+    if let Some(port) = http_port {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+                .await
+                .unwrap();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let executor = Arc::clone(&executor);
+                        tokio::spawn(async move {
+                            executor.execute_http::<Worker<Pool<Conn>>>(stream).await;
+                        });
+                    }
+                    #[cfg_attr(not(debug_assertions), allow(unused))]
+                    Err(e) => {
+                        #[cfg(debug_assertions)]
+                        log::error!(error = e.to_string(); "http_accept_error")
+                    }
+                }
+            }
+        });
+    }
 }
