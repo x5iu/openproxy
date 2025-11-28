@@ -264,6 +264,11 @@ impl<'a> Payload<'a> {
                 }
             }
         };
+        // Security: Reject requests with both Content-Length and Transfer-Encoding headers
+        // to prevent HTTP request smuggling attacks (RFC 7230 Section 3.3.3)
+        if content_length.is_some() && transfer_encoding_chunked {
+            return Err(Error::InvalidHeader);
+        }
         let mut first_block_length = advanced;
         let header_length = header.len();
         let body = if let Some(real_content_length) = content_length {
@@ -389,7 +394,7 @@ impl<'a> Payload<'a> {
                     #[cfg(debug_assertions)]
                     log::info!(step = "ReadState::HostHeader"; "current_block:host_header");
                     select_provider!((self.host().unwrap(), self.path()) => provider);
-                    Ok(Some(Cow::Borrowed(provider.host_header().as_bytes())))
+                    Ok(Some(Cow::Owned(provider.host_header().as_bytes().to_vec())))
                 } else {
                     Box::pin(self.next_block()).await
                 }
@@ -401,7 +406,7 @@ impl<'a> Payload<'a> {
                     log::info!(step = "ReadState::AuthHeader"; "current_block:auth_header");
                     select_provider!((self.host().unwrap(), self.path()) => provider);
                     if let Some(auth_header) = provider.auth_header() {
-                        Ok(Some(Cow::Borrowed(auth_header.as_bytes())))
+                        Ok(Some(Cow::Owned(auth_header.as_bytes().to_vec())))
                     } else {
                         Box::pin(self.next_block()).await
                     }
