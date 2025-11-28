@@ -1,0 +1,84 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Generate self-signed certificate
+        run: |
+          openssl req -x509 -newkey rsa:4096 -keyout privkey.pem -out fullchain.pem -days 1 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+      - name: Generate auth key and config
+        run: |
+          AUTH_KEY=$(openssl rand -hex 32)
+          echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
+
+          cat > config.yml << EOF
+          cert_file: $(pwd)/fullchain.pem
+          private_key_file: $(pwd)/privkey.pem
+
+          auth_keys:
+            - ${AUTH_KEY}
+
+          providers:
+            - type: openai
+              host: localhost
+              endpoint: ${{ secrets.OPENAI_HOST }}
+              api_key: ${{ secrets.OPENAI_API_KEY }}
+          EOF
+
+      - name: Build openproxy
+        run: cargo build --release
+
+      - name: Start openproxy
+        run: |
+          ./target/release/openproxy start -c config.yml &
+          sleep 3
+          # Verify the server is running
+          curl -k https://localhost:443 || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install openai pydantic
+
+      - name: Run E2E tests
+        env:
+          OPENAI_BASE_URL: https://localhost:443/v1
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+          REQUESTS_CA_BUNDLE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          cd e2e
+          python test.py
