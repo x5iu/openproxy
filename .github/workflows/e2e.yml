@@ -51,7 +51,7 @@ jobs:
 
           providers:
             - type: openai
-              host: localhost
+              host: localhost:8443
               endpoint: ${{ secrets.OPENAI_HOST }}
               api_key: ${{ secrets.OPENAI_API_KEY }}
           EOF
