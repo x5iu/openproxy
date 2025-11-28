@@ -5,9 +5,21 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::http;
+
+/// Constant-time string comparison to prevent timing attacks.
+/// Returns true if the two strings are equal.
+#[inline]
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    // Length check is not constant-time, but this is acceptable since
+    // API key lengths are typically public knowledge (e.g., OpenAI keys are always 51 chars)
+    a_bytes.len() == b_bytes.len() && bool::from(a_bytes.ct_eq(b_bytes))
+}
 
 pub fn new_provider(
     kind: &str,
@@ -263,10 +275,12 @@ impl Provider for OpenAIProvider {
     }
 
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError> {
+        let input_key = key.trim_start_matches("Bearer ").trim();
+        // Use constant-time comparison to prevent timing attacks
         self.auth_keys
             .iter()
             .chain(self.provider_auth_keys.iter().flatten())
-            .find(|&k| k == key.trim_start_matches("Bearer ").trim())
+            .find(|&k| constant_time_eq(k, input_key))
             .map(|_| ())
             .ok_or(AuthenticationError)
     }
@@ -432,10 +446,12 @@ impl Provider for GeminiProvider {
     }
 
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError> {
+        let input_key = key.trim();
+        // Use constant-time comparison to prevent timing attacks
         self.auth_keys
             .iter()
             .chain(self.provider_auth_keys.iter().flatten())
-            .find(|&k| k == key.trim())
+            .find(|&k| constant_time_eq(k, input_key))
             .map(|_| ())
             .ok_or(AuthenticationError)
     }
@@ -624,10 +640,12 @@ impl Provider for AnthropicProvider {
     }
 
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError> {
+        let input_key = key.trim();
+        // Use constant-time comparison to prevent timing attacks
         self.auth_keys
             .iter()
             .chain(self.provider_auth_keys.iter().flatten())
-            .find(|&k| k == key.trim())
+            .find(|&k| constant_time_eq(k, input_key))
             .map(|_| ())
             .ok_or(AuthenticationError)
     }
