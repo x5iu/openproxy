@@ -1,5 +1,6 @@
 from typing import List
 
+import httpx
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -10,7 +11,8 @@ class EntitiesModel(BaseModel):
     animals: List[str]
 
 
-client = OpenAI()
+# Force HTTP/1.1 to avoid HTTP/2 protocol issues
+client = OpenAI(http_client=httpx.Client(http2=False))
 
 with client.responses.stream(
     model="gpt-4.1",

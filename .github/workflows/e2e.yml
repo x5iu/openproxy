@@ -41,7 +41,7 @@ jobs:
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
 
-          cat > config.yml << EOF
+          cat > config.yml <<EOF
           cert_file: $(pwd)/fullchain.pem
           private_key_file: $(pwd)/privkey.pem
           https_port: 8443
@@ -55,6 +55,9 @@ jobs:
               endpoint: ${{ secrets.OPENAI_HOST }}
               api_key: ${{ secrets.OPENAI_API_KEY }}
           EOF
+
+          # Debug: show generated config
+          cat config.yml
 
       - name: Build openproxy
         run: cargo build --release
@@ -72,7 +75,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install openai pydantic
+        run: pip install openai pydantic httpx
 
       - name: Run E2E tests
         env:
