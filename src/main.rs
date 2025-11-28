@@ -1,14 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use signal_hook::consts::signal;
 use signal_hook::iterator::exfiltrator::SignalOnly;
 use signal_hook::iterator::SignalsInfo;
-use tokio::net::TcpListener;
-
-use openproxy::executor::{Executor, Pool};
-use openproxy::worker::{Conn, Worker};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -49,8 +44,7 @@ async fn start(
     enable_health_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     openproxy::load_config(&config, true).await?;
-    log::info!(tls = true, debug = cfg!(debug_assertions); "start_openproxy");
-    run_background(Arc::new(Executor::new(Pool::new())), enable_health_check);
+    openproxy::serve(enable_health_check).await;
     let mut signals =
         SignalsInfo::<SignalOnly>::new([signal::SIGTERM, signal::SIGINT, signal::SIGHUP])?;
     for signal in &mut signals {
@@ -60,30 +54,6 @@ async fn start(
             _ => (),
         }
     }
-    log::info!(tls = true, debug = cfg!(debug_assertions); "exit_openproxy");
+    log::info!("exit_openproxy");
     Ok(())
-}
-
-fn run_background(executor: Arc<Executor<Pool<Conn>>>, enable_health_check: bool) {
-    if enable_health_check {
-        executor.run_health_check::<Worker<Pool<Conn>>>();
-    }
-    tokio::spawn(async move {
-        let listener = TcpListener::bind("0.0.0.0:443").await.unwrap();
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let executor = Arc::clone(&executor);
-                    tokio::spawn(async move {
-                        executor.execute::<Worker<Pool<Conn>>>(stream).await;
-                    });
-                }
-                #[cfg_attr(not(debug_assertions), allow(unused))]
-                Err(e) => {
-                    #[cfg(debug_assertions)]
-                    log::error!(error = e.to_string(); "tcp_accept_error")
-                }
-            }
-        }
-    });
 }

@@ -91,6 +91,10 @@ impl<P: PoolTrait> Executor<P> {
             let guard = p.read().await;
             (guard.tls_server_config.clone(), guard.shutdown_tx.subscribe())
         };
+        let Some(tls_server_config) = tls_server_config else {
+            log::error!("TLS server config not available for HTTPS connection");
+            return;
+        };
         let conn_injector = Arc::clone(&self.conn_injector);
         tokio::select! {
             _ = shutdown_rx.recv() => {}
@@ -148,6 +152,55 @@ impl<P: PoolTrait> Executor<P> {
                 tls_stream.flush().await;
                 #[allow(unused)]
                 tls_stream.shutdown().await;
+            } => {}
+        }
+    }
+
+    /// Execute HTTP (plaintext) connection - HTTP/1.1 only, no HTTP/2 support
+    pub async fn execute_http<W: WorkerTrait<P>>(&self, mut stream: TcpStream)
+    where
+        <P as PoolTrait>::Item: Unpin + Send + Sync + 'static,
+    {
+        let p = crate::program();
+        let mut shutdown_rx = p.read().await.shutdown_tx.subscribe();
+        let conn_injector = Arc::clone(&self.conn_injector);
+        tokio::select! {
+            _ = shutdown_rx.recv() => {}
+            _ = async {
+                let mut worker = W::new(conn_injector);
+                #[cfg(debug_assertions)]
+                log::info!(protocol = "http/1.1"; "http_connection");
+                match worker.proxy(&mut stream).await {
+                    Err(ProxyError::Abort(e)) => {
+                        if cfg!(debug_assertions)
+                            || !matches!(&e, crate::Error::IO(io_error) if io_error.kind() == io::ErrorKind::BrokenPipe)
+                        {
+                            log::error!(protocol = "http/1.1", error = e.to_string(); "proxy_abort_error");
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    Err(ProxyError::Client(e)) => {
+                        log::warn!(protocol = "http/1.1", error = e.to_string(); "proxy_client_error");
+                    }
+                    Err(ProxyError::Server(e)) => {
+                        log::error!(protocol = "http/1.1", error = e.to_string(); "proxy_server_error");
+                        #[allow(unused)]
+                        {
+                            let body = format!("upstream: {}", e.to_string());
+                            let resp = format!(
+                                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.as_bytes().len(),
+                                body
+                            );
+                            stream.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                    _ => (),
+                }
+                #[allow(unused)]
+                stream.flush().await;
+                #[allow(unused)]
+                stream.shutdown().await;
             } => {}
         }
     }

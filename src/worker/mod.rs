@@ -50,11 +50,12 @@ where
     ) -> Pin<Box<dyn Future<Output=Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Send;
-    fn proxy<'a>(
+    fn proxy<'a, S>(
         &'a mut self,
-        incoming: &'a mut TlsIncomingStream,
+        incoming: &'a mut S,
     ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
     where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Unpin + Send + Sync;
     fn proxy_h2<'a>(
         &'a mut self,
@@ -106,11 +107,12 @@ where
         })
     }
 
-    fn proxy<'a>(
+    fn proxy<'a, S>(
         &'a mut self,
-        mut incoming: &'a mut TlsIncomingStream,
+        mut incoming: &'a mut S,
     ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
     where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Unpin + Send + Sync,
     {
         Box::pin(async move {
