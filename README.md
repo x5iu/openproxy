@@ -1,5 +1,7 @@
 # OpenProxy
 
+[![E2E Tests](https://github.com/x5iu/openproxy/actions/workflows/e2e.yml/badge.svg)](https://github.com/x5iu/openproxy/actions/workflows/e2e.yml)
+
 A high-performance LLM (Large Language Model) proxy server written in Rust, designed to intelligently route requests between multiple LLM providers with advanced features like weighted load balancing, health checks, and connection pooling.
 
 ## Features
@@ -10,10 +12,12 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
 - **Authentication & Authorization**: Flexible API key management with per-provider and global authentication
 - **Protocol Support**: Full HTTP/1.1 and HTTP/2 support with automatic protocol negotiation
+- **HTTP & HTTPS Support**: Run with TLS encryption (HTTPS) or plaintext HTTP for internal networks
 - **TLS Encryption**: Secure communication using [rustls](https://crates.io/crates/tokio-rustls) with modern cipher suites
 - **Configuration Management**: YAML-based configuration with hot-reload capability (SIGHUP)
 - **Structured Logging**: Comprehensive logging for monitoring and debugging
 - **Container Ready**: Docker support for easy deployment and scaling
+- **CI/CD Ready**: GitHub Actions workflow for E2E testing
 
 ## Installation
 
@@ -52,9 +56,16 @@ The proxy requires TLS certificates for secure HTTPS communication. You need two
 Create a `config.yml` file with your LLM provider configurations:
 
 ```yaml
-# TLS Configuration
+# TLS Configuration (required for HTTPS)
 cert_file: "/certs/certificate.pem"
 private_key_file: "/certs/private-key.pem"
+
+# Port Configuration
+# - https_port: HTTPS with TLS (requires cert_file and private_key_file)
+# - http_port: Plain HTTP without TLS (HTTP/1.1 only, useful for internal networks)
+# At least one port must be configured. Both can be enabled simultaneously.
+https_port: 443
+# http_port: 8080  # Uncomment to enable HTTP
 
 # Global Authentication Keys
 auth_keys:
@@ -124,16 +135,34 @@ providers:
 ### Start the Proxy Server
 
 ```bash
-# Basic usage
+# Basic usage (HTTPS on configured port)
 ./openproxy start -c config.yml
 
 # With health checks enabled
 ./openproxy start -c config.yml --enable-health-check
 ```
 
+### HTTP-only Mode (No TLS)
+
+For internal networks or development, you can run without TLS:
+
+```yaml
+# config.yml - HTTP only (no TLS certificates needed)
+http_port: 8080
+
+auth_keys:
+  - "your-auth-key"
+
+providers:
+  - type: "openai"
+    host: "localhost:8080"
+    endpoint: "api.openai.com"
+    api_key: "sk-your-openai-api-key"
+```
+
 ### Making Requests
 
-The proxy server listens on port 443 and routes requests based on the `Host` header:
+The proxy server routes requests based on the `Host` header:
 
 ```bash
 # OpenAI API request
@@ -170,12 +199,36 @@ curl -X POST https://localhost/v1/messages \
 - **TLS 1.3**: Modern encryption standards with forward secrecy
 - **API Key Validation**: Multi-layer authentication system
 - **No Key Logging**: Secure handling of sensitive credentials
-- **Rate Limiting**: Built-in protection against abuse
+- **Constant-Time Comparison**: API key validation uses constant-time comparison to prevent timing attacks
 
 ## Signal Handling
 
 - **SIGTERM/SIGINT**: Graceful shutdown
 - **SIGHUP**: Reload configuration without restart
+
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run a specific test
+cargo test test_name
+```
+
+### E2E Testing
+
+The project includes end-to-end tests that run via GitHub Actions. The E2E tests verify the proxy works correctly with real OpenAI API calls.
+
+To run E2E tests locally:
+
+```bash
+cd e2e
+pip install openai pydantic "httpx[http2]"
+python test.py
+```
 
 ## License
 
