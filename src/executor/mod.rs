@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,14 +207,27 @@ impl<P: PoolTrait> Executor<P> {
     }
 }
 
+/// Default maximum connections per endpoint to prevent resource exhaustion DoS
+const DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT: usize = 100;
+
 pub struct Pool<T> {
     injectors: RwLock<BTreeMap<String, Injector<T>>>,
+    /// Track connection count per endpoint
+    conn_counts: RwLock<BTreeMap<String, Arc<AtomicUsize>>>,
+    /// Maximum connections allowed per endpoint
+    max_connections_per_endpoint: usize,
 }
 
 impl<T> Pool<T> {
     pub fn new() -> Self {
+        Self::with_max_connections(DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT)
+    }
+
+    pub fn with_max_connections(max_connections_per_endpoint: usize) -> Self {
         Pool {
             injectors: RwLock::new(BTreeMap::new()),
+            conn_counts: RwLock::new(BTreeMap::new()),
+            max_connections_per_endpoint,
         }
     }
 }
@@ -228,18 +242,24 @@ impl<T> PoolTrait for Pool<T> {
         L: Ord + Sync + ?Sized,
     {
         Box::pin(async move {
-            self.injectors
+            let result = self.injectors
                 .read()
                 .await
                 .get(label)
-                .map(|injector| {
+                .and_then(|injector| {
                     if let Steal::Success(v) = injector.steal() {
                         Some(v)
                     } else {
                         None
                     }
-                })
-                .flatten()
+                });
+            // Decrement connection count when taking from pool
+            if result.is_some() {
+                if let Some(count) = self.conn_counts.read().await.get(label) {
+                    count.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            result
         })
     }
 
@@ -250,17 +270,43 @@ impl<T> PoolTrait for Pool<T> {
         L: ToString + Sync + Ord + ?Sized,
     {
         Box::pin(async move {
+            // Initialize data structures if needed
             if !self.injectors.read().await.contains_key(label) {
                 let mut injectors = self.injectors.write().await;
+                let mut conn_counts = self.conn_counts.write().await;
                 if !injectors.contains_key(label) {
                     injectors.insert(label.to_string(), Injector::new());
+                    conn_counts.insert(label.to_string(), Arc::new(AtomicUsize::new(0)));
                 }
             }
-            self.injectors
+
+            // Check if we're at capacity before adding
+            let current_count = self.conn_counts
                 .read()
                 .await
                 .get(label)
-                .map(|injector| injector.push(value));
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0);
+
+            if current_count >= self.max_connections_per_endpoint {
+                // Pool is full, drop the connection instead of adding it
+                // The connection will be dropped when `value` goes out of scope
+                log::warn!(
+                    endpoint = label.to_string(),
+                    current = current_count,
+                    max = self.max_connections_per_endpoint;
+                    "connection_pool_full"
+                );
+                return;
+            }
+
+            // Add to pool and increment count
+            if let Some(injector) = self.injectors.read().await.get(label) {
+                injector.push(value);
+                if let Some(count) = self.conn_counts.read().await.get(label) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         })
     }
 }
