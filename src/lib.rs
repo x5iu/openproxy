@@ -165,6 +165,8 @@ impl Program {
     }
 
     pub fn select_provider(&self, host: &str, path: &str) -> Option<&dyn Provider> {
+        // Strip port from incoming host for comparison
+        let host_without_port = http::strip_port(host);
         let healthy_providers: Vec<&dyn Provider> = self
             .providers
             .iter()
@@ -173,15 +175,17 @@ impl Program {
                     return None;
                 }
                 let (provider_host, provider_path_prefix) = http::split_host_path(provider.host());
+                // Strip port from provider host for comparison
+                let provider_host_without_port = http::strip_port(provider_host);
                 let selected = if let Some(provider_path_prefix) = provider_path_prefix {
-                    provider_host == host
+                    (provider_host == host || provider_host_without_port == host_without_port)
                         && path.starts_with(provider_path_prefix)
                         && matches!(
                             path.as_bytes().get(provider_path_prefix.len()),
                             None | Some(b'/')
                         )
                 } else {
-                    provider_host == host
+                    provider_host == host || provider_host_without_port == host_without_port
                 };
                 selected.then(|| &**provider)
             })

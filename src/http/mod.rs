@@ -491,6 +491,23 @@ pub(crate) fn split_host_path(host: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Strip port from host string (e.g., "localhost:8443" -> "localhost")
+#[inline]
+pub(crate) fn strip_port(host: &str) -> &str {
+    // Handle IPv6 addresses like [::1]:8080
+    if let Some(bracket_idx) = host.rfind(']') {
+        if let Some(colon_idx) = host[bracket_idx..].find(':') {
+            return &host[..bracket_idx + colon_idx];
+        }
+        return host;
+    }
+    // Handle regular host:port
+    if let Some(colon_idx) = host.rfind(':') {
+        return &host[..colon_idx];
+    }
+    host
+}
+
 pub(crate) fn get_req_path(header: &str) -> Range<usize> {
     // Extract URL part (between first and second space)
     let (url_start, url_end) = if let Some(first_whitespace_idx) = header.find(' ') {
