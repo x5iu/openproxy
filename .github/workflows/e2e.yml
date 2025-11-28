@@ -75,7 +75,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install openai pydantic httpx
+        run: pip install openai pydantic "httpx[http2]"
 
       - name: Run E2E tests
         env:
