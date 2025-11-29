@@ -1,0 +1,60 @@
+from typing import List
+
+import httpx
+from openai import OpenAI
+from pydantic import BaseModel
+
+
+class EntitiesModel(BaseModel):
+    attributes: List[str]
+    colors: List[str]
+    animals: List[str]
+
+
+def run_test(client: OpenAI):
+    print(f"\n{'='*50}")
+    print("Testing HTTP (no TLS)")
+    print('='*50)
+
+    with client.responses.stream(
+        model="gpt-4.1",
+        input=[
+            {"role": "system", "content": "Extract entities from the input text"},
+            {
+                "role": "user",
+                "content": "The quick brown fox jumps over the lazy dog with piercing blue eyes",
+            },
+        ],
+        text_format=EntitiesModel,
+    ) as stream:
+        for event in stream:
+            if event.type == "response.refusal.delta":
+                print(event.delta, end="")
+            elif event.type == "response.output_text.delta":
+                print(event.delta, end="")
+            elif event.type == "response.error":
+                print(event.error, end="")
+            elif event.type == "response.completed":
+                print("Completed")
+
+        final_response = stream.get_final_response()
+        print(final_response)
+
+        # Parse the output and validate animals
+        output_text = final_response.output[0].content[0].text
+        result = EntitiesModel.model_validate_json(output_text)
+        animals_lower = [a.lower() for a in result.animals]
+
+        assert "fox" in animals_lower, f"Expected 'fox' in animals, got: {result.animals}"
+        assert "dog" in animals_lower, f"Expected 'dog' in animals, got: {result.animals}"
+
+        print("✓ HTTP (no TLS) test passed!")
+
+
+# Test with HTTP/1.1 (HTTP without TLS only supports HTTP/1.1)
+client = OpenAI(http_client=httpx.Client(http2=False))
+run_test(client)
+
+print("\n" + "="*50)
+print("✓ All HTTP tests passed!")
+print("="*50)
