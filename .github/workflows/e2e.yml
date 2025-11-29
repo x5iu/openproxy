@@ -45,6 +45,7 @@ jobs:
           cert_file: $(pwd)/fullchain.pem
           private_key_file: $(pwd)/privkey.pem
           https_port: 8443
+          http_port: 8080
 
           auth_keys:
             - ${AUTH_KEY}
@@ -52,6 +53,10 @@ jobs:
           providers:
             - type: openai
               host: localhost:8443
+              endpoint: ${{ secrets.OPENAI_HOST }}
+              api_key: ${{ secrets.OPENAI_API_KEY }}
+            - type: openai
+              host: localhost:8080
               endpoint: ${{ secrets.OPENAI_HOST }}
               api_key: ${{ secrets.OPENAI_API_KEY }}
           EOF
@@ -66,8 +71,9 @@ jobs:
         run: |
           ./target/release/openproxy start -c config.yml &
           sleep 3
-          # Verify the server is running
+          # Verify the servers are running
           curl -k https://localhost:8443 || true
+          curl http://localhost:8080 || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -77,7 +83,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install openai pydantic "httpx[http2]"
 
-      - name: Run E2E tests
+      - name: Run HTTPS E2E tests
         env:
           OPENAI_BASE_URL: https://localhost:8443/v1
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
@@ -85,4 +91,12 @@ jobs:
           REQUESTS_CA_BUNDLE: ${{ github.workspace }}/fullchain.pem
         run: |
           cd e2e
-          python test.py
+          python test_https.py
+
+      - name: Run HTTP E2E tests
+        env:
+          OPENAI_BASE_URL: http://localhost:8080/v1
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          cd e2e
+          python test_http.py

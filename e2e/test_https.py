@@ -13,7 +13,7 @@ class EntitiesModel(BaseModel):
 
 def run_test(client: OpenAI, protocol: str):
     print(f"\n{'='*50}")
-    print(f"Testing with {protocol}")
+    print(f"Testing HTTPS with {protocol}")
     print('='*50)
 
     with client.responses.stream(
@@ -48,7 +48,7 @@ def run_test(client: OpenAI, protocol: str):
         assert "fox" in animals_lower, f"Expected 'fox' in animals, got: {result.animals}"
         assert "dog" in animals_lower, f"Expected 'dog' in animals, got: {result.animals}"
 
-        print(f"✓ {protocol} test passed!")
+        print(f"✓ HTTPS + {protocol} test passed!")
 
 
 # Test with HTTP/1.1
@@ -60,5 +60,5 @@ client_http2 = OpenAI(http_client=httpx.Client(http2=True))
 run_test(client_http2, "HTTP/2")
 
 print("\n" + "="*50)
-print("✓ All tests passed!")
+print("✓ All HTTPS tests passed!")
 print("="*50)
