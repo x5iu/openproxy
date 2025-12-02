@@ -6,7 +6,6 @@ pub mod worker;
 use std::fmt::Formatter;
 use std::fs;
 use std::io;
-use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Once};
 
@@ -253,7 +252,7 @@ struct ProviderConfig<'a> {
 trait APIKeysTrait<'a> {
     type Item;
     fn pop(&mut self) -> Option<Self::Item>;
-    fn extend_from_single(&mut self, key: &'a str);
+    fn extend_from_single(&mut self, keys: APIKeys<'a>);
     fn extend_from_multiple(&mut self, keys: Vec<&'a str>);
 }
 
@@ -271,9 +270,11 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
         self.get_or_insert_with(Vec::new).pop()
     }
 
-    fn extend_from_single(&mut self, key: &'a str) {
-        self.get_or_insert_with(Vec::new)
-            .push(APIKeyConfig { key, weight: None });
+    fn extend_from_single(&mut self, keys: APIKeys<'a>) {
+        let vec = self.get_or_insert_with(Vec::new);
+        for key in keys.into_vec() {
+            vec.push(APIKeyConfig { key, weight: None });
+        }
     }
 
     fn extend_from_multiple(&mut self, keys: Vec<&'a str>) {
@@ -284,7 +285,7 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize)]
 struct APIKeys<'a> {
     #[serde(borrow)]
     keys: Vec<&'a str>,

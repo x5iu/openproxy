@@ -45,7 +45,7 @@ impl<'a> Request<'a> {
 
     pub async fn write_to<W: AsyncWrite + Unpin>(
         &mut self,
-        mut writer: &mut W,
+        writer: &mut W,
     ) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
@@ -94,7 +94,7 @@ impl<'a> Response<'a> {
 
     pub async fn write_to<W: AsyncWrite + Unpin>(
         &mut self,
-        mut writer: &mut W,
+        writer: &mut W,
     ) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
