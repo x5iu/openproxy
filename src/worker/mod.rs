@@ -146,7 +146,7 @@ where
                     err_msg = Some("no provider matched".into());
                     break;
                 };
-                if !provider.authenticate(request.auth_key()).is_ok() {
+                if provider.authenticate(request.auth_key()).is_err() {
                     #[cfg(debug_assertions)]
                     log::error!(provider = provider.kind().to_string(), header:serde = request.auth_key().map(|header| header.to_vec()); "authentication_failed");
                     is_invalid_key = true;
@@ -258,25 +258,23 @@ where
                             auth_key = request
                                 .headers()
                                 .get(auth_header_key.trim_end_matches(|ch| ch == ' ' || ch == ':'))
-                                .map(|v| v.to_str().ok())
-                                .flatten();
+                                .and_then(|v| v.to_str().ok());
                         }
                         if auth_key.is_none() {
                             if let Some(auth_query_key) = provider.auth_query_key() {
                                 auth_key = request
                                     .uri()
                                     .query()
-                                    .map(|query| {
+                                    .and_then(|query| {
                                         http::get_auth_query_range(query, auth_query_key)
                                             .map(|range| &query[range])
                                     })
-                                    .flatten()
                             }
                         }
                         let Some(auth_key) = auth_key else {
                             return invalid!(respond, 401, "missing authentication");
                         };
-                        if !provider.authenticate_key(auth_key).is_ok() {
+                        if provider.authenticate_key(auth_key).is_err() {
                             return invalid!(respond, 401, "authentication failed");
                         }
                     }
@@ -467,9 +465,8 @@ where
             };
             if conn.health_check().await.is_ok() {
                 return Some(conn);
-            } else {
-                ConnTrait::shutdown(&mut conn).await;
             }
+            ConnTrait::shutdown(&mut conn).await;
             retry_times += 1;
         }
         None

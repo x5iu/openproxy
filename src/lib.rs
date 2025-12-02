@@ -49,7 +49,10 @@ pub async fn load_config(
     } else {
         let p = program();
         let mut guard = p.write().await;
-        let _ = guard.shutdown_tx.send(());
+        // Send shutdown signal to existing tasks before updating config
+        if let Err(e) = guard.shutdown_tx.send(()) {
+            log::warn!(error = e.to_string(); "no_active_listeners_for_shutdown_signal");
+        }
         *guard = np;
     }
     Ok(())
@@ -114,7 +117,12 @@ impl Program {
         config.providers.sort_by_key(|provider| provider.host);
         for mut provider in config.providers {
             let mut api_keys = provider.api_keys;
-            api_keys.append(provider.api_key);
+
+            // Extend from single key if present
+            if let Some(single_key) = provider.api_key {
+                api_keys.extend_from_single(single_key);
+            }
+
             if let Some(api_key_configs @ [_, _, ..]) = api_keys.as_deref() {
                 debug_assert!(api_key_configs.len() > 1);
                 let health_check_config = provider.health_check_config.take();
@@ -245,7 +253,8 @@ struct ProviderConfig<'a> {
 trait APIKeysTrait<'a> {
     type Item;
     fn pop(&mut self) -> Option<Self::Item>;
-    fn append(&mut self, others: Option<APIKeys<'a>>);
+    fn extend_from_single(&mut self, key: &'a str);
+    fn extend_from_multiple(&mut self, keys: Vec<&'a str>);
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -262,23 +271,40 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
         self.get_or_insert_with(Vec::new).pop()
     }
 
-    fn append(&mut self, others: Option<APIKeys<'a>>) {
-        if let Some(APIKeys(others)) = others {
-            for key in others {
-                self.get_or_insert_with(Vec::new)
-                    .push(APIKeyConfig { key, weight: None });
-            }
+    fn extend_from_single(&mut self, key: &'a str) {
+        self.get_or_insert_with(Vec::new)
+            .push(APIKeyConfig { key, weight: None });
+    }
+
+    fn extend_from_multiple(&mut self, keys: Vec<&'a str>) {
+        let vec = self.get_or_insert_with(Vec::new);
+        for key in keys {
+            vec.push(APIKeyConfig { key, weight: None });
         }
     }
 }
 
-struct APIKeys<'a>(Vec<&'a str>);
+#[derive(serde::Serialize, serde::Deserialize)]
+struct APIKeys<'a> {
+    #[serde(borrow)]
+    keys: Vec<&'a str>,
+}
 
-impl<'a> Deref for APIKeys<'a> {
-    type Target = [&'a str];
+impl<'a> APIKeys<'a> {
+    fn into_vec(self) -> Vec<&'a str> {
+        self.keys
+    }
+}
 
-    fn deref(&self) -> &Self::Target {
-        self.0.as_slice()
+impl<'a> From<&'a str> for APIKeys<'a> {
+    fn from(key: &'a str) -> Self {
+        Self { keys: vec![key] }
+    }
+}
+
+impl<'a> From<Vec<&'a str>> for APIKeys<'a> {
+    fn from(keys: Vec<&'a str>) -> Self {
+        Self { keys }
     }
 }
 
@@ -300,15 +326,18 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
             where
                 E: serde::de::Error,
             {
-                Ok(APIKeys(vec![v]))
+                Ok(APIKeys { keys: vec![v] })
             }
 
-            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
-                    .map(APIKeys)
+                let mut keys = Vec::new();
+                while let Some(key) = seq.next_element::<&'de str>()? {
+                    keys.push(key);
+                }
+                Ok(APIKeys { keys })
             }
         }
 

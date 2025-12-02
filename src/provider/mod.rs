@@ -261,16 +261,26 @@ impl Provider for OpenAIProvider {
         let Some(header) = header else {
             return Err(AuthenticationError);
         };
-        let Ok(header_str) = std::str::from_utf8(header) else {
-            #[cfg(debug_assertions)]
-            log::error!(provider = "openai", header:serde = header.to_vec(); "invalid_authentication_header");
-            return Err(AuthenticationError);
+
+        // Try to parse header as UTF-8 string
+        let header_str = match std::str::from_utf8(header) {
+            Ok(s) => s,
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                log::error!(provider = "openai", header:serde = header.to_vec(); "invalid_authentication_header");
+                return Err(AuthenticationError);
+            }
         };
+
         #[cfg(debug_assertions)]
         log::info!(provider = "openai", header = header_str; "authentication");
+
+        // Validate the header matches expected format
         if !http::is_header(header_str, http::HEADER_AUTHORIZATION) {
             return Err(AuthenticationError);
         }
+
+        // Extract and validate the API key
         self.authenticate_key(&header_str[http::HEADER_AUTHORIZATION.len()..])
     }
 
@@ -432,16 +442,26 @@ impl Provider for GeminiProvider {
         let Some(key) = key else {
             return Err(AuthenticationError);
         };
-        let Ok(mut key_str) = std::str::from_utf8(key) else {
-            #[cfg(debug_assertions)]
-            log::error!(provider = "gemini", key:serde = key.to_vec(); "invalid_authentication_key");
-            return Err(AuthenticationError);
+
+        // Try to parse key as UTF-8 string
+        let mut key_str = match std::str::from_utf8(key) {
+            Ok(s) => s,
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                log::error!(provider = "gemini", key:serde = key.to_vec(); "invalid_authentication_key");
+                return Err(AuthenticationError);
+            }
         };
+
         #[cfg(debug_assertions)]
         log::info!(provider = "gemini", key = key_str; "authentication");
+
+        // Strip header prefix if present
         if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
             key_str = &key_str[http::HEADER_X_GOOG_API_KEY.len()..];
         }
+
+        // Validate the key
         self.authenticate_key(key_str)
     }
 
@@ -626,16 +646,26 @@ impl Provider for AnthropicProvider {
         let Some(header) = header else {
             return Err(AuthenticationError);
         };
-        let Ok(header_str) = std::str::from_utf8(header) else {
-            #[cfg(debug_assertions)]
-            log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
-            return Err(AuthenticationError);
+
+        // Try to parse header as UTF-8 string
+        let header_str = match std::str::from_utf8(header) {
+            Ok(s) => s,
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
+                return Err(AuthenticationError);
+            }
         };
+
         #[cfg(debug_assertions)]
         log::info!(provider = "anthropic", header = header_str; "authentication");
+
+        // Validate the header matches expected format
         if !http::is_header(header_str, http::HEADER_X_API_KEY) {
             return Err(AuthenticationError);
         }
+
+        // Extract and validate the API key
         self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..])
     }
 

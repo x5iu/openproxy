@@ -471,22 +471,35 @@ impl<'a> Payload<'a> {
 #[inline]
 fn get_host(header: Option<&[u8]>) -> Option<&str> {
     header
-        .map(|header| std::str::from_utf8(header).ok())
-        .flatten()
+        .and_then(|header| std::str::from_utf8(header).ok())
         .map(|host| {
+            // Check if the header starts with "Host: " (case-insensitive)
             if host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST) {
+                // Skip the "Host: " prefix and return the actual host value
                 &host[HEADER_HOST.len()..]
             } else {
+                // Return the entire string as-is
                 host
             }
         })
 }
 
 pub(crate) fn split_host_path(host: &str) -> (&str, Option<&str>) {
+    // Find the first '/' character in the host string
     if let Some(slash_idx) = host.find('/') {
+        // Split the string at the slash position
         let (host_part, path_part) = host.split_at(slash_idx);
-        (host_part, Some(path_part.trim_end_matches('/')))
+        // Remove trailing slashes from the path part
+        let trimmed_path = path_part.trim_end_matches('/');
+
+        // If trimmed path is not empty, return it; otherwise return None
+        if trimmed_path.is_empty() {
+            (host_part, None)
+        } else {
+            (host_part, Some(trimmed_path))
+        }
     } else {
+        // No slash found, return host as-is with no path
         (host, None)
     }
 }
