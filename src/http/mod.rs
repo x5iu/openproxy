@@ -580,6 +580,21 @@ mod tests {
         let (host, path) = split_host_path("localhost:8080/api/v1/test");
         assert_eq!(host, "localhost:8080");
         assert_eq!(path, Some("/api/v1/test"));
+
+        // Test with trailing slash
+        let (host, path) = split_host_path("api.openai.com/v1/");
+        assert_eq!(host, "api.openai.com");
+        assert_eq!(path, Some("/v1"));
+
+        // Test with multiple trailing slashes
+        let (host, path) = split_host_path("api.openai.com/v1///");
+        assert_eq!(host, "api.openai.com");
+        assert_eq!(path, Some("/v1"));
+
+        // Test root path only
+        let (host, path) = split_host_path("api.openai.com/");
+        assert_eq!(host, "api.openai.com");
+        assert_eq!(path, Some(""));
     }
 
     #[test]
@@ -628,6 +643,224 @@ mod tests {
         let header = "GET https://api.openai.com HTTP/1.1";
         let range = get_req_path(header);
         assert_eq!(&header[range], "");
+    }
+
+    #[test]
+    fn test_strip_port() {
+        // Test with port
+        assert_eq!(strip_port("localhost:8080"), "localhost");
+        assert_eq!(strip_port("api.openai.com:443"), "api.openai.com");
+        assert_eq!(strip_port("example.com:8443"), "example.com");
+
+        // Test without port
+        assert_eq!(strip_port("localhost"), "localhost");
+        assert_eq!(strip_port("api.openai.com"), "api.openai.com");
+
+        // Test IPv6 addresses
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("[2001:db8::1]:443"), "[2001:db8::1]");
+        assert_eq!(strip_port("[fe80::1%eth0]:8080"), "[fe80::1%eth0]");
+
+        // Test IPv6 without port
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("[2001:db8::1]"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn test_get_auth_query_range() {
+        // Test basic query parameter
+        let header = "GET /v1/models?key=my-api-key HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_some());
+        assert_eq!(&header[range.unwrap()], "my-api-key");
+
+        // Test multiple query parameters
+        let header = "GET /v1/models?model=gpt-4&key=my-api-key&version=2 HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_some());
+        assert_eq!(&header[range.unwrap()], "my-api-key");
+
+        // Test key at the start
+        let header = "GET /v1/models?key=first-key&other=value HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_some());
+        assert_eq!(&header[range.unwrap()], "first-key");
+
+        // Test missing key
+        let header = "GET /v1/models?model=gpt-4 HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_none());
+
+        // Test empty value
+        let header = "GET /v1/models?key= HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_none());
+
+        // Test with fragment
+        let header = "GET /v1/models?key=my-key#section HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_some());
+        assert_eq!(&header[range.unwrap()], "my-key");
+
+        // Test no query string
+        let header = "GET /v1/models HTTP/1.1";
+        let range = get_auth_query_range(header, "key");
+        assert!(range.is_none());
+    }
+
+    #[test]
+    fn test_is_header() {
+        // Test matching headers (case-insensitive)
+        assert!(is_header("Host: example.com", HEADER_HOST));
+        assert!(is_header("host: example.com", HEADER_HOST));
+        assert!(is_header("HOST: example.com", HEADER_HOST));
+
+        // Test Content-Length header
+        assert!(is_header("Content-Length: 100", HEADER_CONTENT_LENGTH));
+        assert!(is_header("content-length: 100", HEADER_CONTENT_LENGTH));
+
+        // Test Authorization header
+        assert!(is_header("Authorization: Bearer token", HEADER_AUTHORIZATION));
+        assert!(is_header("authorization: Bearer token", HEADER_AUTHORIZATION));
+
+        // Test non-matching headers
+        assert!(!is_header("Content-Type: application/json", HEADER_HOST));
+        assert!(!is_header("X-Custom: value", HEADER_AUTHORIZATION));
+
+        // Test header that's a prefix of another
+        assert!(!is_header("Ho", HEADER_HOST));
+        assert!(!is_header("Host", HEADER_HOST)); // Missing colon and space
+    }
+
+    #[test]
+    fn test_find_crlfs() {
+        // Test with single CRLF
+        let buffer = b"Line1\r\nLine2";
+        let result = find_crlfs(buffer);
+        assert!(result.is_none()); // Need double CRLF to be valid
+
+        // Test with double CRLF (end of headers)
+        let buffer = b"Host: example.com\r\n\r\n";
+        let result = find_crlfs(buffer);
+        assert!(result.is_some());
+        let crlfs = result.unwrap();
+        assert_eq!(crlfs.len(), 2);
+
+        // Test with multiple headers
+        let buffer = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+        let result = find_crlfs(buffer);
+        assert!(result.is_some());
+        let crlfs = result.unwrap();
+        assert_eq!(crlfs.len(), 4);
+
+        // Test empty buffer
+        let buffer = b"";
+        let result = find_crlfs(buffer);
+        assert!(result.is_none());
+
+        // Test no CRLF
+        let buffer = b"No line breaks here";
+        let result = find_crlfs(buffer);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_split_header_chunks() {
+        // Test with no special headers
+        let header: [Option<Range<usize>>; 4] = [None, None, None, None];
+        let result = split_header_chunks(header, 100);
+        assert_eq!(result[0], Some(0..100));
+        assert!(result[1].is_none());
+        assert!(result[2].is_none());
+        assert!(result[3].is_none());
+
+        // Test with one header (Host)
+        let header: [Option<Range<usize>>; 4] = [Some(20..40), None, None, None];
+        let result = split_header_chunks(header, 100);
+        assert_eq!(result[0], Some(0..20));
+        assert_eq!(result[1], Some(42..100)); // +2 for CRLF
+        assert!(result[2].is_none());
+        assert!(result[3].is_none());
+
+        // Test with two headers (Host and Auth)
+        let header: [Option<Range<usize>>; 4] = [Some(20..40), Some(50..70), None, None];
+        let result = split_header_chunks(header, 100);
+        assert_eq!(result[0], Some(0..20));
+        assert_eq!(result[1], Some(42..50));
+        assert_eq!(result[2], Some(72..100));
+        assert!(result[3].is_none());
+
+        // Test with three headers (Host, Auth, Connection)
+        let header: [Option<Range<usize>>; 4] = [Some(20..40), Some(50..70), Some(80..95), None];
+        let result = split_header_chunks(header, 100);
+        assert_eq!(result[0], Some(0..20));
+        assert_eq!(result[1], Some(42..50));
+        assert_eq!(result[2], Some(72..80));
+        assert_eq!(result[3], Some(97..100));
+    }
+
+    #[test]
+    fn test_header_lines_iterator() {
+        let buffer = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+        let crlfs = vec![14, 32, 54, 56];
+        let header = &buffer[..56];
+
+        let mut lines = HeaderLines::new(&crlfs, header);
+
+        let line1 = lines.next().unwrap();
+        assert_eq!(line1, b"GET / HTTP/1.1");
+
+        let line2 = lines.next().unwrap();
+        assert_eq!(line2, b"Host: example.com");
+
+        let line3 = lines.next().unwrap();
+        assert_eq!(line3, b"Connection: keep-alive");
+
+        let line4 = lines.next().unwrap();
+        assert_eq!(line4, b"");
+
+        assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn test_get_host() {
+        // Test with Host header prefix
+        assert_eq!(get_host(Some(b"Host: example.com")), Some("example.com"));
+        assert_eq!(get_host(Some(b"host: EXAMPLE.COM")), Some("EXAMPLE.COM"));
+
+        // Test without header prefix (raw host)
+        assert_eq!(get_host(Some(b"example.com")), Some("example.com"));
+
+        // Test None
+        assert_eq!(get_host(None), None);
+
+        // Test invalid UTF-8 (should return None)
+        assert_eq!(get_host(Some(&[0xff, 0xfe])), None);
+    }
+
+    #[test]
+    fn test_read_state_copy_clone() {
+        let state = ReadState::Start;
+        let state_copy = state;
+        let state_clone = state.clone();
+
+        // Both should be the same variant
+        assert!(matches!(state_copy, ReadState::Start));
+        assert!(matches!(state_clone, ReadState::Start));
+    }
+
+    #[test]
+    fn test_constants() {
+        // Verify header constants are correct
+        assert_eq!(HEADER_HOST, "Host: ");
+        assert_eq!(HEADER_AUTHORIZATION, "Authorization: ");
+        assert_eq!(HEADER_X_GOOG_API_KEY, "x-goog-api-key: ");
+        assert_eq!(HEADER_X_API_KEY, "X-API-Key: ");
+        assert_eq!(HEADER_CONTENT_LENGTH, "Content-Length: ");
+        assert_eq!(HEADER_TRANSFER_ENCODING, "Transfer-Encoding: ");
+        assert_eq!(HEADER_CONNECTION, "Connection: ");
+        assert_eq!(QUERY_KEY_KEY, "key");
     }
 }
 

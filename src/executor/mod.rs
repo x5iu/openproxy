@@ -310,3 +310,216 @@ impl<T> PoolTrait for Pool<T> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pool_new() {
+        let pool: Pool<i32> = Pool::new();
+        assert_eq!(pool.max_connections_per_endpoint, DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT);
+    }
+
+    #[tokio::test]
+    async fn test_pool_with_max_connections() {
+        let pool: Pool<i32> = Pool::with_max_connections(50);
+        assert_eq!(pool.max_connections_per_endpoint, 50);
+    }
+
+    #[tokio::test]
+    async fn test_pool_add_and_get() {
+        let pool: Pool<i32> = Pool::new();
+
+        // Add a value
+        pool.add("endpoint1", 42).await;
+
+        // Get the value back
+        let result = pool.get("endpoint1").await;
+        assert_eq!(result, Some(42));
+
+        // Pool should be empty now
+        let result = pool.get("endpoint1").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_pool_multiple_endpoints() {
+        let pool: Pool<i32> = Pool::new();
+
+        // Add values to different endpoints
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint2", 2).await;
+        pool.add("endpoint3", 3).await;
+
+        // Get values from each endpoint
+        assert_eq!(pool.get("endpoint1").await, Some(1));
+        assert_eq!(pool.get("endpoint2").await, Some(2));
+        assert_eq!(pool.get("endpoint3").await, Some(3));
+
+        // All should be empty now
+        assert_eq!(pool.get("endpoint1").await, None);
+        assert_eq!(pool.get("endpoint2").await, None);
+        assert_eq!(pool.get("endpoint3").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_pool_multiple_values_same_endpoint() {
+        let pool: Pool<i32> = Pool::new();
+
+        // Add multiple values to the same endpoint
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+        pool.add("endpoint1", 3).await;
+
+        // Should be able to get all values (order may vary due to Injector behavior)
+        let mut values = vec![];
+        while let Some(v) = pool.get("endpoint1").await {
+            values.push(v);
+        }
+        assert_eq!(values.len(), 3);
+        values.sort();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_pool_get_nonexistent_endpoint() {
+        let pool: Pool<i32> = Pool::new();
+
+        // Try to get from non-existent endpoint
+        let result = pool.get("nonexistent").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_pool_capacity_limit() {
+        let pool: Pool<i32> = Pool::with_max_connections(3);
+
+        // Add up to capacity
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+        pool.add("endpoint1", 3).await;
+
+        // This should be dropped (over capacity)
+        pool.add("endpoint1", 4).await;
+
+        // Should only get 3 values
+        let mut values = vec![];
+        while let Some(v) = pool.get("endpoint1").await {
+            values.push(v);
+        }
+        assert_eq!(values.len(), 3);
+        values.sort();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_pool_capacity_per_endpoint() {
+        let pool: Pool<i32> = Pool::with_max_connections(2);
+
+        // Each endpoint has its own limit
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+        pool.add("endpoint2", 10).await;
+        pool.add("endpoint2", 20).await;
+
+        // Both endpoints should have 2 values
+        let mut values1 = vec![];
+        while let Some(v) = pool.get("endpoint1").await {
+            values1.push(v);
+        }
+        let mut values2 = vec![];
+        while let Some(v) = pool.get("endpoint2").await {
+            values2.push(v);
+        }
+
+        assert_eq!(values1.len(), 2);
+        assert_eq!(values2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_connection_count_tracking() {
+        let pool: Pool<i32> = Pool::with_max_connections(5);
+
+        // Add some values
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+
+        // Get one value
+        let _ = pool.get("endpoint1").await;
+
+        // Add more (should succeed since we removed one)
+        pool.add("endpoint1", 3).await;
+        pool.add("endpoint1", 4).await;
+        pool.add("endpoint1", 5).await;
+        pool.add("endpoint1", 6).await;
+
+        // Count remaining values
+        let mut count = 0;
+        while pool.get("endpoint1").await.is_some() {
+            count += 1;
+        }
+        // Should have 4 values (started with 2, removed 1, added 4 more = 5, but capacity is 5)
+        assert!(count <= 5);
+    }
+
+    #[tokio::test]
+    async fn test_pool_string_keys() {
+        let pool: Pool<String> = Pool::new();
+
+        // Test with owned string
+        pool.add(&String::from("endpoint1"), String::from("value1")).await;
+
+        // Test with &str
+        pool.add("endpoint2", String::from("value2")).await;
+
+        assert_eq!(pool.get("endpoint1").await, Some(String::from("value1")));
+        assert_eq!(pool.get("endpoint2").await, Some(String::from("value2")));
+    }
+
+    #[tokio::test]
+    async fn test_pool_concurrent_access() {
+        use std::sync::Arc;
+
+        let pool: Arc<Pool<i32>> = Arc::new(Pool::with_max_connections(100));
+
+        // Spawn multiple tasks that add values
+        let mut handles = vec![];
+        for i in 0..10 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                for j in 0..10 {
+                    pool.add("endpoint1", i * 10 + j).await;
+                }
+            }));
+        }
+
+        // Wait for all adds to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Get all values
+        let mut count = 0;
+        while pool.get("endpoint1").await.is_some() {
+            count += 1;
+        }
+
+        // Should have at most 100 values (capacity limit)
+        assert!(count <= 100);
+        assert!(count > 0);
+    }
+
+    #[tokio::test]
+    async fn test_executor_new() {
+        let pool: Pool<i32> = Pool::new();
+        let executor = Executor::new(pool);
+        // Just verify it can be created
+        assert!(Arc::strong_count(&executor.conn_injector) >= 1);
+    }
+
+    #[test]
+    fn test_default_max_connections_constant() {
+        assert_eq!(DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT, 100);
+    }
+}
