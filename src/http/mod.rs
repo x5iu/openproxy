@@ -492,9 +492,9 @@ pub(crate) fn split_host_path(host: &str) -> (&str, Option<&str>) {
         // Remove trailing slashes from the path part
         let trimmed_path = path_part.trim_end_matches('/');
 
-        // Return Some even if the trimmed path is empty to preserve backward compatibility
+        // Return None if the trimmed path is empty, otherwise return Some(trimmed_path)
         if trimmed_path.is_empty() {
-            (host_part, Some(""))
+            (host_part, None)
         } else {
             (host_part, Some(trimmed_path))
         }
@@ -593,6 +593,31 @@ mod tests {
         let (host, path) = split_host_path("localhost:8080/api/v1/test");
         assert_eq!(host, "localhost:8080");
         assert_eq!(path, Some("/api/v1/test"));
+
+        // Test with trailing slash only (should return None for path)
+        let (host, path) = split_host_path("example.com/");
+        assert_eq!(host, "example.com");
+        assert_eq!(path, None, "Trailing slash should result in None path");
+
+        // Test with multiple trailing slashes (should return None for path)
+        let (host, path) = split_host_path("example.com//");
+        assert_eq!(host, "example.com");
+        assert_eq!(path, None, "Multiple trailing slashes should result in None path");
+
+        // Test with triple trailing slashes
+        let (host, path) = split_host_path("example.com///");
+        assert_eq!(host, "example.com");
+        assert_eq!(path, None, "Triple trailing slashes should result in None path");
+
+        // Test with path and trailing slashes (should preserve path, remove trailing slashes)
+        let (host, path) = split_host_path("api.example.com/v1/");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(path, Some("/v1"), "Path with trailing slash should preserve path without trailing slashes");
+
+        // Test with path and multiple trailing slashes
+        let (host, path) = split_host_path("api.example.com/v1///");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(path, Some("/v1"), "Path with multiple trailing slashes should preserve path without trailing slashes");
     }
 
     #[test]
