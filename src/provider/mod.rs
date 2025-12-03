@@ -754,6 +754,577 @@ mod tests {
             "GET /models#fragment HTTP/1.1"
         );
     }
+
+    #[test]
+    fn test_constant_time_eq() {
+        // Test equal strings
+        assert!(constant_time_eq("hello", "hello"));
+        assert!(constant_time_eq("", ""));
+        assert!(constant_time_eq("a", "a"));
+
+        // Test unequal strings
+        assert!(!constant_time_eq("hello", "world"));
+        assert!(!constant_time_eq("hello", "hello!"));
+        assert!(!constant_time_eq("hello", "hell"));
+        assert!(!constant_time_eq("", "a"));
+
+        // Test API key format strings
+        assert!(constant_time_eq("sk-test-key-12345", "sk-test-key-12345"));
+        assert!(!constant_time_eq("sk-test-key-12345", "sk-test-key-12346"));
+    }
+
+    #[test]
+    fn test_type_display() {
+        assert_eq!(Type::OpenAI.to_string(), "openai");
+        assert_eq!(Type::Gemini.to_string(), "gemini");
+        assert_eq!(Type::Anthropic.to_string(), "anthropic");
+    }
+
+    #[test]
+    fn test_openai_provider_creation() {
+        let auth_keys = Arc::new(vec!["test-auth-key".to_string()]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test-key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        assert!(matches!(provider.kind(), Type::OpenAI));
+        assert_eq!(provider.host(), "api.openai.com");
+        assert_eq!(provider.endpoint(), "api.openai.com");
+        assert_eq!(provider.api_key(), Some("sk-test-key"));
+        assert_eq!(provider.weight(), 1.0);
+        assert!(provider.tls());
+        assert!(provider.is_healthy());
+        assert_eq!(provider.sock_address(), "api.openai.com:443");
+        assert_eq!(provider.host_header(), "Host: api.openai.com\r\n");
+        assert_eq!(provider.auth_header(), Some("Authorization: Bearer sk-test-key\r\n"));
+        assert_eq!(provider.auth_header_key(), Some(http::HEADER_AUTHORIZATION));
+        assert_eq!(provider.auth_query_key(), None);
+    }
+
+    #[test]
+    fn test_openai_provider_without_tls() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = OpenAIProvider::new(
+            "localhost:8080",
+            "localhost",
+            Some(8080),
+            false,
+            2.0,
+            Some("sk-test"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        assert!(!provider.tls());
+        assert_eq!(provider.sock_address(), "localhost:8080");
+        assert_eq!(provider.weight(), 2.0);
+    }
+
+    #[test]
+    fn test_openai_provider_authentication() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Test valid authentication
+        let valid_header = "Authorization: Bearer valid-key";
+        assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+
+        // Test invalid authentication
+        let invalid_header = "Authorization: Bearer invalid-key";
+        assert!(provider.authenticate(Some(invalid_header.as_bytes())).is_err());
+
+        // Test missing authentication
+        assert!(provider.authenticate(None).is_err());
+
+        // Test authenticate_key directly
+        assert!(provider.authenticate_key("valid-key").is_ok());
+        assert!(provider.authenticate_key("Bearer valid-key").is_ok());
+        assert!(provider.authenticate_key("invalid-key").is_err());
+    }
+
+    #[test]
+    fn test_openai_provider_no_auth_keys() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Without auth_keys, authentication should pass
+        assert!(!provider.has_auth_keys());
+        assert!(provider.authenticate(None).is_ok());
+        assert!(provider.authenticate(Some(b"anything")).is_ok());
+    }
+
+    #[test]
+    fn test_openai_provider_with_provider_auth_keys() {
+        let auth_keys = Arc::new(vec![]);
+        let provider_auth_keys = Some(vec!["provider-specific-key".to_string()]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            auth_keys,
+            provider_auth_keys,
+            None,
+        ).unwrap();
+
+        assert!(provider.has_auth_keys());
+        assert!(provider.authenticate_key("provider-specific-key").is_ok());
+        assert!(provider.authenticate_key("wrong-key").is_err());
+    }
+
+    #[test]
+    fn test_openai_provider_health_state() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            None,
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Default is healthy
+        assert!(provider.is_healthy());
+
+        // Set to unhealthy
+        provider.set_healthy(false);
+        assert!(!provider.is_healthy());
+
+        // Set back to healthy
+        provider.set_healthy(true);
+        assert!(provider.is_healthy());
+    }
+
+    #[test]
+    fn test_gemini_provider_creation() {
+        let auth_keys = Arc::new(vec!["test-auth-key".to_string()]);
+        let provider = GeminiProvider::new(
+            "generativelanguage.googleapis.com",
+            "generativelanguage.googleapis.com",
+            None,
+            true,
+            1.5,
+            Some("gemini-api-key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        assert!(matches!(provider.kind(), Type::Gemini));
+        assert_eq!(provider.host(), "generativelanguage.googleapis.com");
+        assert_eq!(provider.endpoint(), "generativelanguage.googleapis.com");
+        assert_eq!(provider.api_key(), Some("gemini-api-key"));
+        assert_eq!(provider.weight(), 1.5);
+        assert_eq!(provider.auth_query_key(), Some(http::QUERY_KEY_KEY));
+        assert_eq!(provider.auth_header_key(), Some(http::HEADER_X_GOOG_API_KEY));
+    }
+
+    #[test]
+    fn test_gemini_provider_requires_api_key() {
+        let auth_keys = Arc::new(vec![]);
+        let result = GeminiProvider::new(
+            "generativelanguage.googleapis.com",
+            "generativelanguage.googleapis.com",
+            None,
+            true,
+            1.0,
+            None, // Missing API key
+            auth_keys,
+            None,
+            None,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gemini_provider_authentication() {
+        let auth_keys = Arc::new(vec!["client-key".to_string()]);
+        let provider = GeminiProvider::new(
+            "generativelanguage.googleapis.com",
+            "generativelanguage.googleapis.com",
+            None,
+            true,
+            1.0,
+            Some("gemini-api-key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Test with x-goog-api-key header
+        let valid_header = "x-goog-api-key: client-key";
+        assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+
+        // Test without header prefix
+        assert!(provider.authenticate(Some(b"client-key")).is_ok());
+
+        // Test invalid key
+        assert!(provider.authenticate(Some(b"wrong-key")).is_err());
+    }
+
+    #[test]
+    fn test_anthropic_provider_creation() {
+        let auth_keys = Arc::new(vec!["test-auth-key".to_string()]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            0.5,
+            Some("anthropic-api-key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        assert!(matches!(provider.kind(), Type::Anthropic));
+        assert_eq!(provider.host(), "api.anthropic.com");
+        assert_eq!(provider.endpoint(), "api.anthropic.com");
+        assert_eq!(provider.api_key(), Some("anthropic-api-key"));
+        assert_eq!(provider.weight(), 0.5);
+        assert_eq!(provider.auth_header_key(), Some(http::HEADER_X_API_KEY));
+        assert_eq!(provider.auth_query_key(), None);
+    }
+
+    #[test]
+    fn test_anthropic_provider_requires_api_key() {
+        let auth_keys = Arc::new(vec![]);
+        let result = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            None, // Missing API key
+            auth_keys,
+            None,
+            None,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anthropic_provider_authentication() {
+        let auth_keys = Arc::new(vec!["client-key".to_string()]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("anthropic-api-key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Test with X-API-Key header
+        let valid_header = "X-API-Key: client-key";
+        assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+
+        // Test invalid header key
+        let wrong_header = "Authorization: Bearer client-key";
+        assert!(provider.authenticate(Some(wrong_header.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn test_new_provider_factory() {
+        let auth_keys = Arc::new(vec![]);
+
+        // Test OpenAI
+        let openai = new_provider(
+            "openai",
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        ).unwrap();
+        assert!(matches!(openai.kind(), Type::OpenAI));
+
+        // Test Gemini
+        let gemini = new_provider(
+            "gemini",
+            "generativelanguage.googleapis.com",
+            "generativelanguage.googleapis.com",
+            None,
+            true,
+            1.0,
+            Some("gemini-key"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        ).unwrap();
+        assert!(matches!(gemini.kind(), Type::Gemini));
+
+        // Test Anthropic
+        let anthropic = new_provider(
+            "anthropic",
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("anthropic-key"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        ).unwrap();
+        assert!(matches!(anthropic.kind(), Type::Anthropic));
+
+        // Test unsupported provider
+        let unsupported = new_provider(
+            "unknown",
+            "example.com",
+            "example.com",
+            None,
+            true,
+            1.0,
+            Some("key"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        );
+        assert!(unsupported.is_err());
+    }
+
+    #[test]
+    fn test_provider_default_ports() {
+        let auth_keys = Arc::new(vec![]);
+
+        // TLS enabled should default to port 443
+        let provider_tls = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("key"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        ).unwrap();
+        assert_eq!(provider_tls.sock_address(), "api.openai.com:443");
+
+        // TLS disabled should default to port 80
+        let provider_no_tls = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            false,
+            1.0,
+            Some("key"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        ).unwrap();
+        assert_eq!(provider_no_tls.sock_address(), "api.openai.com:80");
+
+        // Custom port should override defaults
+        let provider_custom = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            Some(8443),
+            true,
+            1.0,
+            Some("key"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+        ).unwrap();
+        assert_eq!(provider_custom.sock_address(), "api.openai.com:8443");
+    }
+
+    #[test]
+    fn test_openai_provider_without_api_key() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            None, // No API key
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        assert_eq!(provider.api_key(), None);
+        assert_eq!(provider.auth_header(), None);
+    }
+
+    #[test]
+    fn test_rewrite_first_header_block() {
+        let auth_keys = Arc::new(vec![]);
+
+        // Provider with path prefix
+        let provider = OpenAIProvider::new(
+            "localhost/v1",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("key"),
+            auth_keys.clone(),
+            None,
+            None,
+        ).unwrap();
+
+        let block = b"GET /v1/completions HTTP/1.1";
+        let rewritten = provider.rewrite_first_header_block(block);
+        assert!(rewritten.is_some());
+        assert_eq!(String::from_utf8(rewritten.unwrap()).unwrap(), "GET /completions HTTP/1.1");
+
+        // Provider without path prefix
+        let provider_no_prefix = OpenAIProvider::new(
+            "localhost",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        let rewritten = provider_no_prefix.rewrite_first_header_block(block);
+        assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn test_gemini_rewrite_with_query_key() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = GeminiProvider::new(
+            "localhost/v1beta",
+            "generativelanguage.googleapis.com",
+            None,
+            true,
+            1.0,
+            Some("gemini-api-key"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Test rewriting path and query key
+        let block = b"GET /v1beta/models?key=client-key HTTP/1.1";
+        let rewritten = provider.rewrite_first_header_block(block);
+        assert!(rewritten.is_some());
+        let result = String::from_utf8(rewritten.unwrap()).unwrap();
+        assert!(result.contains("key=gemini-api-key"));
+        assert!(result.starts_with("GET /models?"));
+    }
+
+    #[test]
+    fn test_authentication_error_display() {
+        let error = AuthenticationError;
+        assert_eq!(format!("{}", error), "Authentication error");
+    }
+
+    #[test]
+    fn test_multiple_auth_keys() {
+        let auth_keys = Arc::new(vec![
+            "key1".to_string(),
+            "key2".to_string(),
+            "key3".to_string(),
+        ]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // All keys should work
+        assert!(provider.authenticate_key("key1").is_ok());
+        assert!(provider.authenticate_key("key2").is_ok());
+        assert!(provider.authenticate_key("key3").is_ok());
+        assert!(provider.authenticate_key("key4").is_err());
+    }
+
+    #[test]
+    fn test_authentication_key_trimming() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // OpenAI strips "Bearer " prefix
+        assert!(provider.authenticate_key("Bearer valid-key").is_ok());
+        assert!(provider.authenticate_key("  valid-key  ").is_ok());
+
+        // Anthropic provider
+        let anthropic_provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("key"),
+            Arc::new(vec!["valid-key".to_string()]),
+            None,
+            None,
+        ).unwrap();
+
+        // Anthropic trims whitespace
+        assert!(anthropic_provider.authenticate_key("  valid-key  ").is_ok());
+    }
 }
 
 async fn health_check(
