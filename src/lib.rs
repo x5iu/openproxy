@@ -272,7 +272,7 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
 
     fn extend_from_single(&mut self, keys: APIKeys<'a>) {
         let vec = self.get_or_insert_with(Vec::new);
-        for key in keys.into_vec() {
+        for key in keys.0 {
             vec.push(APIKeyConfig { key, weight: None });
         }
     }
@@ -285,29 +285,8 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
     }
 }
 
-#[derive(serde::Serialize)]
-struct APIKeys<'a> {
-    #[serde(borrow)]
-    keys: Vec<&'a str>,
-}
-
-impl<'a> APIKeys<'a> {
-    fn into_vec(self) -> Vec<&'a str> {
-        self.keys
-    }
-}
-
-impl<'a> From<&'a str> for APIKeys<'a> {
-    fn from(key: &'a str) -> Self {
-        Self { keys: vec![key] }
-    }
-}
-
-impl<'a> From<Vec<&'a str>> for APIKeys<'a> {
-    fn from(keys: Vec<&'a str>) -> Self {
-        Self { keys }
-    }
-}
+#[derive(serde::Deserialize)]
+struct APIKeys<'a>(Vec<&'a str>);
 
 impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -327,7 +306,7 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
             where
                 E: serde::de::Error,
             {
-                Ok(APIKeys { keys: vec![v] })
+                Ok(APIKeys(vec![v]))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -338,7 +317,7 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
                 while let Some(key) = seq.next_element::<&'de str>()? {
                     keys.push(key);
                 }
-                Ok(APIKeys { keys })
+                Ok(APIKeys(keys))
             }
         }
 

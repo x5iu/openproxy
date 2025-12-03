@@ -492,9 +492,9 @@ pub(crate) fn split_host_path(host: &str) -> (&str, Option<&str>) {
         // Remove trailing slashes from the path part
         let trimmed_path = path_part.trim_end_matches('/');
 
-        // If trimmed path is not empty, return it; otherwise return None
+        // Return Some even if the trimmed path is empty to preserve backward compatibility
         if trimmed_path.is_empty() {
-            (host_part, None)
+            (host_part, Some(""))
         } else {
             (host_part, Some(trimmed_path))
         }

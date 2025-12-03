@@ -275,12 +275,10 @@ impl Provider for OpenAIProvider {
         #[cfg(debug_assertions)]
         log::info!(provider = "openai", header = header_str; "authentication");
 
-        // Validate the header matches expected format
         if !http::is_header(header_str, http::HEADER_AUTHORIZATION) {
             return Err(AuthenticationError);
         }
 
-        // Extract and validate the API key
         self.authenticate_key(&header_str[http::HEADER_AUTHORIZATION.len()..])
     }
 
@@ -660,12 +658,10 @@ impl Provider for AnthropicProvider {
         #[cfg(debug_assertions)]
         log::info!(provider = "anthropic", header = header_str; "authentication");
 
-        // Validate the header matches expected format
         if !http::is_header(header_str, http::HEADER_X_API_KEY) {
             return Err(AuthenticationError);
         }
 
-        // Extract and validate the API key
         self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..])
     }
 

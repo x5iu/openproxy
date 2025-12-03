@@ -465,8 +465,9 @@ where
             };
             if conn.health_check().await.is_ok() {
                 return Some(conn);
+            } else {
+                ConnTrait::shutdown(&mut conn).await;
             }
-            ConnTrait::shutdown(&mut conn).await;
             retry_times += 1;
         }
         None
