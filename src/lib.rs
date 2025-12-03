@@ -285,7 +285,6 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
     }
 }
 
-#[derive(serde::Deserialize)]
 struct APIKeys<'a>(Vec<&'a str>);
 
 impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
