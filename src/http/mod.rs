@@ -361,7 +361,7 @@ impl<'a> Payload<'a> {
         self.state
     }
 
-    pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<[u8]>>, Error> {
+    pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<'_, [u8]>>, Error> {
         match self.state {
             ReadState::Start => {
                 if self.header_current_chunk < self.header_chunks.len() {
