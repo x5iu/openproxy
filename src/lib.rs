@@ -344,6 +344,9 @@ pub enum Error {
 
     #[error("Invalid header")]
     InvalidHeader,
+
+    #[error("no provider found")]
+    NoProviderFound,
 }
 
 use executor::{Executor, Pool};
