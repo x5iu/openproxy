@@ -253,7 +253,6 @@ trait APIKeysTrait<'a> {
     type Item;
     fn pop(&mut self) -> Option<Self::Item>;
     fn extend_from_single(&mut self, keys: APIKeys<'a>);
-    fn extend_from_multiple(&mut self, keys: Vec<&'a str>);
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -276,18 +275,14 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
             vec.push(APIKeyConfig { key, weight: None });
         }
     }
-
-    fn extend_from_multiple(&mut self, keys: Vec<&'a str>) {
-        let vec = self.get_or_insert_with(Vec::new);
-        for key in keys {
-            vec.push(APIKeyConfig { key, weight: None });
-        }
-    }
 }
 
 struct APIKeys<'a>(Vec<&'a str>);
 
-impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
+impl<'de, 'a> serde::Deserialize<'de> for APIKeys<'a>
+where
+    'de: 'a,
+{
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
