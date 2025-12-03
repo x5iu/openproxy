@@ -119,7 +119,7 @@ impl Program {
 
             // Extend from single key if present
             if let Some(single_key) = provider.api_key {
-                api_keys.extend_from_single(single_key);
+                api_keys.append(single_key);
             }
 
             if let Some(api_key_configs @ [_, _, ..]) = api_keys.as_deref() {
@@ -252,8 +252,7 @@ struct ProviderConfig<'a> {
 trait APIKeysTrait<'a> {
     type Item;
     fn pop(&mut self) -> Option<Self::Item>;
-    fn extend_from_single(&mut self, keys: APIKeys<'a>);
-    fn extend_from_multiple(&mut self, keys: Vec<&'a str>);
+    fn append(&mut self, keys: APIKeys<'a>);
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -270,16 +269,9 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
         self.get_or_insert_with(Vec::new).pop()
     }
 
-    fn extend_from_single(&mut self, keys: APIKeys<'a>) {
+    fn append(&mut self, keys: APIKeys<'a>) {
         let vec = self.get_or_insert_with(Vec::new);
         for key in keys.into_vec() {
-            vec.push(APIKeyConfig { key, weight: None });
-        }
-    }
-
-    fn extend_from_multiple(&mut self, keys: Vec<&'a str>) {
-        let vec = self.get_or_insert_with(Vec::new);
-        for key in keys {
             vec.push(APIKeyConfig { key, weight: None });
         }
     }
