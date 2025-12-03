@@ -64,6 +64,9 @@ jobs:
           # Debug: show generated config
           cat config.yml
 
+      - name: Run unit tests
+        run: cargo test --release
+
       - name: Build openproxy
         run: cargo build --release
 
