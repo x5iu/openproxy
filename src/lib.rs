@@ -345,7 +345,7 @@ pub enum Error {
     #[error("Invalid header")]
     InvalidHeader,
 
-    #[error("no provider found")]
+    #[error("No provider found")]
     NoProviderFound,
 }
 
