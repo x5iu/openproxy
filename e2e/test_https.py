@@ -1,6 +1,7 @@
 from typing import List
 
 import httpx
+import os
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -48,7 +49,35 @@ def run_test(client: OpenAI, protocol: str):
         assert "fox" in animals_lower, f"Expected 'fox' in animals, got: {result.animals}"
         assert "dog" in animals_lower, f"Expected 'dog' in animals, got: {result.animals}"
 
-        print(f"✓ HTTPS + {protocol} test passed!")
+        print(f"\u2713 HTTPS + {protocol} test passed!")
+
+
+def test_no_provider_found_https_http1():
+    """Verify 404 and message when no provider matches the Host header over HTTPS HTTP/1.1."""
+    print(f"\n{'='*50}")
+    print("Testing HTTPS (HTTP/1.1) no-provider-found handling")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+    api_key = os.environ["OPENAI_API_KEY"]
+
+    # HTTP/1.1 only, to ensure we hit the http/1.1 proxy path
+    with httpx.Client(base_url=base_url, http2=False, verify=os.environ.get("SSL_CERT_FILE")) as client:
+        resp = client.get(
+            "/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Host": "no-such-provider.local",
+            },
+        )
+
+    print("Status:", resp.status_code)
+    print("Body:", resp.text)
+
+    assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+    assert resp.text.strip().lower() == "no provider found", f"Unexpected body: {resp.text!r}"
+
+    print("\u2713 HTTPS HTTP/1.1 no-provider-found test passed!")
 
 
 # Test with HTTP/1.1
@@ -59,6 +88,9 @@ run_test(client_http1, "HTTP/1.1")
 client_http2 = OpenAI(http_client=httpx.Client(http2=True))
 run_test(client_http2, "HTTP/2")
 
+# Also verify 404 handling when no provider is found over HTTPS HTTP/1.1
+test_no_provider_found_https_http1()
+
 print("\n" + "="*50)
-print("✓ All HTTPS tests passed!")
+print("\u2713 All HTTPS tests passed!")
 print("="*50)

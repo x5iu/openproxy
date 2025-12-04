@@ -135,7 +135,7 @@ macro_rules! select_provider {
         let p = crate::program();
         let p = p.read().await;
         let Some($provider) = p.select_provider($host, $path) else {
-            return Err(Error::InvalidHeader);
+            return Err(Error::NoProviderFound);
         };
     };
 }

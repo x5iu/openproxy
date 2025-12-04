@@ -118,18 +118,24 @@ where
         Box::pin(async move {
             let mut is_invalid_key = false;
             let mut is_bad_request = false;
+            let mut is_not_found = false;
             let mut err_msg: Option<Cow<str>> = None;
             loop {
                 let mut request = match http::Request::new(&mut incoming).await {
                     Ok(request) => request,
-                    Err(Error::HeaderTooLarge) => {
+                    Err(e @ Error::HeaderTooLarge) => {
                         is_bad_request = true;
-                        err_msg = Some("header too large".into());
+                        err_msg = Some(e.to_string().into());
                         break;
                     }
-                    Err(Error::InvalidHeader) => {
+                    Err(e @ Error::InvalidHeader) => {
                         is_bad_request = true;
-                        err_msg = Some("invalid header".into());
+                        err_msg = Some(e.to_string().into());
+                        break;
+                    }
+                    Err(e @ Error::NoProviderFound) => {
+                        is_not_found = true;
+                        err_msg = Some(e.to_string().into());
                         break;
                     }
                     Err(e) => return Err(ProxyError::Client(e)),
@@ -142,8 +148,8 @@ where
                 };
                 let p = p.read().await;
                 let Some(provider) = p.select_provider(host, request.path()) else {
-                    is_bad_request = true;
-                    err_msg = Some("no provider matched".into());
+                    is_not_found = true;
+                    err_msg = Some(Error::NoProviderFound.to_string().into());
                     break;
                 };
                 if !provider.authenticate(request.auth_key()).is_ok() {
@@ -183,6 +189,20 @@ where
                 let msg = err_msg.as_deref().unwrap_or("authentication failed");
                 let resp = format!(
                     "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.as_bytes().len(),
+                    msg
+                );
+                incoming
+                    .write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| ProxyError::Client(e.into()))?;
+            } else if is_not_found {
+                let msg: String = err_msg
+                    .clone()
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|| Error::NoProviderFound.to_string());
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     msg.as_bytes().len(),
                     msg
                 );
@@ -250,7 +270,7 @@ where
                     };
                     let p = p.read().await;
                     let Some(provider) = p.select_provider(authority.host(), request.uri().path()) else {
-                        return invalid!(respond, 400, "no provider matched");
+                        return invalid!(respond, 404, Error::NoProviderFound.to_string());
                     };
                     if provider.has_auth_keys() {
                         let mut auth_key = None;
@@ -319,6 +339,7 @@ where
                     let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
                     let mut req = match http::Request::new(req_reader).await {
                         Ok(req) => req,
+                        Err(e @ Error::NoProviderFound) => { return invalid!(respond, 404, e.to_string()); }
                         Err(e) => { return invalid!(respond, 400, e.to_string()); }
                     };
                     let mut outgoing = match worker.get_outgoing_conn(provider).await {
