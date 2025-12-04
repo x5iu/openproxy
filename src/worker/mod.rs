@@ -197,7 +197,10 @@ where
                     .await
                     .map_err(|e| ProxyError::Client(e.into()))?;
             } else if is_not_found {
-                let msg = err_msg.as_deref().unwrap_or(Error::NoProviderFound.to_string().as_str());
+                let msg: String = err_msg
+                    .clone()
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|| Error::NoProviderFound.to_string());
                 let resp = format!(
                     "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     msg.as_bytes().len(),
