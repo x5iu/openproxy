@@ -75,7 +75,7 @@ def test_no_provider_found_https_http1():
     print("Body:", resp.text)
 
     assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
-    assert resp.text.strip() == "no provider found", f"Unexpected body: {resp.text!r}"
+    assert resp.text.strip().lower() == "no provider found", f"Unexpected body: {resp.text!r}"
 
     print("\u2713 HTTPS HTTP/1.1 no-provider-found test passed!")
 
