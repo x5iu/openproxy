@@ -271,26 +271,28 @@ impl<T> PoolTrait for Pool<T> {
     {
         Box::pin(async move {
             // Initialize data structures if needed
-            if !self.injectors.read().await.contains_key(label) {
+            {
                 let mut injectors = self.injectors.write().await;
                 let mut conn_counts = self.conn_counts.write().await;
-                if !injectors.contains_key(label) {
-                    injectors.insert(label.to_string(), Injector::new());
-                    conn_counts.insert(label.to_string(), Arc::new(AtomicUsize::new(0)));
-                }
+                injectors.entry(label.to_string()).or_insert_with(Injector::new);
+                conn_counts
+                    .entry(label.to_string())
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
             }
 
-            // Check if we're at capacity before adding
-            let current_count = self.conn_counts
-                .read()
-                .await
-                .get(label)
-                .map(|c| c.load(Ordering::SeqCst))
-                .unwrap_or(0);
+            // Atomically check and increment capacity
+            let current = {
+                let counts = self.conn_counts.read().await;
+                let Some(count) = counts.get(label) else {
+                    return;
+                };
+                count
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                        (c < self.max_connections_per_endpoint).then_some(c + 1)
+                    })
+            };
 
-            if current_count >= self.max_connections_per_endpoint {
-                // Pool is full, drop the connection instead of adding it
-                // The connection will be dropped when `value` goes out of scope
+            if let Err(current_count) = current {
                 log::warn!(
                     endpoint = label.to_string(),
                     current = current_count,
@@ -300,11 +302,15 @@ impl<T> PoolTrait for Pool<T> {
                 return;
             }
 
-            // Add to pool and increment count
+            // Add to pool; rollback count on failure to push
+            let mut pushed = false;
             if let Some(injector) = self.injectors.read().await.get(label) {
                 injector.push(value);
+                pushed = true;
+            }
+            if !pushed {
                 if let Some(count) = self.conn_counts.read().await.get(label) {
-                    count.fetch_add(1, Ordering::SeqCst);
+                    count.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         })

@@ -354,7 +354,7 @@ use tokio::net::TcpListener;
 use worker::{Conn, Worker};
 
 /// Start the proxy server with the configured listeners
-pub async fn serve(enable_health_check: bool) {
+pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     let executor = Arc::new(Executor::new(Pool::new()));
     let (https_port, http_port) = {
         let p = program();
@@ -370,10 +370,8 @@ pub async fn serve(enable_health_check: bool) {
     // Start HTTPS listener if configured
     if let Some(port) = https_port {
         let executor = Arc::clone(&executor);
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-                .await
-                .unwrap();
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -395,10 +393,8 @@ pub async fn serve(enable_health_check: bool) {
     // Start HTTP listener if configured (HTTP/1.1 only)
     if let Some(port) = http_port {
         let executor = Arc::clone(&executor);
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-                .await
-                .unwrap();
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -416,4 +412,6 @@ pub async fn serve(enable_health_check: bool) {
             }
         });
     }
+
+    Ok(())
 }

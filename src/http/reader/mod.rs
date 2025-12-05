@@ -82,18 +82,24 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedWriter<R> {
                 this.buf.reserve(Self::MAX_DATA_SIZE - this.buf.capacity());
             }
             if this.buf.len() < Self::MAX_DATA_SIZE {
-                // SAFETY: we extend the vector length to MAX_DATA_SIZE to obtain a writable buffer;
-                // only the first `n` bytes returned by the inner reader are initialized and later read.
-                // We never read uninitialized bytes.
+                // SAFETY: extend to MAX_DATA_SIZE to obtain a writable buffer; truncate after the read.
                 unsafe { this.buf.set_len(Self::MAX_DATA_SIZE); }
             }
             let n = {
                 let mut rb = ReadBuf::new(&mut this.buf[..Self::MAX_DATA_SIZE]);
-                let Poll::Ready(_) = pin!(&mut this.reader).poll_read(cx, &mut rb)? else {
-                    return Poll::Pending;
-                };
-                rb.filled().len()
+                match pin!(&mut this.reader).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => rb.filled().len(),
+                    Poll::Ready(Err(e)) => {
+                        this.buf.truncate(0);
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        this.buf.truncate(0);
+                        return Poll::Pending;
+                    }
+                }
             };
+            this.buf.truncate(n);
             let mut n0 = n;
             let mut i = 0usize;
             #[allow(const_evaluatable_unchecked)]
@@ -332,19 +338,29 @@ pub(crate) mod buf_reader {
             let me = self.get_mut();
             let (len, cap) = (me.buf.len(), me.buf.capacity());
             if len < cap {
+                // SAFETY: temporarily extend the buffer, then truncate based on actual bytes read.
                 unsafe {
                     me.buf.set_len(cap);
-                    let mut buf = ReadBuf::new(&mut me.buf[len..cap]);
-                    let poll = pin!(&mut me.inner).poll_read(cx, &mut buf)?;
-                    let n = buf.filled().len();
-                    me.buf.set_len(len + n);
-                    if poll.is_pending() {
+                }
+                let mut buf = ReadBuf::new(&mut me.buf[len..cap]);
+                match pin!(&mut me.inner).poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = buf.filled().len();
+                        me.buf.truncate(len + n);
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF",
+                            )));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        me.buf.truncate(len);
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        me.buf.truncate(len);
                         return Poll::Pending;
-                    } else if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "unexpected EOF",
-                        )));
                     }
                 }
             }
@@ -356,6 +372,7 @@ pub(crate) mod buf_reader {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

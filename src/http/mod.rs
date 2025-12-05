@@ -471,10 +471,9 @@ impl<'a> Payload<'a> {
 #[inline]
 fn get_host(header: Option<&[u8]>) -> Option<&str> {
     header
-        .map(|header| std::str::from_utf8(header).ok())
-        .flatten()
+        .and_then(|header| std::str::from_utf8(header).ok())
         .map(|host| {
-            if host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST) {
+            if host.len() >= HEADER_HOST.len() && host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST) {
                 &host[HEADER_HOST.len()..]
             } else {
                 host
