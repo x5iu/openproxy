@@ -486,6 +486,18 @@ mod tests {
         }
     }
 
+    struct ErrorReader;
+
+    impl AsyncRead for ErrorReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "inner failure")))
+        }
+    }
+
     fn noop_waker() -> std::task::Waker {
         unsafe fn clone(_: *const ()) -> std::task::RawWaker { std::task::RawWaker::new(std::ptr::null(), &VTABLE) }
         unsafe fn wake(_: *const ()) {}
@@ -739,5 +751,73 @@ mod tests {
         let err = rdr.read_to_end(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "invalid chunk length: \"zz\"");
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_errors_when_header_too_long_without_crlf() {
+        let size = super::super::DEFAULT_BUFFER_SIZE;
+        let data = vec![b'a'; size];
+        let r = MemReader::new(data);
+        let mut rdr = ChunkedReader::data_only(r);
+        let mut out = Vec::new();
+        let err = rdr.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let expected = format!(
+            "header line too long: scanned {} bytes without CRLF (capacity {})",
+            size, size
+        );
+        assert_eq!(err.to_string(), expected);
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_errors_on_truncated_header() {
+        let enc = b"10".to_vec();
+        let r = MemReader::new(enc);
+        let mut rdr = ChunkedReader::data_only(r);
+        let mut out = Vec::new();
+        let err = rdr.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "unexpected EOF");
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_errors_on_chunk_extension_length() {
+        let enc = b"1a;foo=bar\r\n".to_vec();
+        let r = MemReader::new(enc);
+        let mut rdr = ChunkedReader::data_only(r);
+        let mut out = Vec::new();
+        let err = rdr.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            err.to_string(),
+            "invalid chunk length: \"1a;foo=bar\"",
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_full_roundtrip_including_headers_multi_chunk_small_buffer() {
+        let data: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let enc = encode_with(MemReader::new(data.clone())).await;
+        let mut rdr = ChunkedReader::new(MemReader::new(enc.clone()));
+        let mut out = Vec::new();
+        let mut tmp = [0u8; 3];
+        loop {
+            let n = AsyncReadExt::read(&mut rdr, &mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&tmp[..n]);
+        }
+        assert_eq!(out, enc);
+    }
+
+    #[tokio::test]
+    async fn limited_reader_propagates_inner_errors() {
+        let inner = ErrorReader;
+        let mut limited = LimitedReader::new(inner, 10);
+        let mut out = Vec::new();
+        let err = AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "inner failure");
     }
 }
