@@ -837,4 +837,82 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "inner failure");
     }
+
+    #[tokio::test]
+    async fn chunked_writer_propagates_error_from_inner() {
+        let mut w = ChunkedWriter::new(ErrorReader);
+        let mut out = Vec::new();
+        let err = w.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "inner failure");
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_no_uninitialized_bytes_on_error() {
+        // Verify that when inner reader returns error, no uninitialized bytes are exposed
+        let mut w = ChunkedWriter::new(ErrorReader);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0xffu8; 64]; // fill with sentinel
+        let mut rb = ReadBuf::new(&mut buf_space);
+        let result = Pin::new(&mut w).poll_read(&mut cx, &mut rb);
+        match result {
+            Poll::Ready(Err(_)) => {
+                // No bytes should be filled on error
+                assert_eq!(rb.filled().len(), 0);
+            }
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_no_uninitialized_bytes_on_pending() {
+        // Verify that when inner reader returns Pending, buffer is properly truncated
+        let data = vec![1u8; 100];
+        let mut w = ChunkedWriter::new(PendingOnceReader::new(data));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0xffu8; 64];
+        let mut rb = ReadBuf::new(&mut buf_space);
+
+        // First poll should be Pending
+        match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+            Poll::Pending => {
+                // No bytes should be filled on Pending
+                assert_eq!(rb.filled().len(), 0);
+            }
+            _ => panic!("expected Pending on first poll"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buf_reader_no_uninitialized_bytes_on_error() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufReadExt;
+
+        let mut reader = BufReader::new(ErrorReader, 64);
+        let err = reader.fill_buf().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "inner failure");
+    }
+
+    #[tokio::test]
+    async fn buf_reader_no_uninitialized_bytes_on_pending() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufRead;
+
+        let data = vec![1u8; 100];
+        let mut reader = BufReader::new(PendingOnceReader::new(data), 64);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll should be Pending
+        match Pin::new(&mut reader).poll_fill_buf(&mut cx) {
+            Poll::Pending => {
+                // Buffer should still be empty after Pending
+                assert_eq!(reader.buffer().len(), 0);
+            }
+            _ => panic!("expected Pending on first poll"),
+        }
+    }
 }

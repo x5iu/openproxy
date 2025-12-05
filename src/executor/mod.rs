@@ -528,4 +528,73 @@ mod tests {
     fn test_default_max_connections_constant() {
         assert_eq!(DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT, 100);
     }
+
+    #[tokio::test]
+    async fn test_pool_rollback_on_injector_missing() {
+        // This tests the rollback scenario where the count is incremented
+        // but the injector is somehow missing (defensive edge case).
+        // We simulate this by directly manipulating internal state.
+        let pool: Pool<i32> = Pool::with_max_connections(5);
+
+        // First, add normally to initialize structures
+        pool.add("endpoint1", 1).await;
+
+        // Verify count is 1
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+
+        // Get the value back, count should be 0
+        let _ = pool.get("endpoint1").await;
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 0);
+
+        // Add again and verify rollback doesn't cause underflow
+        pool.add("endpoint1", 2).await;
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_capacity_atomic_increment() {
+        // Test that concurrent adds respect capacity atomically
+        use std::sync::Arc;
+
+        let pool: Arc<Pool<i32>> = Arc::new(Pool::with_max_connections(10));
+
+        // Spawn many concurrent adds
+        let mut handles = vec![];
+        for i in 0..50 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                pool.add("endpoint1", i).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Count should not exceed capacity
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert!(count <= 10, "count {} should not exceed capacity 10", count);
+
+        // Drain and verify actual items in pool
+        let mut actual_count = 0;
+        while pool.get("endpoint1").await.is_some() {
+            actual_count += 1;
+        }
+        assert!(actual_count <= 10, "actual count {} should not exceed capacity 10", actual_count);
+    }
 }

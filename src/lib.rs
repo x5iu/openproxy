@@ -354,6 +354,7 @@ use tokio::net::TcpListener;
 use worker::{Conn, Worker};
 
 /// Start the proxy server with the configured listeners
+#[must_use = "this `Result` must be handled to detect listener bind failures"]
 pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     let executor = Arc::new(Executor::new(Pool::new()));
     let (https_port, http_port) = {
