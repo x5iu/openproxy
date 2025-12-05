@@ -536,7 +536,7 @@ impl ConnTrait for Conn {
             let server_name = endpoint
                 .clone()
                 .try_into()
-                .map_err(|_| Error::InvalidHeader)?;
+                .map_err(|_| Error::InvalidServerName(endpoint.clone()))?;
             let tls_stream = connector.connect(server_name, stream).await?;
             Ok(Self {
                 endpoint: endpoint.to_string(),

@@ -345,6 +345,9 @@ pub enum Error {
     #[error("Invalid header")]
     InvalidHeader,
 
+    #[error("Invalid server name: {0}")]
+    InvalidServerName(String),
+
     #[error("No provider found")]
     NoProviderFound,
 }
