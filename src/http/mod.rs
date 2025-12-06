@@ -857,6 +857,36 @@ mod tests {
     }
 
     #[test]
+    fn test_get_host_boundary_checks() {
+        // Test empty input - should not panic
+        assert_eq!(get_host(Some(b"")), Some(""));
+
+        // Test input shorter than "Host: " prefix (6 chars)
+        assert_eq!(get_host(Some(b"H")), Some("H"));
+        assert_eq!(get_host(Some(b"Ho")), Some("Ho"));
+        assert_eq!(get_host(Some(b"Hos")), Some("Hos"));
+        assert_eq!(get_host(Some(b"Host")), Some("Host"));
+        assert_eq!(get_host(Some(b"Host:")), Some("Host:"));
+
+        // Test input exactly the length of "Host: " prefix (6 chars)
+        assert_eq!(get_host(Some(b"Host: ")), Some(""));
+
+        // Test with partial prefix match but shorter
+        assert_eq!(get_host(Some(b"host")), Some("host"));
+        assert_eq!(get_host(Some(b"HOST")), Some("HOST"));
+
+        // Test with whitespace only
+        assert_eq!(get_host(Some(b"   ")), Some("   "));
+
+        // Test with only newlines
+        assert_eq!(get_host(Some(b"\r\n")), Some("\r\n"));
+
+        // Test with mixed case prefix that matches
+        assert_eq!(get_host(Some(b"HOST: upper.com")), Some("upper.com"));
+        assert_eq!(get_host(Some(b"HoSt: mixed.com")), Some("mixed.com"));
+    }
+
+    #[test]
     fn test_read_state_copy_clone() {
         let state = ReadState::Start;
         let state_copy = state;

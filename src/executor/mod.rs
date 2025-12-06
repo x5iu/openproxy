@@ -597,4 +597,216 @@ mod tests {
         }
         assert!(actual_count <= 10, "actual count {} should not exceed capacity 10", actual_count);
     }
+
+    #[tokio::test]
+    async fn test_pool_count_consistency_after_add_get_cycles() {
+        // Test that counts stay consistent after multiple add/get cycles
+        let pool: Pool<i32> = Pool::with_max_connections(5);
+
+        // Add 3 items
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+        pool.add("endpoint1", 3).await;
+
+        // Verify count is 3
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 3);
+
+        // Get 2 items
+        assert!(pool.get("endpoint1").await.is_some());
+        assert!(pool.get("endpoint1").await.is_some());
+
+        // Verify count is 1
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+
+        // Add 4 more items (should succeed since we have capacity for 4 more)
+        pool.add("endpoint1", 4).await;
+        pool.add("endpoint1", 5).await;
+        pool.add("endpoint1", 6).await;
+        pool.add("endpoint1", 7).await;
+
+        // Verify count is 5 (at capacity)
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 5);
+
+        // Try to add one more (should be dropped)
+        pool.add("endpoint1", 8).await;
+
+        // Verify count is still 5
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_pool_zero_capacity() {
+        // Test pool with zero capacity - all adds should be dropped
+        let pool: Pool<i32> = Pool::with_max_connections(0);
+
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+
+        // Should not have any items
+        assert!(pool.get("endpoint1").await.is_none());
+
+        // Count should be 0
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pool_single_capacity() {
+        // Test pool with capacity of 1
+        let pool: Pool<i32> = Pool::with_max_connections(1);
+
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await; // Should be dropped
+
+        // Should only get one item
+        assert_eq!(pool.get("endpoint1").await, Some(1));
+        assert!(pool.get("endpoint1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_concurrent_add_and_get() {
+        use std::sync::Arc;
+
+        let pool: Arc<Pool<i32>> = Arc::new(Pool::with_max_connections(20));
+
+        // Spawn concurrent adds and gets
+        let mut handles = vec![];
+
+        // Spawn 10 tasks that add items
+        for i in 0..10 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                for j in 0..5 {
+                    pool.add("endpoint1", i * 10 + j).await;
+                }
+            }));
+        }
+
+        // Spawn 5 tasks that get items
+        for _ in 0..5 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..10 {
+                    let _ = pool.get("endpoint1").await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Verify count is consistent with actual items
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+
+        let mut actual = 0;
+        while pool.get("endpoint1").await.is_some() {
+            actual += 1;
+        }
+
+        assert_eq!(count, actual, "count {} should match actual items {}", count, actual);
+    }
+
+    #[tokio::test]
+    async fn test_pool_multiple_endpoints_isolation() {
+        // Test that capacity is tracked independently per endpoint
+        let pool: Pool<i32> = Pool::with_max_connections(2);
+
+        // Fill endpoint1 to capacity
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+        pool.add("endpoint1", 3).await; // Should be dropped
+
+        // endpoint2 should still have full capacity
+        pool.add("endpoint2", 10).await;
+        pool.add("endpoint2", 20).await;
+        pool.add("endpoint2", 30).await; // Should be dropped
+
+        // Verify each endpoint has exactly 2 items
+        let mut e1_count = 0;
+        while pool.get("endpoint1").await.is_some() {
+            e1_count += 1;
+        }
+        assert_eq!(e1_count, 2);
+
+        let mut e2_count = 0;
+        while pool.get("endpoint2").await.is_some() {
+            e2_count += 1;
+        }
+        assert_eq!(e2_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_get_decrements_count_correctly() {
+        let pool: Pool<i32> = Pool::with_max_connections(10);
+
+        pool.add("endpoint1", 1).await;
+        pool.add("endpoint1", 2).await;
+        pool.add("endpoint1", 3).await;
+
+        // Count should be 3
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 3);
+
+        // Get one item
+        pool.get("endpoint1").await;
+
+        // Count should be 2
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 2);
+
+        // Get from non-existent endpoint should not affect anything
+        pool.get("nonexistent").await;
+
+        // Count for endpoint1 should still be 2
+        let count = pool.conn_counts.read().await
+            .get("endpoint1")
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_entry_api_initialization() {
+        // Test that entry API correctly initializes structures
+        let pool: Pool<i32> = Pool::with_max_connections(5);
+
+        // First add should create the structures
+        pool.add("new_endpoint", 1).await;
+
+        // Verify injector was created
+        assert!(pool.injectors.read().await.contains_key("new_endpoint"));
+
+        // Verify conn_counts was created
+        assert!(pool.conn_counts.read().await.contains_key("new_endpoint"));
+    }
 }
