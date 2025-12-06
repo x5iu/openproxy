@@ -3,10 +3,22 @@
 End-to-end tests for WebSocket proxy support.
 
 These tests verify that openproxy correctly proxies WebSocket connections
-for both HTTP and HTTPS.
+for both HTTP/1.1 and HTTP/2:
+
+HTTP/1.1 WebSocket:
+- Standard WebSocket upgrade (Upgrade: websocket, Connection: Upgrade)
+- Works with ws:// and wss:// URLs
+
+HTTP/2 WebSocket (RFC 8441):
+- Uses Extended CONNECT method with :protocol pseudo-header
+- openproxy enables SETTINGS_ENABLE_CONNECT_PROTOCOL
+- Client sends CONNECT with :protocol=websocket
+- Server responds with 200 OK (not 101)
+- Data flows over the HTTP/2 stream
 
 Requirements:
 - websockets library: pip install websockets
+- httpx with h2 support: pip install httpx[http2]
 - A WebSocket echo server running on the configured endpoint
 """
 
