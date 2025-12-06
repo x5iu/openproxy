@@ -68,7 +68,13 @@ jobs:
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
           # Use dummy values if secrets not set
           ENDPOINT="${OPENAI_HOST:-api.openai.com}"
+          # Strip protocol prefix if present (https:// or http://)
+          ENDPOINT="${ENDPOINT#https://}"
+          ENDPOINT="${ENDPOINT#http://}"
+          # Strip trailing slash if present
+          ENDPOINT="${ENDPOINT%/}"
           API_KEY="${OPENAI_KEY:-sk-dummy}"
+          echo "Using endpoint: ${ENDPOINT}"
           printf '%s\n' \
             "cert_file: fullchain.pem" \
             "private_key_file: privkey.pem" \
