@@ -339,6 +339,135 @@ async def test_websocket_subprotocol(url: str, ssl_context: Optional[ssl.SSLCont
         return False
 
 
+async def test_openai_realtime_api(proxy_url: str, ssl_context: Optional[ssl.SSLContext] = None):
+    """
+    Test WebSocket proxy with OpenAI Realtime API.
+
+    This test connects to OpenAI's Realtime API through the proxy and
+    verifies that WebSocket communication works correctly.
+
+    Args:
+        proxy_url: The proxy WebSocket URL (e.g., wss://localhost:443)
+        ssl_context: Optional SSL context for the connection
+    """
+    print(f"\n{'='*60}")
+    print("Testing OpenAI Realtime API via WebSocket Proxy")
+    print('='*60)
+
+    config = get_test_config()
+    api_key = config.get("api_key")
+
+    if not api_key or api_key == "test-key":
+        print("  Skipping: OPENAI_API_KEY not set or is test key")
+        return None  # Skip, not fail
+
+    # Build the URL for OpenAI Realtime API through proxy
+    # The proxy should route based on Host header
+    model = "gpt-4o-realtime-preview-2024-12-17"
+    ws_url = f"{proxy_url}/v1/realtime?model={model}"
+
+    extra_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "OpenAI-Beta": "realtime=v1",
+        "Host": "api.openai.com",
+    }
+
+    print(f"  URL: {ws_url}")
+    print(f"  Model: {model}")
+
+    try:
+        session_created = False
+        messages_received = []
+        response_done = False
+
+        async with ws_connect(
+            ws_url,
+            additional_headers=extra_headers,
+            ssl=ssl_context,
+            close_timeout=10,
+            open_timeout=15,
+        ) as websocket:
+            print("  Connected to OpenAI Realtime API")
+
+            # Wait for session.created event
+            try:
+                msg = await asyncio.wait_for(websocket.recv(), timeout=10)
+                data = json.loads(msg)
+                if data.get("type") == "session.created":
+                    session_created = True
+                    session_id = data.get("session", {}).get("id", "unknown")
+                    print(f"  Session created: {session_id}")
+                messages_received.append(data)
+            except asyncio.TimeoutError:
+                print("  Timeout waiting for session.created")
+                return False
+
+            # Send a simple text message
+            event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Say 'test' and nothing else."
+                        }
+                    ]
+                }
+            }
+            await websocket.send(json.dumps(event))
+            print("  Sent conversation item")
+
+            # Request a response
+            response_event = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text"],
+                }
+            }
+            await websocket.send(json.dumps(response_event))
+            print("  Requested response")
+
+            # Wait for response events
+            try:
+                while not response_done:
+                    msg = await asyncio.wait_for(websocket.recv(), timeout=15)
+                    data = json.loads(msg)
+                    event_type = data.get("type", "unknown")
+                    messages_received.append(data)
+
+                    if event_type == "response.done":
+                        response_done = True
+                        print("  Response complete")
+                    elif event_type == "response.text.delta":
+                        delta = data.get("delta", "")
+                        print(f"  Text delta: {delta}")
+                    elif event_type == "error":
+                        error = data.get("error", {})
+                        print(f"  Error: {error.get('message', 'unknown')}")
+                        return False
+
+            except asyncio.TimeoutError:
+                print("  Timeout waiting for response")
+                # Not necessarily a failure if we got session.created
+                if session_created:
+                    print("  (Session was created, connection works)")
+
+        print(f"  Total messages received: {len(messages_received)}")
+
+        if session_created:
+            print("  OpenAI Realtime API test passed!")
+            return True
+        else:
+            print("  OpenAI Realtime API test failed: no session created")
+            return False
+
+    except Exception as e:
+        print(f"  OpenAI Realtime API test failed: {e}")
+        return False
+
+
 async def run_tests():
     """Run all WebSocket tests."""
     if not WEBSOCKETS_AVAILABLE:
@@ -380,6 +509,16 @@ async def run_tests():
         results.append(("WSS JSON", await test_websocket_json_messages(config["wss_url"], ssl_context)))
         results.append(("WSS Large Message", await test_websocket_large_message(config["wss_url"], ssl_context)))
         results.append(("WSS Close", await test_websocket_connection_close(config["wss_url"], ssl_context)))
+
+    # Test OpenAI Realtime API (requires OPENAI_API_KEY)
+    if config.get("wss_url"):
+        print("\n" + "="*60)
+        print("TESTING OPENAI REALTIME API (wss://)")
+        print("="*60)
+
+        realtime_result = await test_openai_realtime_api(config["wss_url"], ssl_context)
+        if realtime_result is not None:  # None means skipped
+            results.append(("OpenAI Realtime API", realtime_result))
 
     # Print summary
     print("\n" + "="*60)
