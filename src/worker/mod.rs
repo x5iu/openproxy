@@ -14,6 +14,7 @@ use bytes::Buf;
 
 use crate::http;
 use crate::provider::Provider;
+use crate::websocket;
 use crate::Error;
 
 static TLS_CLIENT_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
@@ -159,6 +160,55 @@ where
                     err_msg = Some("authentication failed".into());
                     break;
                 }
+
+                // Check if this is a WebSocket upgrade request
+                if request.is_websocket_upgrade() {
+                    #[cfg(debug_assertions)]
+                    log::info!(host = host, path = request.path(); "websocket_upgrade_request");
+
+                    // Extract WebSocket upgrade info before dropping request and p
+                    let raw_headers = request.header_bytes().to_vec();
+                    let endpoint = provider.endpoint().to_string();
+                    let sock_address = provider.sock_address().to_string();
+                    let provider_tls = provider.tls();
+                    let host_header = provider.host_header().to_string();
+                    let auth_header = provider.auth_header().map(|s| s.to_string());
+
+                    // Drop p (RwLockReadGuard) first, then request
+                    drop(p);
+                    drop(request);
+
+                    // Handle WebSocket upgrade
+                    match self.proxy_websocket_with_data(
+                        incoming,
+                        &raw_headers,
+                        &endpoint,
+                        &sock_address,
+                        provider_tls,
+                        &host_header,
+                        auth_header.as_deref(),
+                    ).await {
+                        Ok(()) => {
+                            // WebSocket connection completed, exit the loop
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // WebSocket upgrade failed
+                            let msg = format!("WebSocket upgrade failed: {}", e);
+                            let resp = format!(
+                                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                msg.as_bytes().len(),
+                                msg
+                            );
+                            incoming
+                                .write_all(resp.as_bytes())
+                                .await
+                                .map_err(|e| ProxyError::Client(e.into()))?;
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let mut outgoing = self
                     .get_outgoing_conn(provider)
                     .await
@@ -495,6 +545,150 @@ where
         }
         None
     }
+
+    /// Handle WebSocket upgrade request with pre-extracted data
+    /// This method:
+    /// 1. Establishes a new connection to the upstream server (not from pool, since WebSocket is long-lived)
+    /// 2. Forwards the WebSocket upgrade request with rewritten Host header
+    /// 3. Reads the upgrade response
+    /// 4. If successful (101), forwards the response and starts bidirectional proxying
+    async fn proxy_websocket_with_data<S>(
+        &mut self,
+        incoming: &mut S,
+        raw_headers: &[u8],
+        endpoint: &str,
+        sock_address: &str,
+        provider_tls: bool,
+        host_header: &str,
+        auth_header: Option<&str>,
+    ) -> Result<(), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+        <P as PoolTrait>::Item: Unpin + Send + Sync,
+    {
+        // Create a new connection to upstream (don't use pool for WebSocket)
+        let stream = TcpStream::connect(sock_address).await?;
+        let mut outgoing: <P as PoolTrait>::Item = if provider_tls {
+            let connector = new_tls_connector();
+            <P as PoolTrait>::Item::new_tls(endpoint, stream, connector).await?
+        } else {
+            <P as PoolTrait>::Item::new(endpoint, stream)
+        };
+
+        // Build the WebSocket upgrade request with rewritten headers
+        let header_str = std::str::from_utf8(raw_headers).map_err(|_| Error::InvalidHeader)?;
+
+        // Rewrite Host header and Authentication header
+        let mut modified_request = String::with_capacity(raw_headers.len() + 256);
+        let mut first_line = true;
+        let mut auth_written = false;
+
+        for line in header_str.split("\r\n") {
+            if line.is_empty() {
+                break;
+            }
+
+            if first_line {
+                // Request line - keep as is
+                modified_request.push_str(line);
+                modified_request.push_str("\r\n");
+                first_line = false;
+                continue;
+            }
+
+            // Check if this is a header we want to rewrite
+            if http::is_header(line, http::HEADER_HOST) {
+                // Rewrite Host header to provider's endpoint
+                modified_request.push_str(host_header);
+                modified_request.push_str("\r\n");
+            } else if http::is_header(line, http::HEADER_AUTHORIZATION)
+                || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
+                || http::is_header(line, http::HEADER_X_API_KEY)
+            {
+                // Replace authentication header with provider's auth
+                if !auth_written {
+                    if let Some(auth) = auth_header {
+                        modified_request.push_str(auth);
+                        modified_request.push_str("\r\n");
+                        auth_written = true;
+                    }
+                }
+            } else {
+                // Keep other headers as is
+                modified_request.push_str(line);
+                modified_request.push_str("\r\n");
+            }
+        }
+        modified_request.push_str("\r\n");
+
+        // Send the modified request to upstream
+        outgoing.write_all(modified_request.as_bytes()).await?;
+        outgoing.flush().await?;
+
+        #[cfg(debug_assertions)]
+        log::info!(request = modified_request; "websocket_upgrade_request_sent");
+
+        // Read the response from upstream
+        let mut response_buf = vec![0u8; 4096];
+        let mut total_read = 0;
+
+        // Read until we find \r\n\r\n (end of headers)
+        loop {
+            let n = outgoing.read(&mut response_buf[total_read..]).await?;
+            if n == 0 {
+                return Err(Error::InvalidHeader);
+            }
+            total_read += n;
+
+            // Check for end of headers
+            if let Some(pos) = find_header_end(&response_buf[..total_read]) {
+                // Parse the response status line
+                let response_str = std::str::from_utf8(&response_buf[..pos + 4])
+                    .map_err(|_| Error::InvalidHeader)?;
+
+                let first_line = response_str.lines().next().unwrap_or("");
+                let (status, is_upgrade) = websocket::check_websocket_response(first_line);
+
+                #[cfg(debug_assertions)]
+                log::info!(status = status, is_upgrade = is_upgrade, response = response_str; "websocket_upgrade_response");
+
+                if !is_upgrade {
+                    // Not a successful upgrade, forward the error response
+                    incoming.write_all(&response_buf[..total_read]).await?;
+                    incoming.flush().await?;
+                    return Err(Error::IO(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("WebSocket upgrade rejected with status {}", status),
+                    )));
+                }
+
+                // Forward the 101 response to the client
+                incoming.write_all(&response_buf[..total_read]).await?;
+                incoming.flush().await?;
+
+                #[cfg(debug_assertions)]
+                log::info!("websocket_connection_established");
+
+                // Now start bidirectional proxying
+                if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
+                    #[cfg(debug_assertions)]
+                    log::info!(error = e.to_string(); "websocket_connection_closed");
+                }
+
+                return Ok(());
+            }
+
+            if total_read >= response_buf.len() {
+                return Err(Error::HeaderTooLarge);
+            }
+        }
+    }
+}
+
+/// Find the end of HTTP headers (double CRLF)
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
 }
 
 pub trait ConnTrait: AsyncRead + AsyncWrite {

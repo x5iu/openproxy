@@ -1,6 +1,7 @@
 pub mod executor;
 pub mod http;
 pub mod provider;
+pub mod websocket;
 pub mod worker;
 
 use std::fmt::Formatter;
