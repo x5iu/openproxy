@@ -19,14 +19,21 @@ pub(crate) const QUERY_KEY_KEY: &str = "key";
 
 const HEADER_CONTENT_LENGTH: &str = "Content-Length: ";
 const HEADER_TRANSFER_ENCODING: &str = "Transfer-Encoding: ";
-const HEADER_HOST: &str = "Host: ";
+pub(crate) const HEADER_HOST: &str = "Host: ";
 pub(crate) const HEADER_AUTHORIZATION: &str = "Authorization: ";
 pub(crate) const HEADER_X_GOOG_API_KEY: &str = "x-goog-api-key: ";
 pub(crate) const HEADER_X_API_KEY: &str = "X-API-Key: ";
 const HEADER_CONNECTION: &str = "Connection: ";
+const HEADER_UPGRADE: &str = "Upgrade: ";
+const HEADER_SEC_WEBSOCKET_KEY: &str = "Sec-WebSocket-Key: ";
+const HEADER_SEC_WEBSOCKET_VERSION: &str = "Sec-WebSocket-Version: ";
+const HEADER_SEC_WEBSOCKET_PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
+const HEADER_SEC_WEBSOCKET_EXTENSIONS: &str = "Sec-WebSocket-Extensions: ";
 
 const TRANSFER_ENCODING_CHUNKED: &str = "chunked";
 const CONNECTION_KEEP_ALIVE: &str = "keep-alive";
+const UPGRADE_WEBSOCKET: &str = "websocket";
+const CONNECTION_UPGRADE: &str = "upgrade";
 
 const HEADER_CONNECTION_KEEP_ALIVE: &[u8] = b"Connection: keep-alive\r\n";
 
@@ -77,6 +84,19 @@ impl<'a> Request<'a> {
     pub fn auth_key(&self) -> Option<&[u8]> {
         self.payload.auth_key()
     }
+
+    pub fn is_websocket_upgrade(&self) -> bool {
+        self.payload.is_websocket_upgrade
+    }
+
+    pub fn websocket_upgrade(&self) -> Option<&WebSocketUpgrade> {
+        self.payload.websocket_upgrade.as_ref()
+    }
+
+    /// Get the raw header bytes for forwarding (used for WebSocket upgrade)
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.payload.internal_buffer[..self.payload.header_length + 2] // +2 for final CRLF
+    }
 }
 
 pub struct Response<'a> {
@@ -116,6 +136,15 @@ impl<'a> Response<'a> {
     }
 }
 
+/// WebSocket upgrade information extracted from headers
+#[derive(Debug, Clone)]
+pub struct WebSocketUpgrade {
+    pub sec_websocket_key: String,
+    pub sec_websocket_version: String,
+    pub sec_websocket_protocol: Option<String>,
+    pub sec_websocket_extensions: Option<String>,
+}
+
 pub(crate) struct Payload<'a> {
     internal_buffer: Box<[u8]>,
     first_block_length: usize,
@@ -128,6 +157,8 @@ pub(crate) struct Payload<'a> {
     header_chunks: [Option<Range<usize>>; 4],
     header_current_chunk: usize,
     pub(crate) conn_keep_alive: bool,
+    pub(crate) is_websocket_upgrade: bool,
+    pub(crate) websocket_upgrade: Option<WebSocketUpgrade>,
 }
 
 macro_rules! select_provider {
@@ -182,6 +213,13 @@ impl<'a> Payload<'a> {
         let mut auth_range: Option<Range<usize>> = None;
         let mut header_chunks: [Option<Range<usize>>; 4] = [None, None, None, None];
         let mut conn_keep_alive = false;
+        // WebSocket upgrade detection
+        let mut is_upgrade_websocket = false;
+        let mut is_connection_upgrade = false;
+        let mut sec_websocket_key: Option<String> = None;
+        let mut sec_websocket_version: Option<String> = None;
+        let mut sec_websocket_protocol: Option<String> = None;
+        let mut sec_websocket_extensions: Option<String> = None;
         let Some(req_line) = header_lines.next() else {
             return Err(Error::InvalidHeader);
         };
@@ -213,9 +251,33 @@ impl<'a> Payload<'a> {
                     connection_start - block_start
                 };
                 header_chunks[2] = Some(start..start + line.len());
-                if header[HEADER_CONNECTION.len()..].eq_ignore_ascii_case(CONNECTION_KEEP_ALIVE) {
+                let connection_value = &header[HEADER_CONNECTION.len()..];
+                if connection_value.eq_ignore_ascii_case(CONNECTION_KEEP_ALIVE) {
                     conn_keep_alive = true;
                 }
+                // Check for Connection: Upgrade (case-insensitive, may be comma-separated)
+                if connection_value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(CONNECTION_UPGRADE))
+                {
+                    is_connection_upgrade = true;
+                }
+            } else if is_header(header, HEADER_UPGRADE) {
+                let upgrade_value = &header[HEADER_UPGRADE.len()..];
+                if upgrade_value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(UPGRADE_WEBSOCKET))
+                {
+                    is_upgrade_websocket = true;
+                }
+            } else if is_header(header, HEADER_SEC_WEBSOCKET_KEY) {
+                sec_websocket_key = Some(header[HEADER_SEC_WEBSOCKET_KEY.len()..].to_string());
+            } else if is_header(header, HEADER_SEC_WEBSOCKET_VERSION) {
+                sec_websocket_version = Some(header[HEADER_SEC_WEBSOCKET_VERSION.len()..].to_string());
+            } else if is_header(header, HEADER_SEC_WEBSOCKET_PROTOCOL) {
+                sec_websocket_protocol = Some(header[HEADER_SEC_WEBSOCKET_PROTOCOL.len()..].to_string());
+            } else if is_header(header, HEADER_SEC_WEBSOCKET_EXTENSIONS) {
+                sec_websocket_extensions = Some(header[HEADER_SEC_WEBSOCKET_EXTENSIONS.len()..].to_string());
             }
         }
         let Ok(req_line_str) = std::str::from_utf8(req_line) else {
@@ -306,6 +368,23 @@ impl<'a> Payload<'a> {
                 Body::Read(0..0)
             }
         };
+        // Build WebSocket upgrade info if this is a valid WebSocket upgrade request
+        let is_websocket_upgrade = is_upgrade_websocket && is_connection_upgrade;
+        let websocket_upgrade = if is_websocket_upgrade {
+            if let (Some(key), Some(version)) = (sec_websocket_key, sec_websocket_version) {
+                Some(WebSocketUpgrade {
+                    sec_websocket_key: key,
+                    sec_websocket_version: version,
+                    sec_websocket_protocol,
+                    sec_websocket_extensions,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Payload {
             internal_buffer: block,
             first_block_length,
@@ -318,6 +397,8 @@ impl<'a> Payload<'a> {
             header_chunks: split_header_chunks(header_chunks, header_length),
             header_current_chunk: 0,
             conn_keep_alive,
+            is_websocket_upgrade,
+            websocket_upgrade,
         })
     }
 
@@ -908,6 +989,54 @@ mod tests {
         assert_eq!(HEADER_TRANSFER_ENCODING, "Transfer-Encoding: ");
         assert_eq!(HEADER_CONNECTION, "Connection: ");
         assert_eq!(QUERY_KEY_KEY, "key");
+    }
+
+    #[test]
+    fn test_websocket_constants() {
+        // Verify WebSocket-related constants
+        assert_eq!(HEADER_UPGRADE, "Upgrade: ");
+        assert_eq!(HEADER_SEC_WEBSOCKET_KEY, "Sec-WebSocket-Key: ");
+        assert_eq!(HEADER_SEC_WEBSOCKET_VERSION, "Sec-WebSocket-Version: ");
+        assert_eq!(HEADER_SEC_WEBSOCKET_PROTOCOL, "Sec-WebSocket-Protocol: ");
+        assert_eq!(HEADER_SEC_WEBSOCKET_EXTENSIONS, "Sec-WebSocket-Extensions: ");
+        assert_eq!(UPGRADE_WEBSOCKET, "websocket");
+        assert_eq!(CONNECTION_UPGRADE, "upgrade");
+    }
+
+    #[test]
+    fn test_websocket_upgrade_struct() {
+        let upgrade = WebSocketUpgrade {
+            sec_websocket_key: "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+            sec_websocket_version: "13".to_string(),
+            sec_websocket_protocol: Some("chat".to_string()),
+            sec_websocket_extensions: Some("permessage-deflate".to_string()),
+        };
+
+        assert_eq!(upgrade.sec_websocket_key, "dGhlIHNhbXBsZSBub25jZQ==");
+        assert_eq!(upgrade.sec_websocket_version, "13");
+        assert_eq!(upgrade.sec_websocket_protocol, Some("chat".to_string()));
+        assert_eq!(upgrade.sec_websocket_extensions, Some("permessage-deflate".to_string()));
+
+        // Test Clone
+        let cloned = upgrade.clone();
+        assert_eq!(cloned.sec_websocket_key, upgrade.sec_websocket_key);
+        assert_eq!(cloned.sec_websocket_version, upgrade.sec_websocket_version);
+    }
+
+    #[test]
+    fn test_websocket_upgrade_struct_debug() {
+        let upgrade = WebSocketUpgrade {
+            sec_websocket_key: "test-key".to_string(),
+            sec_websocket_version: "13".to_string(),
+            sec_websocket_protocol: None,
+            sec_websocket_extensions: None,
+        };
+
+        // Test Debug trait
+        let debug_str = format!("{:?}", upgrade);
+        assert!(debug_str.contains("WebSocketUpgrade"));
+        assert!(debug_str.contains("test-key"));
+        assert!(debug_str.contains("13"));
     }
 }
 
