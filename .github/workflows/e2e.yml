@@ -64,33 +64,36 @@ jobs:
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
 
-          cat > config.yml <<EOF
-          cert_file: $(pwd)/fullchain.pem
-          private_key_file: $(pwd)/privkey.pem
-          https_port: 8443
-          http_port: 8080
+          cat > config.yml <<'EOF'
+cert_file: fullchain.pem
+private_key_file: privkey.pem
+https_port: 8443
+http_port: 8080
 
-          auth_keys:
-            - ${AUTH_KEY}
+auth_keys:
+  - AUTH_KEY_PLACEHOLDER
 
-          providers:
-            - type: openai
-              host: localhost:8443
-              endpoint: ${{ secrets.OPENAI_HOST }}
-              api_key: ${{ secrets.OPENAI_API_KEY }}
-            - type: openai
-              host: localhost:8080
-              endpoint: ${{ secrets.OPENAI_HOST }}
-              api_key: ${{ secrets.OPENAI_API_KEY }}
-            - type: openai
-              host: echo.localhost:8443
-              endpoint: 127.0.0.1:9000
-              tls: false
-            - type: openai
-              host: echo.localhost:8080
-              endpoint: 127.0.0.1:9000
-              tls: false
-          EOF
+providers:
+  - type: openai
+    host: localhost:8443
+    endpoint: OPENAI_HOST_PLACEHOLDER
+    api_key: OPENAI_KEY_PLACEHOLDER
+  - type: openai
+    host: localhost:8080
+    endpoint: OPENAI_HOST_PLACEHOLDER
+    api_key: OPENAI_KEY_PLACEHOLDER
+  - type: openai
+    host: echo.localhost:8443
+    endpoint: 127.0.0.1:9000
+    tls: false
+  - type: openai
+    host: echo.localhost:8080
+    endpoint: 127.0.0.1:9000
+    tls: false
+EOF
+          sed -i "s|AUTH_KEY_PLACEHOLDER|${AUTH_KEY}|g" config.yml
+          sed -i "s|OPENAI_HOST_PLACEHOLDER|${{ secrets.OPENAI_HOST }}|g" config.yml
+          sed -i "s|OPENAI_KEY_PLACEHOLDER|${{ secrets.OPENAI_API_KEY }}|g" config.yml
 
           # Debug: show generated config
           cat config.yml
@@ -159,10 +162,13 @@ jobs:
           python test_websocket.py || echo "WebSocket HTTPS tests completed"
 
       - name: Run OpenAI Realtime API test
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
           cd e2e
-          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60 || echo "OpenAI Realtime test completed"
+          if [ -n "$OPENAI_API_KEY" ]; then
+            python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60 || echo "OpenAI Realtime test completed"
+          else
+            echo "Skipping OpenAI Realtime test - OPENAI_API_KEY not set"
+          fi
