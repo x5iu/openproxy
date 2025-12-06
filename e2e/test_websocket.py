@@ -44,12 +44,14 @@ def get_test_config():
     return {
         "ws_url": os.environ.get("WS_URL", "ws://localhost:8080"),
         "wss_url": os.environ.get("WSS_URL", "wss://localhost:443"),
+        "ws_host": os.environ.get("WS_HOST"),  # Optional custom Host header for HTTP
+        "wss_host": os.environ.get("WSS_HOST"),  # Optional custom Host header for HTTPS
         "ssl_cert": os.environ.get("SSL_CERT_FILE"),
         "api_key": os.environ.get("OPENAI_API_KEY", "test-key"),
     }
 
 
-async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test basic WebSocket echo functionality through the proxy.
 
@@ -69,6 +71,8 @@ async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = 
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         async with ws_connect(
@@ -97,7 +101,7 @@ async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = 
         return False
 
 
-async def test_websocket_multiple_messages(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_multiple_messages(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test multiple message exchanges over a single WebSocket connection.
     """
@@ -110,6 +114,8 @@ async def test_websocket_multiple_messages(url: str, ssl_context: Optional[ssl.S
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         async with ws_connect(
@@ -137,7 +143,7 @@ async def test_websocket_multiple_messages(url: str, ssl_context: Optional[ssl.S
         return False
 
 
-async def test_websocket_binary_data(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_binary_data(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test binary data transmission over WebSocket.
     """
@@ -150,6 +156,8 @@ async def test_websocket_binary_data(url: str, ssl_context: Optional[ssl.SSLCont
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         async with ws_connect(
@@ -176,7 +184,7 @@ async def test_websocket_binary_data(url: str, ssl_context: Optional[ssl.SSLCont
         return False
 
 
-async def test_websocket_json_messages(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_json_messages(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test JSON message exchange over WebSocket (common use case for APIs).
     """
@@ -189,6 +197,8 @@ async def test_websocket_json_messages(url: str, ssl_context: Optional[ssl.SSLCo
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         async with ws_connect(
@@ -222,7 +232,7 @@ async def test_websocket_json_messages(url: str, ssl_context: Optional[ssl.SSLCo
         return False
 
 
-async def test_websocket_large_message(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_large_message(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test large message handling over WebSocket.
     """
@@ -235,6 +245,8 @@ async def test_websocket_large_message(url: str, ssl_context: Optional[ssl.SSLCo
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         async with ws_connect(
@@ -262,7 +274,7 @@ async def test_websocket_large_message(url: str, ssl_context: Optional[ssl.SSLCo
         return False
 
 
-async def test_websocket_connection_close(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_connection_close(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test graceful WebSocket connection close.
     """
@@ -275,6 +287,8 @@ async def test_websocket_connection_close(url: str, ssl_context: Optional[ssl.SS
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         websocket = await ws_connect(
@@ -303,7 +317,7 @@ async def test_websocket_connection_close(url: str, ssl_context: Optional[ssl.SS
         return False
 
 
-async def test_websocket_subprotocol(url: str, ssl_context: Optional[ssl.SSLContext] = None):
+async def test_websocket_subprotocol(url: str, ssl_context: Optional[ssl.SSLContext] = None, host: Optional[str] = None):
     """
     Test WebSocket subprotocol negotiation.
     """
@@ -316,6 +330,8 @@ async def test_websocket_subprotocol(url: str, ssl_context: Optional[ssl.SSLCont
     extra_headers = {
         "Authorization": f"Bearer {config['api_key']}",
     }
+    if host:
+        extra_headers["Host"] = host
 
     try:
         async with ws_connect(
@@ -490,12 +506,13 @@ async def run_tests():
         print("TESTING HTTP WEBSOCKET (ws://)")
         print("="*60)
 
-        results.append(("WS Echo", await test_websocket_echo(config["ws_url"])))
-        results.append(("WS Multiple Messages", await test_websocket_multiple_messages(config["ws_url"])))
-        results.append(("WS Binary", await test_websocket_binary_data(config["ws_url"])))
-        results.append(("WS JSON", await test_websocket_json_messages(config["ws_url"])))
-        results.append(("WS Large Message", await test_websocket_large_message(config["ws_url"])))
-        results.append(("WS Close", await test_websocket_connection_close(config["ws_url"])))
+        ws_host = config.get("ws_host")
+        results.append(("WS Echo", await test_websocket_echo(config["ws_url"], host=ws_host)))
+        results.append(("WS Multiple Messages", await test_websocket_multiple_messages(config["ws_url"], host=ws_host)))
+        results.append(("WS Binary", await test_websocket_binary_data(config["ws_url"], host=ws_host)))
+        results.append(("WS JSON", await test_websocket_json_messages(config["ws_url"], host=ws_host)))
+        results.append(("WS Large Message", await test_websocket_large_message(config["ws_url"], host=ws_host)))
+        results.append(("WS Close", await test_websocket_connection_close(config["ws_url"], host=ws_host)))
 
     # Test HTTPS WebSocket (wss://)
     if config.get("wss_url") and ssl_context:
@@ -503,12 +520,13 @@ async def run_tests():
         print("TESTING HTTPS WEBSOCKET (wss://)")
         print("="*60)
 
-        results.append(("WSS Echo", await test_websocket_echo(config["wss_url"], ssl_context)))
-        results.append(("WSS Multiple Messages", await test_websocket_multiple_messages(config["wss_url"], ssl_context)))
-        results.append(("WSS Binary", await test_websocket_binary_data(config["wss_url"], ssl_context)))
-        results.append(("WSS JSON", await test_websocket_json_messages(config["wss_url"], ssl_context)))
-        results.append(("WSS Large Message", await test_websocket_large_message(config["wss_url"], ssl_context)))
-        results.append(("WSS Close", await test_websocket_connection_close(config["wss_url"], ssl_context)))
+        wss_host = config.get("wss_host")
+        results.append(("WSS Echo", await test_websocket_echo(config["wss_url"], ssl_context, host=wss_host)))
+        results.append(("WSS Multiple Messages", await test_websocket_multiple_messages(config["wss_url"], ssl_context, host=wss_host)))
+        results.append(("WSS Binary", await test_websocket_binary_data(config["wss_url"], ssl_context, host=wss_host)))
+        results.append(("WSS JSON", await test_websocket_json_messages(config["wss_url"], ssl_context, host=wss_host)))
+        results.append(("WSS Large Message", await test_websocket_large_message(config["wss_url"], ssl_context, host=wss_host)))
+        results.append(("WSS Close", await test_websocket_connection_close(config["wss_url"], ssl_context, host=wss_host)))
 
     # Test OpenAI Realtime API (requires OPENAI_API_KEY)
     if config.get("wss_url"):

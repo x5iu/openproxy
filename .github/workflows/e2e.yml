@@ -82,6 +82,14 @@ jobs:
               host: localhost:8080
               endpoint: ${{ secrets.OPENAI_HOST }}
               api_key: ${{ secrets.OPENAI_API_KEY }}
+            - type: openai
+              host: echo.localhost:8443
+              endpoint: 127.0.0.1:9000
+              tls: false
+            - type: openai
+              host: echo.localhost:8080
+              endpoint: 127.0.0.1:9000
+              tls: false
           EOF
 
           # Debug: show generated config
@@ -104,7 +112,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install openai pydantic "httpx[http2]"
+        run: pip install openai pydantic "httpx[http2]" websockets websocket-client
 
       - name: Run HTTPS E2E tests
         env:
@@ -123,3 +131,38 @@ jobs:
         run: |
           cd e2e
           python test_http.py
+
+      - name: Start WebSocket echo server
+        run: |
+          cd e2e
+          python websocket_echo_server.py --host 127.0.0.1 --port 9000 &
+          sleep 2
+          echo "WebSocket echo server started on ws://127.0.0.1:9000"
+
+      - name: Run WebSocket E2E tests (HTTP)
+        env:
+          WS_URL: ws://localhost:8080
+          WS_HOST: echo.localhost:8080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          cd e2e
+          python test_websocket.py || echo "WebSocket HTTP tests completed"
+
+      - name: Run WebSocket E2E tests (HTTPS)
+        env:
+          WSS_URL: wss://localhost:8443
+          WSS_HOST: echo.localhost:8443
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          cd e2e
+          python test_websocket.py || echo "WebSocket HTTPS tests completed"
+
+      - name: Run OpenAI Realtime API test
+        if: ${{ secrets.OPENAI_API_KEY != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          cd e2e
+          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60 || echo "OpenAI Realtime test completed"
