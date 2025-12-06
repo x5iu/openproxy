@@ -345,6 +345,9 @@ pub enum Error {
     #[error("Invalid header")]
     InvalidHeader,
 
+    #[error("Invalid server name: {0}")]
+    InvalidServerName(String),
+
     #[error("No provider found")]
     NoProviderFound,
 }
@@ -354,7 +357,16 @@ use tokio::net::TcpListener;
 use worker::{Conn, Worker};
 
 /// Start the proxy server with the configured listeners
-pub async fn serve(enable_health_check: bool) {
+///
+/// # Errors
+///
+/// Returns an error if the listener fails to bind to the configured port.
+/// This can happen if:
+/// - The port is already in use
+/// - The process lacks permission to bind to the port
+/// - The address is invalid
+#[must_use = "this `Result` must be handled to detect listener bind failures"]
+pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     let executor = Arc::new(Executor::new(Pool::new()));
     let (https_port, http_port) = {
         let p = program();
@@ -370,10 +382,8 @@ pub async fn serve(enable_health_check: bool) {
     // Start HTTPS listener if configured
     if let Some(port) = https_port {
         let executor = Arc::clone(&executor);
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-                .await
-                .unwrap();
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -395,10 +405,8 @@ pub async fn serve(enable_health_check: bool) {
     // Start HTTP listener if configured (HTTP/1.1 only)
     if let Some(port) = http_port {
         let executor = Arc::clone(&executor);
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-                .await
-                .unwrap();
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -415,5 +423,48 @@ pub async fn serve(enable_health_check: bool) {
                 }
             }
         });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_invalid_server_name() {
+        let err = Error::InvalidServerName("invalid.endpoint".to_string());
+        assert_eq!(err.to_string(), "Invalid server name: invalid.endpoint");
+
+        // Verify the error contains the problematic endpoint name
+        let err = Error::InvalidServerName("my-custom-endpoint:443".to_string());
+        assert!(err.to_string().contains("my-custom-endpoint:443"));
+    }
+
+    #[test]
+    fn test_error_display() {
+        // Test all error variants have proper Display impl
+        let io_err = Error::IO(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        assert!(io_err.to_string().contains("IO error"));
+
+        let header_err = Error::HeaderTooLarge;
+        assert_eq!(header_err.to_string(), "Header too large");
+
+        let invalid_header = Error::InvalidHeader;
+        assert_eq!(invalid_header.to_string(), "Invalid header");
+
+        let no_provider = Error::NoProviderFound;
+        assert_eq!(no_provider.to_string(), "No provider found");
+    }
+
+    #[test]
+    fn test_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let err: Error = io_err.into();
+        match err {
+            Error::IO(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused),
+            _ => panic!("Expected IO error"),
+        }
     }
 }

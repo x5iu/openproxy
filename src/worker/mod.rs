@@ -533,9 +533,11 @@ impl ConnTrait for Conn {
     ) -> Pin<Box<dyn Future<Output=Result<Self, Error>> + Send>> {
         let endpoint = endpoint.to_owned();
         Box::pin(async move {
-            let tls_stream = connector
-                .connect(endpoint.clone().try_into().unwrap(), stream)
-                .await?;
+            let server_name = endpoint
+                .clone()
+                .try_into()
+                .map_err(|_| Error::InvalidServerName(endpoint.clone()))?;
+            let tls_stream = connector.connect(server_name, stream).await?;
             Ok(Self {
                 endpoint: endpoint.to_string(),
                 stream: Stream::Tls(tls_stream),

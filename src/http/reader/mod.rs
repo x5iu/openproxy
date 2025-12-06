@@ -82,18 +82,24 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedWriter<R> {
                 this.buf.reserve(Self::MAX_DATA_SIZE - this.buf.capacity());
             }
             if this.buf.len() < Self::MAX_DATA_SIZE {
-                // SAFETY: we extend the vector length to MAX_DATA_SIZE to obtain a writable buffer;
-                // only the first `n` bytes returned by the inner reader are initialized and later read.
-                // We never read uninitialized bytes.
+                // SAFETY: extend to MAX_DATA_SIZE to obtain a writable buffer; truncate after the read.
                 unsafe { this.buf.set_len(Self::MAX_DATA_SIZE); }
             }
             let n = {
                 let mut rb = ReadBuf::new(&mut this.buf[..Self::MAX_DATA_SIZE]);
-                let Poll::Ready(_) = pin!(&mut this.reader).poll_read(cx, &mut rb)? else {
-                    return Poll::Pending;
-                };
-                rb.filled().len()
+                match pin!(&mut this.reader).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => rb.filled().len(),
+                    Poll::Ready(Err(e)) => {
+                        this.buf.truncate(0);
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        this.buf.truncate(0);
+                        return Poll::Pending;
+                    }
+                }
             };
+            this.buf.truncate(n);
             let mut n0 = n;
             let mut i = 0usize;
             #[allow(const_evaluatable_unchecked)]
@@ -332,19 +338,29 @@ pub(crate) mod buf_reader {
             let me = self.get_mut();
             let (len, cap) = (me.buf.len(), me.buf.capacity());
             if len < cap {
+                // SAFETY: temporarily extend the buffer, then truncate based on actual bytes read.
                 unsafe {
                     me.buf.set_len(cap);
-                    let mut buf = ReadBuf::new(&mut me.buf[len..cap]);
-                    let poll = pin!(&mut me.inner).poll_read(cx, &mut buf)?;
-                    let n = buf.filled().len();
-                    me.buf.set_len(len + n);
-                    if poll.is_pending() {
+                }
+                let mut buf = ReadBuf::new(&mut me.buf[len..cap]);
+                match pin!(&mut me.inner).poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = buf.filled().len();
+                        me.buf.truncate(len + n);
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF",
+                            )));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        me.buf.truncate(len);
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        me.buf.truncate(len);
                         return Poll::Pending;
-                    } else if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "unexpected EOF",
-                        )));
                     }
                 }
             }
@@ -356,6 +372,7 @@ pub(crate) mod buf_reader {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -819,5 +836,260 @@ mod tests {
         let err = AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "inner failure");
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_propagates_error_from_inner() {
+        let mut w = ChunkedWriter::new(ErrorReader);
+        let mut out = Vec::new();
+        let err = w.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "inner failure");
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_no_uninitialized_bytes_on_error() {
+        // Verify that when inner reader returns error, no uninitialized bytes are exposed
+        let mut w = ChunkedWriter::new(ErrorReader);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0xffu8; 64]; // fill with sentinel
+        let mut rb = ReadBuf::new(&mut buf_space);
+        let result = Pin::new(&mut w).poll_read(&mut cx, &mut rb);
+        match result {
+            Poll::Ready(Err(_)) => {
+                // No bytes should be filled on error
+                assert_eq!(rb.filled().len(), 0);
+            }
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_no_uninitialized_bytes_on_pending() {
+        // Verify that when inner reader returns Pending, buffer is properly truncated
+        let data = vec![1u8; 100];
+        let mut w = ChunkedWriter::new(PendingOnceReader::new(data));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0xffu8; 64];
+        let mut rb = ReadBuf::new(&mut buf_space);
+
+        // First poll should be Pending
+        match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+            Poll::Pending => {
+                // No bytes should be filled on Pending
+                assert_eq!(rb.filled().len(), 0);
+            }
+            _ => panic!("expected Pending on first poll"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buf_reader_no_uninitialized_bytes_on_error() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufReadExt;
+
+        let mut reader = BufReader::new(ErrorReader, 64);
+        let err = reader.fill_buf().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "inner failure");
+    }
+
+    #[tokio::test]
+    async fn buf_reader_no_uninitialized_bytes_on_pending() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufRead;
+
+        let data = vec![1u8; 100];
+        let mut reader = BufReader::new(PendingOnceReader::new(data), 64);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll should be Pending
+        match Pin::new(&mut reader).poll_fill_buf(&mut cx) {
+            Poll::Pending => {
+                // Buffer should still be empty after Pending
+                assert_eq!(reader.buffer().len(), 0);
+            }
+            _ => panic!("expected Pending on first poll"),
+        }
+    }
+
+    #[tokio::test]
+    async fn buf_reader_preserves_data_on_partial_read() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufReadExt;
+
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut reader = BufReader::new(MemReader::new(data.clone()), 64);
+
+        // Fill buffer
+        let buf = reader.fill_buf().await.unwrap();
+        assert_eq!(buf, &data[..]);
+
+        // Consume only part of it
+        reader.consume(3);
+        assert_eq!(reader.buffer(), &[4u8, 5, 6, 7, 8, 9, 10]);
+
+        // Consume more
+        reader.consume(4);
+        assert_eq!(reader.buffer(), &[8u8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn buf_reader_capacity_and_buffer() {
+        use super::buf_reader::BufReader;
+
+        let data = vec![1u8; 100];
+        let reader = BufReader::new(MemReader::new(data), 32);
+
+        assert_eq!(reader.capacity(), 32);
+        assert_eq!(reader.buffer().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_empty_input() {
+        let data: Vec<u8> = vec![];
+        let enc = encode_with(MemReader::new(data.clone())).await;
+        assert_eq!(enc, b"0\r\n\r\n");
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_single_byte() {
+        let data = vec![42u8];
+        let enc = encode_with(MemReader::new(data.clone())).await;
+        assert!(enc.starts_with(b"1\r\n"));
+        assert!(enc.ends_with(b"0\r\n\r\n"));
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_exactly_max_data_size() {
+        // Test exactly 4096 bytes (MAX_DATA_SIZE)
+        let data = vec![0xAB_u8; 4096];
+        let enc = encode_with(MemReader::new(data.clone())).await;
+        // Should produce "1000\r\n" + 4096 bytes + "\r\n0\r\n\r\n"
+        assert!(enc.starts_with(b"1000\r\n"));
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_multiple_chunks_data_only() {
+        // Create multi-chunk encoded data
+        let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+        let enc = encode_with(MemReader::new(data.clone())).await;
+
+        // Decode with data_only mode
+        let mut rdr = ChunkedReader::data_only(MemReader::new(enc));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn limited_reader_exact_boundary() {
+        // Test when limit exactly matches source length
+        let data: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let inner = MemReader::new(data.clone());
+        let mut limited = LimitedReader::new(inner, 64);
+        let mut out = Vec::new();
+        AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_buffer_reuse() {
+        // Verify buffer is properly reused across multiple reads
+        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+        let mut w = ChunkedWriter::new(MemReader::new(data.clone()));
+        let mut enc = Vec::new();
+        let mut tmp = [0u8; 100]; // Small buffer to force multiple reads
+        loop {
+            let n = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
+            if n == 0 { break; }
+            enc.extend_from_slice(&tmp[..n]);
+        }
+        let dec = decode_chunked(enc).await;
+        assert_eq!(dec, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_cleaning_state() {
+        // Test the cleaning state transition after reading a chunk
+        let data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
+        let enc = encode_with(MemReader::new(data.clone())).await;
+
+        // Use data_only mode to verify cleaning state works correctly
+        let mut rdr = ChunkedReader::data_only(MemReader::new(enc));
+        let mut buf = [0u8; 10];
+        let mut total_read = 0;
+
+        // Read in small chunks to exercise cleaning state
+        while total_read < data.len() {
+            let n = AsyncReadExt::read(&mut rdr, &mut buf).await.unwrap();
+            if n == 0 { break; }
+            total_read += n;
+        }
+        assert_eq!(total_read, data.len());
+    }
+
+    #[tokio::test]
+    async fn buf_reader_poll_read_bypass() {
+        use super::buf_reader::BufReader;
+
+        // When buffer is empty, poll_read should bypass directly to inner
+        let data = vec![1u8, 2, 3, 4, 5];
+        let mut reader = BufReader::new(MemReader::new(data.clone()), 64);
+
+        // Read directly without fill_buf
+        let mut buf = [0u8; 5];
+        let n = AsyncReadExt::read(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn buf_reader_reads_from_buffer_first() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufReadExt;
+
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut reader = BufReader::new(MemReader::new(data.clone()), 64);
+
+        // Fill buffer first
+        reader.fill_buf().await.unwrap();
+
+        // Now read should come from buffer
+        let mut buf = [0u8; 3];
+        let n = AsyncReadExt::read(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..n], &[1u8, 2, 3]);
+
+        // Buffer should have remaining data
+        assert_eq!(reader.buffer(), &[4u8, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn chunked_writer_out_buffer_zero_remaining() {
+        // Test when out buffer has zero remaining
+        let data = vec![1u8; 100];
+        let mut w = ChunkedWriter::new(MemReader::new(data));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf_space = [0u8; 0]; // Zero-length buffer
+        let mut rb = ReadBuf::new(&mut buf_space);
+
+        // Should return Ready(Ok(())) immediately
+        match Pin::new(&mut w).poll_read(&mut cx, &mut rb) {
+            Poll::Ready(Ok(())) => {
+                assert_eq!(rb.filled().len(), 0);
+            }
+            _ => panic!("expected Ready(Ok(())) with zero-length buffer"),
+        }
     }
 }

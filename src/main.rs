@@ -44,7 +44,9 @@ async fn start(
     enable_health_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     openproxy::load_config(&config, true).await?;
-    openproxy::serve(enable_health_check).await;
+    openproxy::serve(enable_health_check)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
     let mut signals =
         SignalsInfo::<SignalOnly>::new([signal::SIGTERM, signal::SIGINT, signal::SIGHUP])?;
     for signal in &mut signals {

@@ -85,6 +85,99 @@ run_test(client)
 
 test_no_provider_found_http()
 
+
+def test_invalid_host_header_http():
+    """Test various invalid or edge-case Host headers don't cause panics."""
+    print(f"\n{'='*50}")
+    print("Testing HTTP invalid/edge-case Host headers")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+    api_key = os.environ["OPENAI_API_KEY"]
+
+    test_cases = [
+        ("Empty Host", ""),
+        ("Short Host (1 char)", "a"),
+        ("Short Host (5 chars)", "abcde"),
+        ("Whitespace only", "   "),
+        # Note: Unicode hosts are rejected by httpx client before reaching server
+        ("Numeric host", "12345"),
+    ]
+
+    with httpx.Client(base_url=base_url, http2=False, timeout=10) as client:
+        for name, host_value in test_cases:
+            print(f"  Testing: {name}")
+            try:
+                resp = client.get(
+                    "/models",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Host": host_value,
+                    },
+                )
+                # We expect 404 (no provider found) or 400 (bad request), but no 500 or crash
+                assert resp.status_code in [400, 404], f"Unexpected status {resp.status_code} for {name}"
+                print(f"    -> Status: {resp.status_code} (OK)")
+            except (httpx.RequestError, ValueError) as e:
+                # Connection errors or invalid header errors are acceptable for some edge cases
+                print(f"    -> Client error (acceptable): {e}")
+
+    print("\u2713 HTTP invalid Host header tests passed!")
+
+
+def test_connection_reuse_http():
+    """Test that connection pooling works correctly with keep-alive."""
+    print(f"\n{'='*50}")
+    print("Testing HTTP connection reuse (keep-alive)")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+    api_key = os.environ["OPENAI_API_KEY"]
+
+    # Use a single client for multiple requests to test connection reuse
+    with httpx.Client(base_url=base_url, http2=False) as client:
+        for i in range(3):
+            resp = client.get(
+                "/v1/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            print(f"  Request {i+1}: Status {resp.status_code}")
+            # Accept either 200 (success) or 404 (no matching provider for this path)
+            assert resp.status_code in [200, 404], f"Unexpected status: {resp.status_code}"
+
+    print("\u2713 HTTP connection reuse test passed!")
+
+
+def test_bad_request_handling_http():
+    """Test that bad requests are handled gracefully."""
+    print(f"\n{'='*50}")
+    print("Testing HTTP bad request handling")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+
+    with httpx.Client(base_url=base_url, http2=False, timeout=10) as client:
+        # Request without required headers
+        try:
+            resp = client.get(
+                "/models",
+                # No Authorization header, minimal request
+            )
+            # Should get 400, 401, or 404 depending on validation order
+            print(f"  Status: {resp.status_code}")
+            assert resp.status_code in [400, 401, 404], f"Unexpected status: {resp.status_code}"
+        except httpx.RequestError as e:
+            print(f"  Connection error (acceptable): {e}")
+
+    print("\u2713 HTTP bad request handling test passed!")
+
+
+test_invalid_host_header_http()
+test_connection_reuse_http()
+test_bad_request_handling_http()
+
 print("\n" + "="*50)
 print("\u2713 All HTTP tests passed!")
 print("="*50)

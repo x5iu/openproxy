@@ -471,10 +471,9 @@ impl<'a> Payload<'a> {
 #[inline]
 fn get_host(header: Option<&[u8]>) -> Option<&str> {
     header
-        .map(|header| std::str::from_utf8(header).ok())
-        .flatten()
+        .and_then(|header| std::str::from_utf8(header).ok())
         .map(|host| {
-            if host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST) {
+            if host.len() >= HEADER_HOST.len() && host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST) {
                 &host[HEADER_HOST.len()..]
             } else {
                 host
@@ -855,6 +854,36 @@ mod tests {
 
         // Test invalid UTF-8 (should return None)
         assert_eq!(get_host(Some(&[0xff, 0xfe])), None);
+    }
+
+    #[test]
+    fn test_get_host_boundary_checks() {
+        // Test empty input - should not panic
+        assert_eq!(get_host(Some(b"")), Some(""));
+
+        // Test input shorter than "Host: " prefix (6 chars)
+        assert_eq!(get_host(Some(b"H")), Some("H"));
+        assert_eq!(get_host(Some(b"Ho")), Some("Ho"));
+        assert_eq!(get_host(Some(b"Hos")), Some("Hos"));
+        assert_eq!(get_host(Some(b"Host")), Some("Host"));
+        assert_eq!(get_host(Some(b"Host:")), Some("Host:"));
+
+        // Test input exactly the length of "Host: " prefix (6 chars)
+        assert_eq!(get_host(Some(b"Host: ")), Some(""));
+
+        // Test with partial prefix match but shorter
+        assert_eq!(get_host(Some(b"host")), Some("host"));
+        assert_eq!(get_host(Some(b"HOST")), Some("HOST"));
+
+        // Test with whitespace only
+        assert_eq!(get_host(Some(b"   ")), Some("   "));
+
+        // Test with only newlines
+        assert_eq!(get_host(Some(b"\r\n")), Some("\r\n"));
+
+        // Test with mixed case prefix that matches
+        assert_eq!(get_host(Some(b"HOST: upper.com")), Some("upper.com"));
+        assert_eq!(get_host(Some(b"HoSt: mixed.com")), Some("mixed.com"));
     }
 
     #[test]
