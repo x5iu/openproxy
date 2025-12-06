@@ -66,6 +66,9 @@ jobs:
         run: |
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
+          # Use dummy values if secrets not set
+          ENDPOINT="${OPENAI_HOST:-api.openai.com}"
+          API_KEY="${OPENAI_KEY:-sk-dummy}"
           printf '%s\n' \
             "cert_file: fullchain.pem" \
             "private_key_file: privkey.pem" \
@@ -78,12 +81,12 @@ jobs:
             "providers:" \
             "  - type: openai" \
             "    host: localhost:8443" \
-            "    endpoint: ${OPENAI_HOST}" \
-            "    api_key: ${OPENAI_KEY}" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
             "  - type: openai" \
             "    host: localhost:8080" \
-            "    endpoint: ${OPENAI_HOST}" \
-            "    api_key: ${OPENAI_KEY}" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
             "  - type: openai" \
             "    host: echo.localhost:8443" \
             "    endpoint: 127.0.0.1:9000" \
