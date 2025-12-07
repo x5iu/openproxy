@@ -28,15 +28,8 @@ import ssl
 import json
 from typing import Optional
 
-# Try to import websockets, skip tests if not available
-try:
-    import websockets
-    from websockets.client import connect as ws_connect
-    WEBSOCKETS_AVAILABLE = True
-except ImportError:
-    WEBSOCKETS_AVAILABLE = False
-    print("Warning: websockets library not installed. WebSocket tests will be skipped.")
-    print("Install with: pip install websockets")
+import websockets
+from websockets.client import connect as ws_connect
 
 
 def get_test_config():
@@ -374,8 +367,8 @@ async def test_openai_realtime_api(proxy_url: str, ssl_context: Optional[ssl.SSL
     api_key = config.get("api_key")
 
     if not api_key or api_key == "test-key":
-        print("  Skipping: OPENAI_API_KEY not set or is test key")
-        return None  # Skip, not fail
+        print("  ERROR: OPENAI_API_KEY not set or is test key")
+        return False  # Fail the test
 
     # Build the URL for OpenAI Realtime API through proxy
     # The proxy should route based on Host header
@@ -486,10 +479,6 @@ async def test_openai_realtime_api(proxy_url: str, ssl_context: Optional[ssl.SSL
 
 async def run_tests():
     """Run all WebSocket tests."""
-    if not WEBSOCKETS_AVAILABLE:
-        print("\nSkipping WebSocket tests - websockets library not available")
-        return
-
     config = get_test_config()
 
     # Create SSL context for HTTPS tests
@@ -535,8 +524,7 @@ async def run_tests():
         print("="*60)
 
         realtime_result = await test_openai_realtime_api(config["wss_url"], ssl_context)
-        if realtime_result is not None:  # None means skipped
-            results.append(("OpenAI Realtime API", realtime_result))
+        results.append(("OpenAI Realtime API", realtime_result))
 
     # Print summary
     print("\n" + "="*60)
@@ -560,10 +548,4 @@ async def run_tests():
 
 
 if __name__ == "__main__":
-    # Check if we should skip tests
-    if os.environ.get("SKIP_WEBSOCKET_TESTS"):
-        print("WebSocket tests skipped (SKIP_WEBSOCKET_TESTS is set)")
-        exit(0)
-
-    # Run tests
     asyncio.run(run_tests())

@@ -163,7 +163,7 @@ jobs:
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
         run: |
           cd e2e
-          python test_websocket.py || echo "WebSocket HTTP tests completed"
+          python test_websocket.py
 
       - name: Run WebSocket E2E tests (HTTPS)
         env:
@@ -173,7 +173,7 @@ jobs:
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
         run: |
           cd e2e
-          python test_websocket.py || echo "WebSocket HTTPS tests completed"
+          python test_websocket.py
 
       - name: Run OpenAI Realtime API test
         env:
@@ -181,8 +181,4 @@ jobs:
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
           cd e2e
-          if [ -n "$OPENAI_API_KEY" ]; then
-            python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60 || echo "OpenAI Realtime test completed"
-          else
-            echo "Skipping OpenAI Realtime test - OPENAI_API_KEY not set"
-          fi
+          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
