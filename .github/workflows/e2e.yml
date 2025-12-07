@@ -176,7 +176,16 @@ jobs:
         env:
           AUTH_KEY: ${{ env.AUTH_KEY }}
         run: |
-          echo "=== Testing WebSocket upgrade request with curl ==="
+          echo "=== Testing WebSocket direct to echo server (should work) ==="
+          curl -v -i --no-buffer \
+            -H "Host: localhost:9000" \
+            -H "Upgrade: websocket" \
+            -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            http://127.0.0.1:9000/ 2>&1 || true
+          echo ""
+          echo "=== Testing WebSocket upgrade request through proxy ==="
           echo "Sending WebSocket upgrade request to proxy..."
           curl -v -i --no-buffer \
             -H "Host: echo.localhost:8080" \
