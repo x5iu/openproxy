@@ -172,7 +172,28 @@ jobs:
           PYTEST
           python /tmp/test_echo.py
 
-      - name: Test WebSocket through proxy (debug)
+      - name: Test WebSocket through proxy (debug with curl)
+        env:
+          AUTH_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          echo "=== Testing WebSocket upgrade request with curl ==="
+          echo "Sending WebSocket upgrade request to proxy..."
+          curl -v -i --no-buffer \
+            -H "Host: echo.localhost:8080" \
+            -H "Authorization: Bearer $AUTH_KEY" \
+            -H "Upgrade: websocket" \
+            -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            http://localhost:8080/ 2>&1 || true
+          echo ""
+          echo "=== Testing regular HTTP request to proxy ==="
+          curl -v -i \
+            -H "Host: echo.localhost:8080" \
+            -H "Authorization: Bearer $AUTH_KEY" \
+            http://localhost:8080/ 2>&1 || true
+
+      - name: Test WebSocket through proxy (debug with python)
         env:
           AUTH_KEY: ${{ env.AUTH_KEY }}
         run: |
