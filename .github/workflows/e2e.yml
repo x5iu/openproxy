@@ -197,7 +197,7 @@ jobs:
 
       - name: Run OpenAI Realtime API test
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
           cd e2e
