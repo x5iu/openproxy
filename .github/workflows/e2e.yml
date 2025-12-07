@@ -101,6 +101,10 @@ jobs:
             "    endpoint: ${ENDPOINT}" \
             "    api_key: ${API_KEY}" \
             "  - type: openai" \
+            "    host: api.openai.com" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
+            "  - type: openai" \
             "    host: echo.localhost:8443" \
             "    endpoint: localhost" \
             "    port: 9000" \
