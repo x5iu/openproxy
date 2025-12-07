@@ -129,7 +129,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install openai pydantic "httpx[http2]" "websockets<15.0" websocket-client
+        run: pip install openai pydantic "httpx[http2]" "websockets==10.4" websocket-client
 
       - name: Run HTTPS E2E tests
         env:

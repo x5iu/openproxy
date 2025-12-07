@@ -28,7 +28,7 @@ import ssl
 import json
 from typing import Optional
 
-from websockets import connect as ws_connect
+import websockets
 
 
 def get_test_config():
@@ -67,7 +67,7 @@ async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = 
         extra_headers["Host"] = host
 
     try:
-        async with ws_connect(
+        async with websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -110,7 +110,7 @@ async def test_websocket_multiple_messages(url: str, ssl_context: Optional[ssl.S
         extra_headers["Host"] = host
 
     try:
-        async with ws_connect(
+        async with websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -152,7 +152,7 @@ async def test_websocket_binary_data(url: str, ssl_context: Optional[ssl.SSLCont
         extra_headers["Host"] = host
 
     try:
-        async with ws_connect(
+        async with websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -193,7 +193,7 @@ async def test_websocket_json_messages(url: str, ssl_context: Optional[ssl.SSLCo
         extra_headers["Host"] = host
 
     try:
-        async with ws_connect(
+        async with websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -241,7 +241,7 @@ async def test_websocket_large_message(url: str, ssl_context: Optional[ssl.SSLCo
         extra_headers["Host"] = host
 
     try:
-        async with ws_connect(
+        async with websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -283,7 +283,7 @@ async def test_websocket_connection_close(url: str, ssl_context: Optional[ssl.SS
         extra_headers["Host"] = host
 
     try:
-        websocket = await ws_connect(
+        websocket = await websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -326,7 +326,7 @@ async def test_websocket_subprotocol(url: str, ssl_context: Optional[ssl.SSLCont
         extra_headers["Host"] = host
 
     try:
-        async with ws_connect(
+        async with websockets.connect(
             url,
             extra_headers=extra_headers,
             ssl=ssl_context,
@@ -388,7 +388,7 @@ async def test_openai_realtime_api(proxy_url: str, ssl_context: Optional[ssl.SSL
         messages_received = []
         response_done = False
 
-        async with ws_connect(
+        async with websockets.connect(
             ws_url,
             extra_headers=extra_headers,
             ssl=ssl_context,
