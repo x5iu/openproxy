@@ -3,4 +3,5 @@
 /.idea
 /.vscode
 /.claude
-/.scripte2e/__pycache__/
+/.script
+e2e/__pycache__/

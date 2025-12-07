@@ -833,17 +833,17 @@ where
             // Check if this is a header we want to rewrite
             if http::is_header(line, http::HEADER_HOST) {
                 // Rewrite Host header to provider's endpoint
+                // Note: host_header already includes trailing \r\n
                 modified_request.push_str(host_header);
-                modified_request.push_str("\r\n");
             } else if http::is_header(line, http::HEADER_AUTHORIZATION)
                 || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
                 || http::is_header(line, http::HEADER_X_API_KEY)
             {
                 // Replace authentication header with provider's auth
+                // Note: auth already includes trailing \r\n
                 if !auth_written {
                     if let Some(auth) = auth_header {
                         modified_request.push_str(auth);
-                        modified_request.push_str("\r\n");
                         auth_written = true;
                     }
                 }
