@@ -12,6 +12,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
 - **Authentication & Authorization**: Flexible API key management with per-provider and global authentication
 - **Protocol Support**: Full HTTP/1.1 and HTTP/2 support with automatic protocol negotiation
+- **WebSocket Support**: Transparent WebSocket proxying for both HTTP/1.1 upgrade and HTTP/2 Extended CONNECT (RFC 8441)
 - **HTTP & HTTPS Support**: Run with TLS encryption (HTTPS) or plaintext HTTP for internal networks
 - **TLS Encryption**: Secure communication using [rustls](https://crates.io/crates/tokio-rustls) with modern cipher suites
 - **Configuration Management**: YAML-based configuration with hot-reload capability (SIGHUP)
@@ -187,6 +188,30 @@ curl -X POST https://localhost/v1/messages \
   -d '{"model": "claude-3-haiku-20240307", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
+### WebSocket Connections
+
+The proxy transparently handles WebSocket connections, including OpenAI's Realtime API:
+
+```python
+import websocket
+
+# Connect to OpenAI Realtime API through the proxy
+ws = websocket.create_connection(
+    "wss://localhost/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+    header=[
+        "Host: openai.example.com",
+        "Authorization: Bearer client-api-key-1",
+        "OpenAI-Beta: realtime=v1"
+    ]
+)
+
+# Send and receive messages
+ws.send('{"type": "response.create", "response": {"modalities": ["text"]}}')
+result = ws.recv()
+print(result)
+ws.close()
+```
+
 ## Performance
 
 - **Concurrent Requests**: Handles thousands of concurrent connections
@@ -220,14 +245,23 @@ cargo test test_name
 
 ### E2E Testing
 
-The project includes end-to-end tests that run via GitHub Actions. The E2E tests verify the proxy works correctly with real OpenAI API calls.
+The project includes end-to-end tests that run via GitHub Actions. The E2E tests verify the proxy works correctly with real API calls.
 
 To run E2E tests locally:
 
 ```bash
 cd e2e
-pip install openai pydantic "httpx[http2]"
-python test.py
+pip install openai pydantic "httpx[http2]" websockets websocket-client
+
+# Run HTTP/HTTPS tests
+python test_https.py
+python test_http.py
+
+# Run WebSocket tests
+python test_websocket.py
+
+# Run OpenAI Realtime API test (requires OPENAI_API_KEY)
+OPENAI_API_KEY=sk-xxx python test_openai_realtime.py --direct
 ```
 
 ## License
