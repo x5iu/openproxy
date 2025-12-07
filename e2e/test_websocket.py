@@ -28,8 +28,7 @@ import ssl
 import json
 from typing import Optional
 
-import websockets
-from websockets.client import connect as ws_connect
+from websockets import connect as ws_connect
 
 
 def get_test_config():
@@ -70,7 +69,7 @@ async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = 
     try:
         async with ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=5,
         ) as websocket:
@@ -113,7 +112,7 @@ async def test_websocket_multiple_messages(url: str, ssl_context: Optional[ssl.S
     try:
         async with ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=5,
         ) as websocket:
@@ -155,7 +154,7 @@ async def test_websocket_binary_data(url: str, ssl_context: Optional[ssl.SSLCont
     try:
         async with ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=5,
         ) as websocket:
@@ -196,7 +195,7 @@ async def test_websocket_json_messages(url: str, ssl_context: Optional[ssl.SSLCo
     try:
         async with ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=5,
         ) as websocket:
@@ -244,7 +243,7 @@ async def test_websocket_large_message(url: str, ssl_context: Optional[ssl.SSLCo
     try:
         async with ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB max
@@ -286,7 +285,7 @@ async def test_websocket_connection_close(url: str, ssl_context: Optional[ssl.SS
     try:
         websocket = await ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=5,
         )
@@ -329,7 +328,7 @@ async def test_websocket_subprotocol(url: str, ssl_context: Optional[ssl.SSLCont
     try:
         async with ws_connect(
             url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=5,
             subprotocols=["chat", "superchat"],
@@ -391,7 +390,7 @@ async def test_openai_realtime_api(proxy_url: str, ssl_context: Optional[ssl.SSL
 
         async with ws_connect(
             ws_url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             ssl=ssl_context,
             close_timeout=10,
             open_timeout=15,
