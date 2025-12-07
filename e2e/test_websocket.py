@@ -34,8 +34,8 @@ import websockets
 def get_test_config():
     """Get test configuration from environment variables."""
     return {
-        "ws_url": os.environ.get("WS_URL", "ws://localhost:8080"),
-        "wss_url": os.environ.get("WSS_URL", "wss://localhost:443"),
+        "ws_url": os.environ.get("WS_URL"),
+        "wss_url": os.environ.get("WSS_URL"),
         "ws_host": os.environ.get("WS_HOST"),  # Optional custom Host header for HTTP
         "wss_host": os.environ.get("WSS_HOST"),  # Optional custom Host header for HTTPS
         "ssl_cert": os.environ.get("SSL_CERT_FILE"),
@@ -65,6 +65,8 @@ async def test_websocket_echo(url: str, ssl_context: Optional[ssl.SSLContext] = 
     }
     if host:
         extra_headers["Host"] = host
+
+    print(f"  Headers: {extra_headers}")
 
     try:
         async with websockets.connect(
@@ -479,6 +481,22 @@ async def test_openai_realtime_api(proxy_url: str, ssl_context: Optional[ssl.SSL
 async def run_tests():
     """Run all WebSocket tests."""
     config = get_test_config()
+
+    # Debug: Print configuration
+    print("\n" + "="*60)
+    print("TEST CONFIGURATION")
+    print("="*60)
+    print(f"  WS_URL: {config.get('ws_url')}")
+    print(f"  WSS_URL: {config.get('wss_url')}")
+    print(f"  WS_HOST: {config.get('ws_host')}")
+    print(f"  WSS_HOST: {config.get('wss_host')}")
+    print(f"  SSL_CERT_FILE: {config.get('ssl_cert')}")
+    print(f"  OPENAI_API_KEY: {'set' if config.get('api_key') and config.get('api_key') != 'test-key' else 'not set'}")
+
+    # Validate configuration
+    if not config.get("ws_url") and not config.get("wss_url"):
+        print("\nERROR: Neither WS_URL nor WSS_URL is set")
+        exit(1)
 
     # Create SSL context for HTTPS tests
     ssl_context = None

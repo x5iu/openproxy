@@ -156,6 +156,43 @@ jobs:
           sleep 2
           echo "WebSocket echo server started on ws://127.0.0.1:9000"
 
+      - name: Verify echo server is running
+        run: |
+          cat > /tmp/test_echo.py << 'PYTEST'
+          import asyncio
+          import websockets
+          async def test():
+              async with websockets.connect('ws://127.0.0.1:9000') as ws:
+                  await ws.send('test')
+                  resp = await ws.recv()
+                  print(f'Echo server test: sent "test", received "{resp}"')
+                  assert resp == 'test', 'Echo server not working'
+                  print('Echo server is working correctly')
+          asyncio.run(test())
+          PYTEST
+          python /tmp/test_echo.py
+
+      - name: Test WebSocket through proxy (debug)
+        env:
+          AUTH_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          cat > /tmp/test_proxy.py << 'PYTEST'
+          import asyncio
+          import os
+          import websockets
+          async def test():
+              auth_key = os.environ.get('AUTH_KEY', '')
+              headers = {'Host': 'echo.localhost:8080', 'Authorization': f'Bearer {auth_key}'}
+              print(f'Connecting to ws://localhost:8080 with headers: {headers}')
+              async with websockets.connect('ws://localhost:8080', extra_headers=headers, close_timeout=5) as ws:
+                  await ws.send('proxy test')
+                  resp = await ws.recv()
+                  print(f'Proxy test: sent "proxy test", received "{resp}"')
+                  print('WebSocket proxy is working!')
+          asyncio.run(test())
+          PYTEST
+          python /tmp/test_proxy.py
+
       - name: Run WebSocket E2E tests (HTTP)
         env:
           WS_URL: ws://localhost:8080
