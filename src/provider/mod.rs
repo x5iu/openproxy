@@ -180,12 +180,17 @@ impl OpenAIProvider {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
-        let host_header = format!("Host: {}\r\n", endpoint);
+        let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
+        let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
+        // Include port in Host header for non-standard ports (not 80 for HTTP, not 443 for HTTPS)
+        let host_header = if (tls && port == 443) || (!tls && port == 80) {
+            format!("Host: {}\r\n", endpoint)
+        } else {
+            format!("Host: {}:{}\r\n", endpoint, port)
+        };
         let auth_header = api_key.map(|api_key| {
             format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, api_key)
         });
-        let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
-        let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
         let sock_address = format!("{}:{}", endpoint, port);
         Ok(Self {
             host,
@@ -353,10 +358,15 @@ impl GeminiProvider {
         };
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
-        let host_header = format!("Host: {}\r\n", endpoint);
-        let auth_header = format!("{}{}\r\n", http::HEADER_X_GOOG_API_KEY, api_key);
         let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
         let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
+        // Include port in Host header for non-standard ports
+        let host_header = if (tls && port == 443) || (!tls && port == 80) {
+            format!("Host: {}\r\n", endpoint)
+        } else {
+            format!("Host: {}:{}\r\n", endpoint, port)
+        };
+        let auth_header = format!("{}{}\r\n", http::HEADER_X_GOOG_API_KEY, api_key);
         let sock_address = format!("{}:{}", endpoint, port);
         Ok(GeminiProvider {
             host,
@@ -547,10 +557,15 @@ impl AnthropicProvider {
         };
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
-        let host_header = format!("Host: {}\r\n", endpoint);
-        let auth_header = format!("{}{}\r\n", http::HEADER_X_API_KEY, api_key);
         let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
         let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
+        // Include port in Host header for non-standard ports
+        let host_header = if (tls && port == 443) || (!tls && port == 80) {
+            format!("Host: {}\r\n", endpoint)
+        } else {
+            format!("Host: {}:{}\r\n", endpoint, port)
+        };
+        let auth_header = format!("{}{}\r\n", http::HEADER_X_API_KEY, api_key);
         let sock_address = format!("{}:{}", endpoint, port);
         Ok(Self {
             host,
