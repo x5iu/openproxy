@@ -534,14 +534,23 @@ async def run_tests():
         results.append(("WSS Large Message", await test_websocket_large_message(config["wss_url"], ssl_context, host=wss_host)))
         results.append(("WSS Close", await test_websocket_connection_close(config["wss_url"], ssl_context, host=wss_host)))
 
-    # Test OpenAI Realtime API (requires OPENAI_API_KEY)
-    if config.get("wss_url"):
+    # Test OpenAI Realtime API (requires OPENAI_API_KEY and a provider for api.openai.com)
+    # Note: This test is optional as there's a dedicated test_openai_realtime.py for this
+    # It will only run if we're not testing with an echo server (WSS_HOST doesn't contain 'echo')
+    wss_host = config.get("wss_host", "")
+    if config.get("wss_url") and "echo" not in wss_host.lower():
         print("\n" + "="*60)
         print("TESTING OPENAI REALTIME API (wss://)")
         print("="*60)
 
         realtime_result = await test_openai_realtime_api(config["wss_url"], ssl_context)
         results.append(("OpenAI Realtime API", realtime_result))
+    elif "echo" in wss_host.lower():
+        print("\n" + "="*60)
+        print("SKIPPING OPENAI REALTIME API (echo server detected)")
+        print("="*60)
+        print("  OpenAI Realtime API test is skipped when using echo server")
+        print("  Use test_openai_realtime.py for dedicated OpenAI API testing")
 
     # Print summary
     print("\n" + "="*60)

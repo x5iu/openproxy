@@ -172,57 +172,6 @@ jobs:
           PYTEST
           python /tmp/test_echo.py
 
-      - name: Test WebSocket through proxy (debug with curl)
-        env:
-          AUTH_KEY: ${{ env.AUTH_KEY }}
-        run: |
-          echo "=== Testing WebSocket direct to echo server (should work) ==="
-          curl -v -i --no-buffer \
-            -H "Host: localhost:9000" \
-            -H "Upgrade: websocket" \
-            -H "Connection: Upgrade" \
-            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-            -H "Sec-WebSocket-Version: 13" \
-            http://127.0.0.1:9000/ 2>&1 || true
-          echo ""
-          echo "=== Testing WebSocket upgrade request through proxy ==="
-          echo "Sending WebSocket upgrade request to proxy..."
-          curl -v -i --no-buffer \
-            -H "Host: echo.localhost:8080" \
-            -H "Authorization: Bearer $AUTH_KEY" \
-            -H "Upgrade: websocket" \
-            -H "Connection: Upgrade" \
-            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-            -H "Sec-WebSocket-Version: 13" \
-            http://localhost:8080/ 2>&1 || true
-          echo ""
-          echo "=== Testing regular HTTP request to proxy ==="
-          curl -v -i \
-            -H "Host: echo.localhost:8080" \
-            -H "Authorization: Bearer $AUTH_KEY" \
-            http://localhost:8080/ 2>&1 || true
-
-      - name: Test WebSocket through proxy (debug with python)
-        env:
-          AUTH_KEY: ${{ env.AUTH_KEY }}
-        run: |
-          cat > /tmp/test_proxy.py << 'PYTEST'
-          import asyncio
-          import os
-          import websockets
-          async def test():
-              auth_key = os.environ.get('AUTH_KEY', '')
-              headers = {'Host': 'echo.localhost:8080', 'Authorization': f'Bearer {auth_key}'}
-              print(f'Connecting to ws://localhost:8080 with headers: {headers}')
-              async with websockets.connect('ws://localhost:8080', extra_headers=headers, close_timeout=5) as ws:
-                  await ws.send('proxy test')
-                  resp = await ws.recv()
-                  print(f'Proxy test: sent "proxy test", received "{resp}"')
-                  print('WebSocket proxy is working!')
-          asyncio.run(test())
-          PYTEST
-          python /tmp/test_proxy.py
-
       - name: Run WebSocket E2E tests (HTTP)
         env:
           WS_URL: ws://localhost:8080
