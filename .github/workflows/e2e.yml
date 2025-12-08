@@ -60,31 +60,61 @@ jobs:
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
       - name: Generate auth key and config
+        env:
+          OPENAI_HOST: ${{ secrets.OPENAI_HOST }}
+          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          # Check required secrets
+          if [ -z "$OPENAI_HOST" ]; then
+            echo "::error::OPENAI_HOST secret is not set"
+            exit 1
+          fi
+          if [ -z "$OPENAI_KEY" ]; then
+            echo "::error::OPENAI_API_KEY secret is not set"
+            exit 1
+          fi
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
-
-          cat > config.yml <<EOF
-          cert_file: $(pwd)/fullchain.pem
-          private_key_file: $(pwd)/privkey.pem
-          https_port: 8443
-          http_port: 8080
-
-          auth_keys:
-            - ${AUTH_KEY}
-
-          providers:
-            - type: openai
-              host: localhost:8443
-              endpoint: ${{ secrets.OPENAI_HOST }}
-              api_key: ${{ secrets.OPENAI_API_KEY }}
-            - type: openai
-              host: localhost:8080
-              endpoint: ${{ secrets.OPENAI_HOST }}
-              api_key: ${{ secrets.OPENAI_API_KEY }}
-          EOF
-
-          # Debug: show generated config
+          # Strip protocol prefix if present (https:// or http://)
+          ENDPOINT="${OPENAI_HOST#https://}"
+          ENDPOINT="${ENDPOINT#http://}"
+          # Strip trailing slash if present
+          ENDPOINT="${ENDPOINT%/}"
+          API_KEY="${OPENAI_KEY}"
+          echo "Using endpoint: ${ENDPOINT}"
+          printf '%s\n' \
+            "cert_file: fullchain.pem" \
+            "private_key_file: privkey.pem" \
+            "https_port: 8443" \
+            "http_port: 8080" \
+            "" \
+            "auth_keys:" \
+            "  - ${AUTH_KEY}" \
+            "" \
+            "providers:" \
+            "  - type: openai" \
+            "    host: localhost:8443" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
+            "  - type: openai" \
+            "    host: localhost:8080" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
+            "  - type: openai" \
+            "    host: api.openai.com" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
+            "  - type: openai" \
+            "    host: echo.localhost:8443" \
+            "    endpoint: localhost" \
+            "    port: 9000" \
+            "    tls: false" \
+            "  - type: openai" \
+            "    host: echo.localhost:8080" \
+            "    endpoint: localhost" \
+            "    port: 9000" \
+            "    tls: false" \
+            > config.yml
           cat config.yml
 
       - name: Build openproxy
@@ -94,7 +124,6 @@ jobs:
         run: |
           ./target/release/openproxy start -c config.yml &
           sleep 3
-          # Verify the servers are running
           curl -k https://localhost:8443 || true
           curl http://localhost:8080 || true
 
@@ -104,7 +133,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install openai pydantic "httpx[http2]"
+        run: pip install openai pydantic "httpx[http2]" "websockets==10.4" websocket-client
 
       - name: Run HTTPS E2E tests
         env:
@@ -123,3 +152,53 @@ jobs:
         run: |
           cd e2e
           python test_http.py
+
+      - name: Start WebSocket echo server
+        run: |
+          cd e2e
+          python websocket_echo_server.py --host 127.0.0.1 --port 9000 &
+          sleep 2
+          echo "WebSocket echo server started on ws://127.0.0.1:9000"
+
+      - name: Verify echo server is running
+        run: |
+          cat > /tmp/test_echo.py << 'PYTEST'
+          import asyncio
+          import websockets
+          async def test():
+              async with websockets.connect('ws://127.0.0.1:9000') as ws:
+                  await ws.send('test')
+                  resp = await ws.recv()
+                  print(f'Echo server test: sent "test", received "{resp}"')
+                  assert resp == 'test', 'Echo server not working'
+                  print('Echo server is working correctly')
+          asyncio.run(test())
+          PYTEST
+          python /tmp/test_echo.py
+
+      - name: Run WebSocket E2E tests (HTTP)
+        env:
+          WS_URL: ws://localhost:8080
+          WS_HOST: echo.localhost:8080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          cd e2e
+          python test_websocket.py
+
+      - name: Run WebSocket E2E tests (HTTPS)
+        env:
+          WSS_URL: wss://localhost:8443
+          WSS_HOST: echo.localhost:8443
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          cd e2e
+          python test_websocket.py
+
+      - name: Run OpenAI Realtime API test
+        env:
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          cd e2e
+          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
