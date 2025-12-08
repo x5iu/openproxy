@@ -114,6 +114,16 @@ jobs:
             "    endpoint: localhost" \
             "    port: 9000" \
             "    tls: false" \
+            "  # Providers with path prefix for host path routing tests" \
+            "  # Use unique host names to avoid conflicts with other providers" \
+            "  - type: openai" \
+            "    host: path-test.local/openai" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
+            "  - type: openai" \
+            "    host: nested-path.local/api/v1" \
+            "    endpoint: ${ENDPOINT}" \
+            "    api_key: ${API_KEY}" \
             > config.yml
           cat config.yml
 
@@ -152,6 +162,18 @@ jobs:
         run: |
           cd e2e
           python test_http.py
+
+      - name: Run Host Path Prefix E2E tests (HTTPS)
+        env:
+          PROXY_HOST: localhost
+          PROXY_HTTPS_PORT: 8443
+          PROXY_HTTP_PORT: 8080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+          REQUESTS_CA_BUNDLE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          cd e2e
+          python test_host_path.py
 
       - name: Start WebSocket echo server
         run: |
