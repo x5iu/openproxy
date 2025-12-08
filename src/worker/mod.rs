@@ -173,6 +173,7 @@ where
                     let provider_tls = provider.tls();
                     let host_header = provider.host_header().to_string();
                     let auth_header = provider.auth_header().map(|s| s.to_string());
+                    let path_prefix = provider.path_prefix().map(|s| s.to_string());
 
                     // Drop p (RwLockReadGuard) first, then request
                     drop(p);
@@ -187,6 +188,7 @@ where
                         provider_tls,
                         &host_header,
                         auth_header.as_deref(),
+                        path_prefix.as_deref(),
                     ).await {
                         Ok(()) => {
                             // WebSocket connection completed, exit the loop
@@ -371,9 +373,18 @@ where
                         let provider_tls = provider.tls();
                         let host_header = provider.host_header().to_string();
                         let auth_header = provider.auth_header().map(|s| s.to_string());
-                        let path = request.uri().path_and_query()
+                        let path_prefix = provider.path_prefix();
+                        let mut path = request.uri().path_and_query()
                             .map(|pq| pq.as_str().to_string())
                             .unwrap_or_else(|| "/".to_string());
+
+                        // Strip path prefix if present
+                        if let Some(prefix) = path_prefix {
+                            if path.starts_with(prefix) {
+                                let remaining = &path[prefix.len()..];
+                                path = if remaining.is_empty() { "/".to_string() } else { remaining.to_string() };
+                            }
+                        }
 
                         // Drop the read lock before async operations
                         drop(p);
@@ -795,6 +806,7 @@ where
         provider_tls: bool,
         host_header: &str,
         auth_header: Option<&str>,
+        path_prefix: Option<&str>,
     ) -> Result<(), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
@@ -823,7 +835,23 @@ where
             }
 
             if first_line {
-                // Request line - keep as is
+                // Request line - strip path prefix if present
+                if let Some(prefix) = path_prefix {
+                    let path_range = http::get_req_path(line);
+                    let path = &line[path_range.clone()];
+                    if path.starts_with(prefix) {
+                        // Rewrite the request line with the path prefix removed
+                        let remaining = &path[prefix.len()..];
+                        let new_path = if remaining.is_empty() { "/" } else { remaining };
+                        modified_request.push_str(&line[..path_range.start]);
+                        modified_request.push_str(new_path);
+                        modified_request.push_str(&line[path_range.end..]);
+                        modified_request.push_str("\r\n");
+                        first_line = false;
+                        continue;
+                    }
+                }
+                // No prefix to strip, keep as is
                 modified_request.push_str(line);
                 modified_request.push_str("\r\n");
                 first_line = false;

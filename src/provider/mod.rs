@@ -103,6 +103,13 @@ pub trait Provider: Send + Sync {
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError>;
     fn weight(&self) -> f64;
 
+    /// Returns the path prefix that should be stripped from requests, if any.
+    /// For example, if host is "localhost/openai", returns Some("/openai").
+    fn path_prefix(&self) -> Option<&str> {
+        let (_, prefix) = http::split_host_path(self.host());
+        prefix
+    }
+
     fn rewrite_first_header_block(&self, block: &[u8]) -> Option<Vec<u8>> {
         let Ok(block_str) = std::str::from_utf8(block) else {
             return None;
