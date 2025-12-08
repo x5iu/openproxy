@@ -115,20 +115,13 @@ jobs:
             "    port: 9000" \
             "    tls: false" \
             "  # Providers with path prefix for host path routing tests" \
+            "  # Use unique host names to avoid conflicts with other providers" \
             "  - type: openai" \
-            "    host: localhost:8443/openai" \
+            "    host: path-test.local/openai" \
             "    endpoint: ${ENDPOINT}" \
             "    api_key: ${API_KEY}" \
             "  - type: openai" \
-            "    host: localhost:8080/openai" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: localhost:8443/api/v1" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: localhost:8080/api/v1" \
+            "    host: nested-path.local/api/v1" \
             "    endpoint: ${ENDPOINT}" \
             "    api_key: ${API_KEY}" \
             > config.yml

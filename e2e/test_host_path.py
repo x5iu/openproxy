@@ -2,13 +2,13 @@
 E2E tests for host path prefix routing.
 
 This tests the scenario where providers are configured with a path prefix in the host,
-e.g., `host: localhost/openai`. The proxy should:
+e.g., `host: path-test.local/openai`. The proxy should:
 1. Match requests based on both host and path prefix
 2. Strip the path prefix before forwarding to the backend
 
 Test configuration in e2e.yml:
-  - host: localhost:8443/openai -> routes /openai/* requests
-  - host: localhost:8443/api/v1 -> routes /api/v1/* requests
+  - host: path-test.local/openai -> routes /openai/* requests
+  - host: nested-path.local/api/v1 -> routes /api/v1/* requests
 """
 
 from typing import List
@@ -48,14 +48,25 @@ def test_host_path_prefix_https_http1():
     print("=" * 60)
 
     config = get_proxy_config()
-    # Use the /openai path prefix - requests to /openai/v1/* should be routed
-    # and the /openai prefix should be stripped, so backend receives /v1/*
+    # Connect to the actual proxy host but use Host header for routing
+    # The proxy routes based on Host header, not the actual connection host
     base_url = f"https://{config['host']}:{config['https_port']}/openai/v1"
+
+    # Create a custom transport that sets the Host header
+    class HostOverrideTransport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            # Override Host header to match our path-prefix provider
+            request.headers["Host"] = "path-test.local"
+            return super().handle_request(request)
 
     client = OpenAI(
         base_url=base_url,
         api_key=config["api_key"],
-        http_client=httpx.Client(http2=False, verify=config["ssl_cert"]),
+        http_client=httpx.Client(
+            http2=False,
+            verify=config["ssl_cert"],
+            transport=HostOverrideTransport(verify=config["ssl_cert"]),
+        ),
     )
 
     with client.responses.stream(
@@ -95,10 +106,20 @@ def test_host_path_prefix_https_http2():
     config = get_proxy_config()
     base_url = f"https://{config['host']}:{config['https_port']}/openai/v1"
 
+    # For HTTP/2, we need to use headers parameter on each request
+    # since HTTP/2 uses :authority pseudo-header
+    # We'll use a custom event hook to set the host header
+    def set_host_header(request):
+        request.headers["Host"] = "path-test.local"
+
     client = OpenAI(
         base_url=base_url,
         api_key=config["api_key"],
-        http_client=httpx.Client(http2=True, verify=config["ssl_cert"]),
+        http_client=httpx.Client(
+            http2=True,
+            verify=config["ssl_cert"],
+            event_hooks={"request": [set_host_header]},
+        ),
     )
 
     with client.responses.stream(
@@ -138,10 +159,18 @@ def test_host_path_prefix_http():
     config = get_proxy_config()
     base_url = f"http://{config['host']}:{config['http_port']}/openai/v1"
 
+    class HostOverrideTransport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            request.headers["Host"] = "path-test.local"
+            return super().handle_request(request)
+
     client = OpenAI(
         base_url=base_url,
         api_key=config["api_key"],
-        http_client=httpx.Client(http2=False),
+        http_client=httpx.Client(
+            http2=False,
+            transport=HostOverrideTransport(),
+        ),
     )
 
     with client.responses.stream(
@@ -183,10 +212,17 @@ def test_nested_path_prefix_https():
     # The /api/v1 prefix should be stripped, so backend receives /v1/*
     base_url = f"https://{config['host']}:{config['https_port']}/api/v1/v1"
 
+    def set_host_header(request):
+        request.headers["Host"] = "nested-path.local"
+
     client = OpenAI(
         base_url=base_url,
         api_key=config["api_key"],
-        http_client=httpx.Client(http2=True, verify=config["ssl_cert"]),
+        http_client=httpx.Client(
+            http2=True,
+            verify=config["ssl_cert"],
+            event_hooks={"request": [set_host_header]},
+        ),
     )
 
     with client.responses.stream(
@@ -226,10 +262,18 @@ def test_nested_path_prefix_http():
     config = get_proxy_config()
     base_url = f"http://{config['host']}:{config['http_port']}/api/v1/v1"
 
+    class HostOverrideTransport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            request.headers["Host"] = "nested-path.local"
+            return super().handle_request(request)
+
     client = OpenAI(
         base_url=base_url,
         api_key=config["api_key"],
-        http_client=httpx.Client(http2=False),
+        http_client=httpx.Client(
+            http2=False,
+            transport=HostOverrideTransport(),
+        ),
     )
 
     with client.responses.stream(
@@ -270,14 +314,13 @@ def test_path_prefix_no_match_https():
     base_url = f"https://{config['host']}:{config['https_port']}"
 
     with httpx.Client(base_url=base_url, http2=False, verify=config["ssl_cert"]) as client:
-        # Request to /nonexistent/v1/models should not match any provider with path prefix
-        # The localhost:8443 provider without path prefix will match, so this should work
-        # But /nonexistent-provider/v1/models with a different Host header should fail
+        # Request to /nonexistent/v1/models with a host that has path prefix
+        # but the path doesn't match the prefix
         resp = client.get(
-            "/nonexistent-path-prefix/v1/models",
+            "/wrongprefix/v1/models",
             headers={
                 "Authorization": f"Bearer {config['api_key']}",
-                "Host": "some-random-host.local",
+                "Host": "path-test.local",  # This host expects /openai prefix
             },
         )
 
@@ -301,10 +344,10 @@ def test_path_prefix_no_match_http():
 
     with httpx.Client(base_url=base_url, http2=False) as client:
         resp = client.get(
-            "/nonexistent-path-prefix/v1/models",
+            "/wrongprefix/v1/models",
             headers={
                 "Authorization": f"Bearer {config['api_key']}",
-                "Host": "some-random-host.local",
+                "Host": "path-test.local",  # This host expects /openai prefix
             },
         )
 
@@ -332,7 +375,7 @@ def test_path_prefix_exact_match():
             "/openai-extra/v1/models",
             headers={
                 "Authorization": f"Bearer {config['api_key']}",
-                "Host": "some-unique-host-for-test.local",
+                "Host": "path-test.local",  # This host expects /openai prefix
             },
         )
 
