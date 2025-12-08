@@ -32,62 +32,6 @@ where
     tokio::try_join!(client_to_server, server_to_client)
 }
 
-/// WebSocket-specific bidirectional copy that handles the streams without splitting
-/// This version is more efficient for cases where we own both streams
-pub async fn websocket_proxy<C, S>(
-    mut client: C,
-    mut server: S,
-) -> io::Result<()>
-where
-    C: AsyncRead + AsyncWrite + Unpin + Send,
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let mut client_buf = vec![0u8; 8192];
-    let mut server_buf = vec![0u8; 8192];
-
-    loop {
-        tokio::select! {
-            biased;
-
-            result = client.read(&mut client_buf) => {
-                match result {
-                    Ok(0) => {
-                        // Client closed, shutdown server write
-                        let _ = server.shutdown().await;
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        server.write_all(&client_buf[..n]).await?;
-                        server.flush().await?;
-                    }
-                    Err(e) => {
-                        let _ = server.shutdown().await;
-                        return Err(e);
-                    }
-                }
-            }
-
-            result = server.read(&mut server_buf) => {
-                match result {
-                    Ok(0) => {
-                        // Server closed, shutdown client write
-                        let _ = client.shutdown().await;
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        client.write_all(&server_buf[..n]).await?;
-                        client.flush().await?;
-                    }
-                    Err(e) => {
-                        let _ = client.shutdown().await;
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Parse HTTP response status line and check if it's a valid WebSocket upgrade response
 /// Returns (status_code, is_valid_upgrade)
 pub fn check_websocket_response(response_line: &str) -> (u16, bool) {
@@ -161,50 +105,5 @@ mod tests {
 
         let server_received = server_handle.await.unwrap();
         assert_eq!(&server_received, b"Hello from client");
-    }
-
-    #[tokio::test]
-    async fn test_websocket_proxy() {
-        // Test the websocket proxy function with duplex streams
-        let (client_stream, proxy_client_side) = tokio::io::duplex(1024);
-        let (proxy_server_side, server_stream) = tokio::io::duplex(1024);
-
-        // Spawn the proxy
-        let proxy_handle = tokio::spawn(async move {
-            let mut client = proxy_client_side;
-            let mut server = proxy_server_side;
-            websocket_proxy(client, server).await
-        });
-
-        // Spawn server that echoes data
-        let server_handle = tokio::spawn(async move {
-            let mut server = server_stream;
-            let mut buf = vec![0u8; 100];
-            let n = server.read(&mut buf).await.unwrap();
-            if n > 0 {
-                server.write_all(&buf[..n]).await.unwrap();
-                server.flush().await.unwrap();
-            }
-            server.shutdown().await.unwrap();
-        });
-
-        // Client sends and receives
-        let mut client = client_stream;
-        client.write_all(b"ping").await.unwrap();
-        client.flush().await.unwrap();
-
-        // Give time for the echo
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        let mut buf = vec![0u8; 100];
-        let n = client.read(&mut buf).await.unwrap();
-
-        assert_eq!(&buf[..n], b"ping");
-
-        client.shutdown().await.unwrap();
-
-        // Wait for handles
-        let _ = server_handle.await;
-        let _ = proxy_handle.await;
     }
 }
