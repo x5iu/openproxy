@@ -26,9 +26,9 @@ impl<P: PoolTrait> Executor<P> {
         }
     }
 
-    pub fn run_health_check<W: WorkerTrait<P>>(&self)
+    pub fn run_health_check<W>(&self)
     where
-        W: Send + 'static,
+        W: WorkerTrait<P> + Send + 'static,
         <P as PoolTrait>::Item: AsyncReadWrite + 'static,
     {
         let mut worker = W::new(Arc::clone(&self.conn_injector));
@@ -40,7 +40,7 @@ impl<P: PoolTrait> Executor<P> {
                     let provider_api_key = || {
                         provider
                             .api_key()
-                            .map(|k| {
+                            .and_then(|k| {
                                 if let (Some(prefix), Some(suffix)) =
                                     (k.get(..3), k.get(k.len() - 4..))
                                 {
@@ -49,7 +49,6 @@ impl<P: PoolTrait> Executor<P> {
                                     None
                                 }
                             })
-                            .flatten()
                     };
                     let fut = async {
                         let Ok(mut conn) = worker.get_outgoing_conn(&**provider).await else {
@@ -137,10 +136,10 @@ impl<P: PoolTrait> Executor<P> {
                             log::error!(alpn = "http/1.1", error = e.to_string(); "proxy_server_error");
                             #[allow(unused)]
                             {
-                                let body = format!("upstream: {}", e.to_string());
+                                let body = format!("upstream: {}", e);
                                 let resp = format!(
                                     "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                    body.as_bytes().len(),
+                                    body.len(),
                                     body
                                 );
                                 tls_stream.write_all(resp.as_bytes()).await;
@@ -187,10 +186,10 @@ impl<P: PoolTrait> Executor<P> {
                         log::error!(protocol = "http/1.1", error = e.to_string(); "proxy_server_error");
                         #[allow(unused)]
                         {
-                            let body = format!("upstream: {}", e.to_string());
+                            let body = format!("upstream: {}", e);
                             let resp = format!(
                                 "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.as_bytes().len(),
+                                body.len(),
                                 body
                             );
                             stream.write_all(resp.as_bytes()).await;
@@ -216,6 +215,12 @@ pub struct Pool<T> {
     conn_counts: RwLock<BTreeMap<String, Arc<AtomicUsize>>>,
     /// Maximum connections allowed per endpoint
     max_connections_per_endpoint: usize,
+}
+
+impl<T> Default for Pool<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> Pool<T> {

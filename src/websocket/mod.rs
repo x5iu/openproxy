@@ -1,6 +1,6 @@
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Bidirectional copy between two streams
 /// This is used after WebSocket handshake to proxy data in both directions
@@ -48,6 +48,7 @@ pub fn check_websocket_response(response_line: &str) -> (u16, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_check_websocket_response_valid() {

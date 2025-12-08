@@ -195,14 +195,11 @@ impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
                     return Poll::Ready(Ok(idx));
                 }
             }
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "header line too long: scanned {} bytes without CRLF (capacity {})",
-                    buffer.len(),
-                    capacity
-                ),
-            )))
+            Poll::Ready(Err(io::Error::other(format!(
+                "header line too long: scanned {} bytes without CRLF (capacity {})",
+                buffer.len(),
+                capacity
+            ))))
         }
         if self.cleaning {
             if self.data_only {
@@ -231,16 +228,13 @@ impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
             log::info!(buffer:serde = buffer.to_vec(), index = idx; "read_chunk_header_line");
             self.unread_chunk_length = {
                 let Ok(length_str) = std::str::from_utf8(&buffer[..idx]) else {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "non-utf8 chunk length",
-                    )));
+                    return Poll::Ready(Err(io::Error::other("non-utf8 chunk length")));
                 };
                 let Ok(length) = usize::from_str_radix(length_str, 16) else {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("invalid chunk length: \"{}\"", length_str),
-                    )));
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "invalid chunk length: \"{}\"",
+                        length_str
+                    ))));
                 };
                 if length == 0 {
                     self.finished = true;
@@ -320,7 +314,7 @@ pub(crate) mod buf_reader {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
-            if self.buf.len() == 0 {
+            if self.buf.is_empty() {
                 return pin!(&mut self.inner).poll_read(cx, buf);
             }
             let mut real_buf = ReadBuf::new(buf.initialize_unfilled());

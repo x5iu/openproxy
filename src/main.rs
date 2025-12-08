@@ -29,12 +29,12 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let openproxy = OpenProxy::parse();
-    match openproxy.command {
-        Some(Command::Start {
-                 config,
-                 enable_health_check,
-             }) => start(config, enable_health_check).await?,
-        _ => (),
+    if let Some(Command::Start {
+        config,
+        enable_health_check,
+    }) = openproxy.command
+    {
+        start(config, enable_health_check).await?
     }
     Ok(())
 }

@@ -153,7 +153,7 @@ where
                     err_msg = Some(Error::NoProviderFound.to_string().into());
                     break;
                 };
-                if !provider.authenticate(request.auth_key()).is_ok() {
+                if provider.authenticate(request.auth_key()).is_err() {
                     #[cfg(debug_assertions)]
                     log::error!(provider = provider.kind().to_string(), header:serde = request.auth_key().map(|header| header.to_vec()); "authentication_failed");
                     is_invalid_key = true;
@@ -199,7 +199,7 @@ where
                             let msg = format!("WebSocket upgrade failed: {}", e);
                             let resp = format!(
                                 "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                msg.as_bytes().len(),
+                                msg.len(),
                                 msg
                             );
                             incoming
@@ -241,7 +241,7 @@ where
                 let msg = err_msg.as_deref().unwrap_or("authentication failed");
                 let resp = format!(
                     "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    msg.as_bytes().len(),
+                    msg.len(),
                     msg
                 );
                 incoming
@@ -255,7 +255,7 @@ where
                     .unwrap_or_else(|| Error::NoProviderFound.to_string());
                 let resp = format!(
                     "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    msg.as_bytes().len(),
+                    msg.len(),
                     msg
                 );
                 incoming
@@ -266,7 +266,7 @@ where
                 let msg = err_msg.as_deref().unwrap_or("bad request");
                 let resp = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    msg.as_bytes().len(),
+                    msg.len(),
                     msg
                 );
                 incoming
@@ -303,9 +303,7 @@ where
                 };
                 if let Err(e) = send.send_data(bytes::Bytes::from(body), true) {
                     log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
-                    return;
                 }
-                ()
             }};
         }
         Box::pin(async move {
@@ -332,26 +330,24 @@ where
                         if let Some(auth_header_key) = provider.auth_header_key() {
                             auth_key = request
                                 .headers()
-                                .get(auth_header_key.trim_end_matches(|ch| ch == ' ' || ch == ':'))
-                                .map(|v| v.to_str().ok())
-                                .flatten();
+                                .get(auth_header_key.trim_end_matches([' ', ':']))
+                                .and_then(|v| v.to_str().ok());
                         }
                         if auth_key.is_none() {
                             if let Some(auth_query_key) = provider.auth_query_key() {
                                 auth_key = request
                                     .uri()
                                     .query()
-                                    .map(|query| {
+                                    .and_then(|query| {
                                         http::get_auth_query_range(query, auth_query_key)
                                             .map(|range| &query[range])
                                     })
-                                    .flatten()
                             }
                         }
                         let Some(auth_key) = auth_key else {
                             return invalid!(respond, 401, "missing authentication");
                         };
-                        if !provider.authenticate_key(auth_key).is_ok() {
+                        if provider.authenticate_key(auth_key).is_err() {
                             return invalid!(respond, 401, "authentication failed");
                         }
                     }
@@ -447,24 +443,26 @@ where
                     let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
                     let mut req = match http::Request::new(req_reader).await {
                         Ok(req) => req,
-                        Err(e @ Error::NoProviderFound) => { return invalid!(respond, 404, e.to_string()); }
-                        Err(e) => { return invalid!(respond, 400, e.to_string()); }
+                        Err(e @ Error::NoProviderFound) => { invalid!(respond, 404, e.to_string()); return; }
+                        Err(e) => { invalid!(respond, 400, e.to_string()); return; }
                     };
                     let mut outgoing = match worker.get_outgoing_conn(provider).await {
                         Ok(conn) => conn,
-                        Err(e) => { return invalid!(respond, 502, format!("upstream: {}", e.to_string())); }
+                        Err(e) => { invalid!(respond, 502, format!("upstream: {}", e)); return; }
                     };
                     if let Err(e) = req.write_to(&mut outgoing).await {
-                        return invalid!(respond, 502, format!("upstream: {}", e.to_string()));
+                        invalid!(respond, 502, format!("upstream: {}", e));
+                        return;
                     };
                     let mut response = match http::Response::new(&mut outgoing).await {
                         Ok(resp) => resp,
-                        Err(e) => { return invalid!(respond, 502, format!("upstream: {}", e.to_string())); }
+                        Err(e) => { invalid!(respond, 502, format!("upstream: {}", e)); return; }
                     };
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let mut parser = httparse::Response::new(&mut headers);
                     if let Err(e) = parser.parse(response.payload.block()) {
-                        return invalid!(respond, 502, format!("upstream: {}", e.to_string()));
+                        invalid!(respond, 502, format!("upstream: {}", e));
+                        return;
                     };
                     let mut builder = httplib::Response::builder()
                         .version(httplib::Version::HTTP_2)
@@ -611,6 +609,7 @@ where
     /// 3. Validates 101 response from upstream
     /// 4. Sends 200 OK to H2 client (per RFC 8441)
     /// 5. Performs bidirectional proxying between H2 stream and upstream connection
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_h2_websocket(
         &mut self,
         mut respond: h2::server::SendResponse<bytes::Bytes>,
@@ -696,14 +695,14 @@ where
 
                     let error_msg = format!("WebSocket upgrade rejected by upstream: {}", status);
                     let mut send = respond.send_response(builder.body(()).unwrap(), false)
-                        .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                        .map_err(|e| Error::IO(io::Error::other(e.to_string())))?;
                     send.send_data(bytes::Bytes::from(error_msg), true)
-                        .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                        .map_err(|e| Error::IO(io::Error::other(e.to_string())))?;
 
-                    return Err(Error::IO(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("WebSocket upgrade rejected with status {}", status),
-                    )));
+                    return Err(Error::IO(io::Error::other(format!(
+                        "WebSocket upgrade rejected with status {}",
+                        status
+                    ))));
                 }
 
                 // Upstream accepted, send 200 OK to H2 client (per RFC 8441)
@@ -711,8 +710,8 @@ where
                     .version(httplib::Version::HTTP_2)
                     .status(200);
 
-                let mut send = respond.send_response(builder.body(()).unwrap(), false)
-                    .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                let send = respond.send_response(builder.body(()).unwrap(), false)
+                    .map_err(|e| Error::IO(io::Error::other(e.to_string())))?;
 
                 #[cfg(debug_assertions)]
                 log::info!("h2_websocket_connection_established");
@@ -797,6 +796,7 @@ where
     /// 2. Forwards the WebSocket upgrade request with rewritten Host header
     /// 3. Reads the upgrade response
     /// 4. If successful (101), forwards the response and starts bidirectional proxying
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_websocket_with_data<S>(
         &mut self,
         incoming: &mut S,
@@ -839,9 +839,8 @@ where
                 if let Some(prefix) = path_prefix {
                     let path_range = http::get_req_path(line);
                     let path = &line[path_range.clone()];
-                    if path.starts_with(prefix) {
+                    if let Some(remaining) = path.strip_prefix(prefix) {
                         // Rewrite the request line with the path prefix removed
-                        let remaining = &path[prefix.len()..];
                         let new_path = if remaining.is_empty() { "/" } else { remaining };
                         modified_request.push_str(&line[..path_range.start]);
                         modified_request.push_str(new_path);
@@ -918,10 +917,10 @@ where
                     // Not a successful upgrade, forward the error response
                     incoming.write_all(&response_buf[..total_read]).await?;
                     incoming.flush().await?;
-                    return Err(Error::IO(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("WebSocket upgrade rejected with status {}", status),
-                    )));
+                    return Err(Error::IO(io::Error::other(format!(
+                        "WebSocket upgrade rejected with status {}",
+                        status
+                    ))));
                 }
 
                 // Forward the 101 response to the client
@@ -1078,6 +1077,7 @@ impl AsyncWrite for Conn {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Stream {
     Tcp(TcpStream),
     Tls(TlsOutgoingStream),
@@ -1154,7 +1154,7 @@ impl AsyncRead for H2StreamReader {
         let stream = match self.stream.poll_data(cx) {
             Poll::Ready(Some(Ok(stream))) => stream,
             Poll::Ready(Some(Err(e))) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+                return Poll::Ready(Err(io::Error::other(e)))
             }
             Poll::Ready(None) => return Poll::Ready(Ok(())),
             Poll::Pending => return Poll::Pending,
@@ -1183,14 +1183,14 @@ impl H2SendStreamWriter {
         // Send data
         self.send
             .send_data(bytes::Bytes::copy_from_slice(data), false)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
         // Send empty data with end_of_stream flag
         self.send
             .send_data(bytes::Bytes::new(), true)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 
@@ -1206,8 +1206,8 @@ fn base64_encode_ws_key() -> String {
     let nanos = now.as_nanos();
 
     let mut key = [0u8; 16];
-    for i in 0..16 {
-        key[i] = ((nanos >> (i * 4)) & 0xFF) as u8;
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = ((nanos >> (i * 4)) & 0xFF) as u8;
     }
 
     // Base64 encode
@@ -1218,7 +1218,7 @@ fn base64_encode_ws_key() -> String {
 fn base64_encode(data: &[u8]) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
 
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;

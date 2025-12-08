@@ -52,7 +52,7 @@ impl<'a> Request<'a> {
 
     pub async fn write_to<W: AsyncWrite + Unpin>(
         &mut self,
-        mut writer: &mut W,
+        writer: &mut W,
     ) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
@@ -61,7 +61,7 @@ impl<'a> Request<'a> {
             let Some(block) = self.payload.next_block().await? else {
                 break;
             };
-            if block.len() > 0 {
+            if !block.is_empty() {
                 #[cfg(debug_assertions)]
                 payload_blocks.push(block.to_vec());
                 writer.write_all(&block).await?;
@@ -110,7 +110,7 @@ impl<'a> Response<'a> {
 
     pub async fn write_to<W: AsyncWrite + Unpin>(
         &mut self,
-        mut writer: &mut W,
+        writer: &mut W,
     ) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
@@ -119,7 +119,7 @@ impl<'a> Response<'a> {
             let Some(block) = self.payload.next_block().await? else {
                 break;
             };
-            if block.len() > 0 {
+            if !block.is_empty() {
                 #[cfg(debug_assertions)]
                 payload_blocks.push(block.to_vec());
                 writer.write_all(&block).await?;
@@ -134,6 +134,7 @@ impl<'a> Response<'a> {
 
 /// WebSocket upgrade information extracted from headers
 /// Uses Range<usize> to avoid memory allocation - values are read from the internal buffer
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct WebSocketUpgrade {
     sec_websocket_key: Range<usize>,
@@ -155,6 +156,7 @@ pub(crate) struct Payload<'a> {
     header_current_chunk: usize,
     pub(crate) conn_keep_alive: bool,
     pub(crate) is_websocket_upgrade: bool,
+    #[allow(dead_code)]
     pub(crate) websocket_upgrade: Option<WebSocketUpgrade>,
 }
 
@@ -187,12 +189,10 @@ impl<'a> Payload<'a> {
                 };
                 if let Some(crlfs) = find_crlfs(&block[..n]) {
                     return Ok((crlfs, n));
+                } else if n >= block.len() {
+                    return Err(Error::HeaderTooLarge);
                 } else {
-                    if n >= block.len() {
-                        return Err(Error::HeaderTooLarge);
-                    } else {
-                        continue;
-                    }
+                    continue;
                 };
             }
         }
@@ -459,7 +459,7 @@ impl<'a> Payload<'a> {
         self.state
     }
 
-    pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<[u8]>>, Error> {
+    pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<'_, [u8]>>, Error> {
         match self.state {
             ReadState::Start => {
                 if self.header_current_chunk < self.header_chunks.len() {
@@ -468,14 +468,12 @@ impl<'a> Payload<'a> {
                         self.header_current_chunk += 1;
                         #[cfg(debug_assertions)]
                         log::info!(step = "ReadState::Start"; "current_block:header_chunks({})", cur_idx);
-                        if cur_idx == 0 {
-                            if self.host_range.is_some() {
-                                select_provider!((self.host().unwrap(), self.path()) => provider);
-                                if let Some(rewritten) = provider.rewrite_first_header_block(
-                                    &self.internal_buffer[range.start..range.end],
-                                ) {
-                                    return Ok(Some(Cow::Owned(rewritten)));
-                                }
+                        if cur_idx == 0 && self.host_range.is_some() {
+                            select_provider!((self.host().unwrap(), self.path()) => provider);
+                            if let Some(rewritten) = provider.rewrite_first_header_block(
+                                &self.internal_buffer[range.start..range.end],
+                            ) {
+                                return Ok(Some(Cow::Owned(rewritten)));
                             }
                         }
                         return Ok(Some(Cow::Borrowed(
@@ -1067,7 +1065,7 @@ pub(crate) fn get_auth_query_range(header: &str, key: &str) -> Option<Range<usiz
         };
         &header[first_whitespace_idx + 1..second_whitespace_idx]
     } else {
-        let next_whitespace_idx = header.find(' ').unwrap_or_else(|| header.len());
+        let next_whitespace_idx = header.find(' ').unwrap_or(header.len());
         &header[..next_whitespace_idx]
     };
     let mut query = if let Some(question_mark_idx) = url.find('?') {
