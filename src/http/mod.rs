@@ -89,10 +89,6 @@ impl<'a> Request<'a> {
         self.payload.is_websocket_upgrade
     }
 
-    pub fn websocket_upgrade(&self) -> Option<&WebSocketUpgrade> {
-        self.payload.websocket_upgrade.as_ref()
-    }
-
     /// Get the raw header bytes for forwarding (used for WebSocket upgrade)
     pub fn header_bytes(&self) -> &[u8] {
         &self.payload.internal_buffer[..self.payload.header_length + 2] // +2 for final CRLF
@@ -137,12 +133,13 @@ impl<'a> Response<'a> {
 }
 
 /// WebSocket upgrade information extracted from headers
+/// Uses Range<usize> to avoid memory allocation - values are read from the internal buffer
 #[derive(Debug, Clone)]
-pub struct WebSocketUpgrade {
-    pub sec_websocket_key: String,
-    pub sec_websocket_version: String,
-    pub sec_websocket_protocol: Option<String>,
-    pub sec_websocket_extensions: Option<String>,
+pub(crate) struct WebSocketUpgrade {
+    sec_websocket_key: Range<usize>,
+    sec_websocket_version: Range<usize>,
+    sec_websocket_protocol: Option<Range<usize>>,
+    sec_websocket_extensions: Option<Range<usize>>,
 }
 
 pub(crate) struct Payload<'a> {
@@ -216,10 +213,10 @@ impl<'a> Payload<'a> {
         // WebSocket upgrade detection
         let mut is_upgrade_websocket = false;
         let mut is_connection_upgrade = false;
-        let mut sec_websocket_key: Option<String> = None;
-        let mut sec_websocket_version: Option<String> = None;
-        let mut sec_websocket_protocol: Option<String> = None;
-        let mut sec_websocket_extensions: Option<String> = None;
+        let mut sec_websocket_key: Option<Range<usize>> = None;
+        let mut sec_websocket_version: Option<Range<usize>> = None;
+        let mut sec_websocket_protocol: Option<Range<usize>> = None;
+        let mut sec_websocket_extensions: Option<Range<usize>> = None;
         let Some(req_line) = header_lines.next() else {
             return Err(Error::InvalidHeader);
         };
@@ -271,13 +268,33 @@ impl<'a> Payload<'a> {
                     is_upgrade_websocket = true;
                 }
             } else if is_header(header, HEADER_SEC_WEBSOCKET_KEY) {
-                sec_websocket_key = Some(header[HEADER_SEC_WEBSOCKET_KEY.len()..].to_string());
+                let start = {
+                    let block_start = &block[0] as *const u8 as usize;
+                    let value_start = &line[HEADER_SEC_WEBSOCKET_KEY.len()] as *const u8 as usize;
+                    value_start - block_start
+                };
+                sec_websocket_key = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_KEY.len());
             } else if is_header(header, HEADER_SEC_WEBSOCKET_VERSION) {
-                sec_websocket_version = Some(header[HEADER_SEC_WEBSOCKET_VERSION.len()..].to_string());
+                let start = {
+                    let block_start = &block[0] as *const u8 as usize;
+                    let value_start = &line[HEADER_SEC_WEBSOCKET_VERSION.len()] as *const u8 as usize;
+                    value_start - block_start
+                };
+                sec_websocket_version = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_VERSION.len());
             } else if is_header(header, HEADER_SEC_WEBSOCKET_PROTOCOL) {
-                sec_websocket_protocol = Some(header[HEADER_SEC_WEBSOCKET_PROTOCOL.len()..].to_string());
+                let start = {
+                    let block_start = &block[0] as *const u8 as usize;
+                    let value_start = &line[HEADER_SEC_WEBSOCKET_PROTOCOL.len()] as *const u8 as usize;
+                    value_start - block_start
+                };
+                sec_websocket_protocol = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_PROTOCOL.len());
             } else if is_header(header, HEADER_SEC_WEBSOCKET_EXTENSIONS) {
-                sec_websocket_extensions = Some(header[HEADER_SEC_WEBSOCKET_EXTENSIONS.len()..].to_string());
+                let start = {
+                    let block_start = &block[0] as *const u8 as usize;
+                    let value_start = &line[HEADER_SEC_WEBSOCKET_EXTENSIONS.len()] as *const u8 as usize;
+                    value_start - block_start
+                };
+                sec_websocket_extensions = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_EXTENSIONS.len());
             }
         }
         let Ok(req_line_str) = std::str::from_utf8(req_line) else {
@@ -1005,17 +1022,18 @@ mod tests {
 
     #[test]
     fn test_websocket_upgrade_struct() {
+        // WebSocketUpgrade now uses Range<usize> for zero-copy parsing
         let upgrade = WebSocketUpgrade {
-            sec_websocket_key: "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
-            sec_websocket_version: "13".to_string(),
-            sec_websocket_protocol: Some("chat".to_string()),
-            sec_websocket_extensions: Some("permessage-deflate".to_string()),
+            sec_websocket_key: 0..24,
+            sec_websocket_version: 24..26,
+            sec_websocket_protocol: Some(26..30),
+            sec_websocket_extensions: None,
         };
 
-        assert_eq!(upgrade.sec_websocket_key, "dGhlIHNhbXBsZSBub25jZQ==");
-        assert_eq!(upgrade.sec_websocket_version, "13");
-        assert_eq!(upgrade.sec_websocket_protocol, Some("chat".to_string()));
-        assert_eq!(upgrade.sec_websocket_extensions, Some("permessage-deflate".to_string()));
+        assert_eq!(upgrade.sec_websocket_key, 0..24);
+        assert_eq!(upgrade.sec_websocket_version, 24..26);
+        assert_eq!(upgrade.sec_websocket_protocol, Some(26..30));
+        assert!(upgrade.sec_websocket_extensions.is_none());
 
         // Test Clone
         let cloned = upgrade.clone();
@@ -1026,8 +1044,8 @@ mod tests {
     #[test]
     fn test_websocket_upgrade_struct_debug() {
         let upgrade = WebSocketUpgrade {
-            sec_websocket_key: "test-key".to_string(),
-            sec_websocket_version: "13".to_string(),
+            sec_websocket_key: 0..8,
+            sec_websocket_version: 8..10,
             sec_websocket_protocol: None,
             sec_websocket_extensions: None,
         };
@@ -1035,8 +1053,6 @@ mod tests {
         // Test Debug trait
         let debug_str = format!("{:?}", upgrade);
         assert!(debug_str.contains("WebSocketUpgrade"));
-        assert!(debug_str.contains("test-key"));
-        assert!(debug_str.contains("13"));
     }
 }
 

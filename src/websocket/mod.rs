@@ -2,16 +2,6 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// WebSocket upgrade request information
-#[derive(Debug, Clone)]
-pub struct WebSocketUpgrade {
-    pub sec_websocket_key: String,
-    pub sec_websocket_version: String,
-    pub sec_websocket_protocol: Option<String>,
-    pub sec_websocket_extensions: Option<String>,
-}
-
-
 /// Bidirectional copy between two streams
 /// This is used after WebSocket handshake to proxy data in both directions
 pub async fn bidirectional_copy<C, S>(
@@ -171,25 +161,6 @@ mod tests {
 
         let server_received = server_handle.await.unwrap();
         assert_eq!(&server_received, b"Hello from client");
-    }
-
-    #[test]
-    fn test_websocket_upgrade_struct() {
-        let upgrade = WebSocketUpgrade {
-            sec_websocket_key: "test-key".to_string(),
-            sec_websocket_version: "13".to_string(),
-            sec_websocket_protocol: Some("chat".to_string()),
-            sec_websocket_extensions: Some("permessage-deflate".to_string()),
-        };
-
-        assert_eq!(upgrade.sec_websocket_key, "test-key");
-        assert_eq!(upgrade.sec_websocket_version, "13");
-        assert_eq!(upgrade.sec_websocket_protocol, Some("chat".to_string()));
-        assert_eq!(upgrade.sec_websocket_extensions, Some("permessage-deflate".to_string()));
-
-        // Test Clone
-        let cloned = upgrade.clone();
-        assert_eq!(cloned.sec_websocket_key, upgrade.sec_websocket_key);
     }
 
     #[tokio::test]
