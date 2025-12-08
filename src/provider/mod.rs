@@ -21,6 +21,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     a_bytes.len() == b_bytes.len() && bool::from(a_bytes.ct_eq(b_bytes))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn new_provider(
     kind: &str,
     host: &str,
@@ -132,10 +133,11 @@ pub trait Provider: Send + Sync {
     fn is_healthy(&self) -> bool;
     fn set_healthy(&self, healthy: bool);
 
+    #[allow(clippy::type_complexity)]
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         #[allow(unused)] stream: &'stream mut dyn AsyncReadWrite,
-    ) -> Pin<Box<dyn Future<Output=Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         Box::pin(async move { Ok(()) })
     }
@@ -174,6 +176,7 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: &str,
         endpoint: &str,
@@ -188,7 +191,7 @@ impl OpenAIProvider {
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
         let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
-        let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
+        let port = port.unwrap_or(if tls { 443 } else { 80 });
         // Include port in Host header for non-standard ports (not 80 for HTTP, not 443 for HTTPS)
         let host_header = if (tls && port == 443) || (!tls && port == 80) {
             format!("Host: {}\r\n", endpoint)
@@ -259,7 +262,7 @@ impl Provider for OpenAIProvider {
     }
 
     fn has_auth_keys(&self) -> bool {
-        self.auth_keys.len() > 0 || self.provider_auth_keys.is_some()
+        !self.auth_keys.is_empty() || self.provider_auth_keys.is_some()
     }
 
     fn weight(&self) -> f64 {
@@ -309,10 +312,11 @@ impl Provider for OpenAIProvider {
         self.is_healthy.store(healthy, Ordering::SeqCst)
     }
 
+    #[allow(clippy::type_complexity)]
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
-    ) -> Pin<Box<dyn Future<Output=Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
             Box::pin(health_check(
@@ -349,6 +353,7 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: &str,
         endpoint: &str,
@@ -366,7 +371,7 @@ impl GeminiProvider {
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
         let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
-        let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
+        let port = port.unwrap_or(if tls { 443 } else { 80 });
         // Include port in Host header for non-standard ports
         let host_header = if (tls && port == 443) || (!tls && port == 80) {
             format!("Host: {}\r\n", endpoint)
@@ -435,7 +440,7 @@ impl Provider for GeminiProvider {
     }
 
     fn has_auth_keys(&self) -> bool {
-        self.auth_keys.len() > 0 || self.provider_auth_keys.is_some()
+        !self.auth_keys.is_empty() || self.provider_auth_keys.is_some()
     }
 
     fn weight(&self) -> f64 {
@@ -481,10 +486,7 @@ impl Provider for GeminiProvider {
         if let (_, Some(prefix)) = http::split_host_path(self.host()) {
             block_cow_str = replace_path(prefix, block_str);
         }
-        let Some(query_range) = http::get_auth_query_range(&block_cow_str, http::QUERY_KEY_KEY)
-        else {
-            return None;
-        };
+        let query_range = http::get_auth_query_range(&block_cow_str, http::QUERY_KEY_KEY)?;
         let mut rewritten = Vec::with_capacity(block_cow_str.len());
         rewritten.extend_from_slice(block_cow_str[..query_range.start].as_bytes());
         rewritten.extend_from_slice(self.api_key.as_bytes());
@@ -548,6 +550,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: &str,
         endpoint: &str,
@@ -565,7 +568,7 @@ impl AnthropicProvider {
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
         let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
-        let port = port.unwrap_or_else(|| if tls { 443 } else { 80 });
+        let port = port.unwrap_or(if tls { 443 } else { 80 });
         // Include port in Host header for non-standard ports
         let host_header = if (tls && port == 443) || (!tls && port == 80) {
             format!("Host: {}\r\n", endpoint)
@@ -634,7 +637,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn has_auth_keys(&self) -> bool {
-        self.auth_keys.len() > 0 || self.provider_auth_keys.is_some()
+        !self.auth_keys.is_empty() || self.provider_auth_keys.is_some()
     }
 
     fn weight(&self) -> f64 {
@@ -684,10 +687,11 @@ impl Provider for AnthropicProvider {
         self.is_healthy.store(healthy, Ordering::SeqCst)
     }
 
+    #[allow(clippy::type_complexity)]
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
-    ) -> Pin<Box<dyn Future<Output=Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
             Box::pin(health_check(
@@ -715,8 +719,7 @@ fn replace_path<'a>(prefix: &str, block_str: &'a str) -> Cow<'a, str> {
         &block_str[path_range.start..path_range.end]
     };
 
-    let modified_path = if path.starts_with(prefix) {
-        let remaining = &path[prefix.len()..];
+    let modified_path = if let Some(remaining) = path.strip_prefix(prefix) {
         if remaining.is_empty() {
             "/"
         } else {

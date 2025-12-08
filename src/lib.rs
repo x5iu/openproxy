@@ -110,7 +110,7 @@ impl Program {
             None
         };
 
-        let auth_keys = Arc::new(config.auth_keys.unwrap_or_else(Vec::new));
+        let auth_keys = Arc::new(config.auth_keys.unwrap_or_default());
         let mut providers = Vec::new();
         config.providers.sort_by_key(|provider| provider.host);
         for mut provider in config.providers {
@@ -188,7 +188,7 @@ impl Program {
                 } else {
                     provider_host == host || provider_host_without_port == host_without_port
                 };
-                selected.then(|| &**provider)
+                selected.then_some(&**provider)
             })
             .collect();
 
