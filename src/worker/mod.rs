@@ -388,6 +388,7 @@ where
                         // Get the request body stream for bidirectional communication
                         let recv_stream = request.into_body();
 
+                        #[allow(unused_variables)]
                         if let Err(e) = worker.proxy_h2_websocket(
                             respond,
                             recv_stream,
@@ -738,6 +739,7 @@ where
                                     break;
                                 }
                                 Ok(n) => {
+                                    #[allow(unused_variables)]
                                     if let Err(e) = outgoing.write_all(&client_buf[..n]).await {
                                         #[cfg(debug_assertions)]
                                         log::info!(error = e.to_string(); "h2_websocket_upstream_write_error");
@@ -745,6 +747,7 @@ where
                                     }
                                     let _ = outgoing.flush().await;
                                 }
+                                #[allow(unused_variables)]
                                 Err(e) => {
                                     #[cfg(debug_assertions)]
                                     log::info!(error = e.to_string(); "h2_websocket_client_read_error");
@@ -762,12 +765,14 @@ where
                                     break;
                                 }
                                 Ok(n) => {
+                                    #[allow(unused_variables)]
                                     if let Err(e) = send_stream.write_all(&upstream_buf[..n]).await {
                                         #[cfg(debug_assertions)]
                                         log::info!(error = e.to_string(); "h2_websocket_client_write_error");
                                         break;
                                     }
                                 }
+                                #[allow(unused_variables)]
                                 Err(e) => {
                                     #[cfg(debug_assertions)]
                                     log::info!(error = e.to_string(); "h2_websocket_upstream_read_error");
@@ -931,6 +936,7 @@ where
                 log::info!("websocket_connection_established");
 
                 // Now start bidirectional proxying
+                #[allow(unused_variables)]
                 if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
                     #[cfg(debug_assertions)]
                     log::info!(error = e.to_string(); "websocket_connection_closed");
