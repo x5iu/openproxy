@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 
 use bytes::Buf;
 
-use crate::h2_client::{self, H2Connection, H2Pool};
+use crate::h2client::{self as h2client, H2Connection, H2Pool};
 use crate::http;
 use crate::provider::Provider;
 use crate::websocket;
@@ -44,7 +44,7 @@ pub trait WorkerTrait<P>
 where
     P: PoolTrait,
 {
-    fn new(injector: Arc<P>, h2_pool: Arc<H2Pool>) -> Self;
+    fn new(injector: Arc<P>, h2pool: Arc<H2Pool>) -> Self;
     fn get_outgoing_conn<'a>(
         &'a mut self,
         provider: &'a dyn Provider,
@@ -74,7 +74,7 @@ where
 
 pub struct Worker<P> {
     pool: Arc<P>,
-    h2_pool: Arc<H2Pool>,
+    h2pool: Arc<H2Pool>,
 }
 
 impl<P> WorkerTrait<P> for Worker<P>
@@ -82,8 +82,8 @@ where
     P: PoolTrait + Send + Sync + 'static,
     <P as PoolTrait>::Item: ConnTrait,
 {
-    fn new(pool: Arc<P>, h2_pool: Arc<H2Pool>) -> Self {
-        Self { pool, h2_pool }
+    fn new(pool: Arc<P>, h2pool: Arc<H2Pool>) -> Self {
+        Self { pool, h2pool }
     }
 
     fn get_outgoing_conn<'a>(
@@ -316,7 +316,7 @@ where
                 .map_err(|e| ProxyError::Client(e.into()))?;
             while let Some(next) = stream.accept().await {
                 let (request, mut respond) = next.map_err(|e| ProxyError::Client(e.into()))?;
-                let mut worker = Worker::new(self.pool.clone(), self.h2_pool.clone());
+                let mut worker = Worker::new(self.pool.clone(), self.h2pool.clone());
                 tokio::spawn(async move {
                     let p = crate::program();
                     let Some(authority) = request.uri().authority() else {
@@ -522,7 +522,7 @@ where
                         Ok(res) => res,
                         Err(e) => {
                             // Connection might be stale, remove from pool and try again
-                            worker.h2_pool.remove(&endpoint).await;
+                            worker.h2pool.remove(&endpoint).await;
                             invalid!(respond, 502, format!("upstream send: {}", e));
                             return;
                         }
@@ -690,15 +690,15 @@ where
         use_tls: bool,
     ) -> Result<H2Connection, Error> {
         // Try to get an existing connection
-        if let Some(conn) = self.h2_pool.get(endpoint).await {
+        if let Some(conn) = self.h2pool.get(endpoint).await {
             return Ok(conn);
         }
 
         // Create a new connection
-        let conn = h2_client::connect_h2(endpoint, sock_address, use_tls).await?;
+        let conn = h2client::connect_h2(endpoint, sock_address, use_tls).await?;
 
         // Store it in the pool for future use
-        self.h2_pool.insert(endpoint, conn.clone()).await;
+        self.h2pool.insert(endpoint, conn.clone()).await;
 
         Ok(conn)
     }
