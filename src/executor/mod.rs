@@ -12,17 +12,20 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
+use crate::h2_client::H2Pool;
 use crate::provider::AsyncReadWrite;
 use crate::worker::{PoolTrait, ProxyError, WorkerTrait};
 
 pub struct Executor<P> {
     conn_injector: Arc<P>,
+    h2_pool: Arc<H2Pool>,
 }
 
 impl<P: PoolTrait> Executor<P> {
     pub fn new(pool: P) -> Self {
         Executor {
             conn_injector: Arc::new(pool),
+            h2_pool: Arc::new(H2Pool::new()),
         }
     }
 
@@ -31,7 +34,7 @@ impl<P: PoolTrait> Executor<P> {
         W: WorkerTrait<P> + Send + 'static,
         <P as PoolTrait>::Item: AsyncReadWrite + 'static,
     {
-        let mut worker = W::new(Arc::clone(&self.conn_injector));
+        let mut worker = W::new(Arc::clone(&self.conn_injector), Arc::clone(&self.h2_pool));
         tokio::spawn(async move {
             loop {
                 let p = crate::program();
@@ -96,6 +99,7 @@ impl<P: PoolTrait> Executor<P> {
             return;
         };
         let conn_injector = Arc::clone(&self.conn_injector);
+        let h2_pool = Arc::clone(&self.h2_pool);
         tokio::select! {
             _ = shutdown_rx.recv() => {}
             _ = async move {
@@ -109,7 +113,7 @@ impl<P: PoolTrait> Executor<P> {
                         return;
                     }
                 };
-                let mut worker = W::new(conn_injector);
+                let mut worker = W::new(conn_injector, h2_pool);
                 let alpn = tls_stream.get_ref().1.alpn_protocol();
                 #[cfg(debug_assertions)]
                 log::info!(alpn = alpn.map(|v| String::from_utf8_lossy(v)); "alpn_protocol");
@@ -164,10 +168,11 @@ impl<P: PoolTrait> Executor<P> {
         let p = crate::program();
         let mut shutdown_rx = p.read().await.shutdown_tx.subscribe();
         let conn_injector = Arc::clone(&self.conn_injector);
+        let h2_pool = Arc::clone(&self.h2_pool);
         tokio::select! {
             _ = shutdown_rx.recv() => {}
             _ = async {
-                let mut worker = W::new(conn_injector);
+                let mut worker = W::new(conn_injector, h2_pool);
                 #[cfg(debug_assertions)]
                 log::info!(protocol = "http/1.1"; "http_connection");
                 match worker.proxy(&mut stream).await {
