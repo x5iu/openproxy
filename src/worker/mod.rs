@@ -417,6 +417,7 @@ where
                         h.trim_start_matches("Host: ").trim_end_matches("\r\n").to_string()
                     };
                     let auth_header = provider.auth_header().map(|s| s.to_string());
+                    let auth_header_key = provider.auth_header_key();
                     let path_prefix = provider.path_prefix().map(|s| s.to_string());
                     let api_key = provider.api_key().map(|s| s.to_string());
                     let auth_query_key = provider.auth_query_key();
@@ -494,12 +495,11 @@ where
                                 upstream_request = upstream_request.header("host", host_header_value.as_str());
                                 continue;
                             }
-                            // Replace auth headers with provider's auth
-                            if key_str.eq_ignore_ascii_case("authorization")
-                                || key_str.eq_ignore_ascii_case("x-goog-api-key")
-                                || key_str.eq_ignore_ascii_case("x-api-key")
-                            {
-                                continue; // Will add auth_header below
+                            // Skip auth header - will be replaced by provider auth
+                            if let Some(provider_auth_key) = auth_header_key {
+                                if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
+                                    continue; // Will add auth_header below
+                                }
                             }
                             upstream_request = upstream_request.header(key, value);
                         }
@@ -645,12 +645,11 @@ where
                         let mut req_headers = String::with_capacity(1024);
                         for (key, value) in request.headers() {
                             let key_str = key.as_str();
-                            // Skip auth headers - will be replaced by provider auth
-                            if key_str.eq_ignore_ascii_case("authorization")
-                                || key_str.eq_ignore_ascii_case("x-goog-api-key")
-                                || key_str.eq_ignore_ascii_case("x-api-key")
-                            {
-                                continue;
+                            // Skip auth header - will be replaced by provider auth
+                            if let Some(provider_auth_key) = auth_header_key {
+                                if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
+                                    continue;
+                                }
                             }
                             // Replace Host header
                             if key_str.eq_ignore_ascii_case("host") {
