@@ -461,18 +461,14 @@ impl Provider for GeminiProvider {
         };
         #[cfg(debug_assertions)]
         log::info!(provider = "gemini", key = key_str; "authentication");
-        // Support both Authorization header and x-goog-api-key header
-        if http::is_header(key_str, http::HEADER_AUTHORIZATION) {
-            key_str = &key_str[http::HEADER_AUTHORIZATION.len()..];
-        } else if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
+        if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
             key_str = &key_str[http::HEADER_X_GOOG_API_KEY.len()..];
         }
         self.authenticate_key(key_str)
     }
 
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError> {
-        // Handle "Bearer " prefix from Authorization header
-        let input_key = key.trim_start_matches("Bearer ").trim();
+        let input_key = key.trim();
         // Use constant-time comparison to prevent timing attacks
         self.auth_keys
             .iter()
