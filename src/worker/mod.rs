@@ -329,12 +329,28 @@ where
                     };
                     if provider.has_auth_keys() {
                         let mut auth_key = None;
-                        if let Some(auth_header_key) = provider.auth_header_key() {
-                            auth_key = request
-                                .headers()
-                                .get(auth_header_key.trim_end_matches([' ', ':']))
-                                .and_then(|v| v.to_str().ok());
+                        // First try Authorization header (standard proxy authentication)
+                        if let Some(auth_value) = request
+                            .headers()
+                            .get(http::HEADER_AUTHORIZATION.trim_end_matches([' ', ':']))
+                            .and_then(|v| v.to_str().ok())
+                        {
+                            auth_key = Some(auth_value.trim_start_matches("Bearer ").trim());
                         }
+                        // Then try provider-specific auth header (e.g., x-goog-api-key for Gemini)
+                        if auth_key.is_none() {
+                            if let Some(auth_header_key) = provider.auth_header_key() {
+                                let key = auth_header_key.trim_end_matches([' ', ':']);
+                                // Skip if it's the same as Authorization (already checked)
+                                if !key.eq_ignore_ascii_case("authorization") {
+                                    auth_key = request
+                                        .headers()
+                                        .get(key)
+                                        .and_then(|v| v.to_str().ok());
+                                }
+                            }
+                        }
+                        // Finally try query parameter authentication
                         if auth_key.is_none() {
                             if let Some(auth_query_key) = provider.auth_query_key() {
                                 auth_key = request
