@@ -165,7 +165,7 @@ where
 {
     let (send_request, connection) = h2::client::handshake(stream)
         .await
-        .map_err(|e| Error::H2(e))?;
+        .map_err(Error::H2)?;
 
     // Spawn a task to drive the connection
     tokio::spawn(async move {
