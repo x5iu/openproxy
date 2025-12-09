@@ -63,6 +63,8 @@ jobs:
         env:
           OPENAI_HOST: ${{ secrets.OPENAI_HOST }}
           OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_HOST: ${{ secrets.GEMINI_HOST }}
+          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           # Check required secrets
           if [ -z "$OPENAI_HOST" ]; then
@@ -82,49 +84,76 @@ jobs:
           ENDPOINT="${ENDPOINT%/}"
           API_KEY="${OPENAI_KEY}"
           echo "Using endpoint: ${ENDPOINT}"
-          printf '%s\n' \
-            "cert_file: fullchain.pem" \
-            "private_key_file: privkey.pem" \
-            "https_port: 8443" \
-            "http_port: 8080" \
-            "" \
-            "auth_keys:" \
-            "  - ${AUTH_KEY}" \
-            "" \
-            "providers:" \
-            "  - type: openai" \
-            "    host: localhost:8443" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: localhost:8080" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: api.openai.com" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: echo.localhost:8443" \
-            "    endpoint: localhost" \
-            "    port: 9000" \
-            "    tls: false" \
-            "  - type: openai" \
-            "    host: echo.localhost:8080" \
-            "    endpoint: localhost" \
-            "    port: 9000" \
-            "    tls: false" \
-            "  # Providers with path prefix for host path routing tests" \
-            "  # Use unique host names to avoid conflicts with other providers" \
-            "  - type: openai" \
-            "    host: path-test.local/openai" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: nested-path.local/api/v1" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            > config.yml
+
+          # Process Gemini config if available
+          GEMINI_ENDPOINT="${GEMINI_HOST#https://}"
+          GEMINI_ENDPOINT="${GEMINI_ENDPOINT#http://}"
+          GEMINI_ENDPOINT="${GEMINI_ENDPOINT%/}"
+          echo "Using Gemini endpoint: ${GEMINI_ENDPOINT:-not configured}"
+
+          # Build config file
+          cat > config.yml << YAML
+          cert_file: fullchain.pem
+          private_key_file: privkey.pem
+          https_port: 8443
+          http_port: 8080
+
+          auth_keys:
+            - ${AUTH_KEY}
+
+          providers:
+            - type: openai
+              host: localhost:8443
+              endpoint: ${ENDPOINT}
+              api_key: ${API_KEY}
+            - type: openai
+              host: localhost:8080
+              endpoint: ${ENDPOINT}
+              api_key: ${API_KEY}
+            - type: openai
+              host: api.openai.com
+              endpoint: ${ENDPOINT}
+              api_key: ${API_KEY}
+            - type: openai
+              host: echo.localhost:8443
+              endpoint: localhost
+              port: 9000
+              tls: false
+            - type: openai
+              host: echo.localhost:8080
+              endpoint: localhost
+              port: 9000
+              tls: false
+            # Providers with path prefix for host path routing tests
+            - type: openai
+              host: path-test.local/openai
+              endpoint: ${ENDPOINT}
+              api_key: ${API_KEY}
+            - type: openai
+              host: nested-path.local/api/v1
+              endpoint: ${ENDPOINT}
+              api_key: ${API_KEY}
+          YAML
+
+          # Add Gemini provider if configured
+          if [ -n "$GEMINI_HOST" ] && [ -n "$GEMINI_KEY" ]; then
+            cat >> config.yml << YAML
+            # Gemini provider
+            - type: gemini
+              host: gemini.localhost:8443
+              endpoint: ${GEMINI_ENDPOINT}
+              api_key: ${GEMINI_KEY}
+            - type: gemini
+              host: gemini.localhost:8080
+              endpoint: ${GEMINI_ENDPOINT}
+              api_key: ${GEMINI_KEY}
+          YAML
+            echo "GEMINI_CONFIGURED=true" >> $GITHUB_ENV
+          else
+            echo "GEMINI_CONFIGURED=false" >> $GITHUB_ENV
+            echo "::warning::Gemini secrets not configured, skipping Gemini tests"
+          fi
+
           cat config.yml
 
       - name: Build openproxy
@@ -224,3 +253,72 @@ jobs:
         run: |
           cd e2e
           python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
+
+      - name: Run Gemini E2E tests (HTTPS with curl)
+        if: env.GEMINI_CONFIGURED == 'true'
+        env:
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          echo "Testing Gemini API via HTTPS proxy with HTTP/2..."
+
+          # Test 1: List models with query parameter authentication (HTTP/2)
+          echo "Test 1: Gemini list models via H2 proxy"
+          HTTP_CODE=$(curl -s -o /tmp/gemini_response.json -w "%{http_code}" \
+            --cacert $SSL_CERT_FILE \
+            --http2 \
+            -H "Host: gemini.localhost:8443" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            "https://localhost:8443/v1beta/models?key=placeholder&pageSize=1")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/gemini_response.json | head -c 500
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Gemini H2 test failed with status $HTTP_CODE"
+            cat /tmp/gemini_response.json
+            exit 1
+          fi
+
+          # Verify response contains models
+          if ! grep -q "models" /tmp/gemini_response.json; then
+            echo "::error::Gemini response does not contain models"
+            cat /tmp/gemini_response.json
+            exit 1
+          fi
+
+          echo "Gemini HTTPS/H2 test passed!"
+
+      - name: Run Gemini E2E tests (HTTP with curl)
+        if: env.GEMINI_CONFIGURED == 'true'
+        env:
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          echo "Testing Gemini API via HTTP proxy..."
+
+          # Test: List models with query parameter authentication (HTTP/1.1)
+          echo "Test: Gemini list models via HTTP/1.1 proxy"
+          HTTP_CODE=$(curl -s -o /tmp/gemini_response_http.json -w "%{http_code}" \
+            -H "Host: gemini.localhost:8080" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            "http://localhost:8080/v1beta/models?key=placeholder&pageSize=1")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/gemini_response_http.json | head -c 500
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Gemini HTTP test failed with status $HTTP_CODE"
+            cat /tmp/gemini_response_http.json
+            exit 1
+          fi
+
+          # Verify response contains models
+          if ! grep -q "models" /tmp/gemini_response_http.json; then
+            echo "::error::Gemini response does not contain models"
+            cat /tmp/gemini_response_http.json
+            exit 1
+          fi
+
+          echo "Gemini HTTP/1.1 test passed!"
