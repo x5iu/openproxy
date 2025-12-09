@@ -15,6 +15,15 @@ use tokio_rustls::client::TlsStream;
 
 use crate::Error;
 
+/// Result of attempting to establish an HTTP/2 connection.
+pub enum H2ConnectResult {
+    /// Successfully established HTTP/2 connection.
+    H2(H2Connection),
+    /// Upstream doesn't support HTTP/2, should fallback to HTTP/1.1.
+    /// Contains the TLS stream if TLS was used, or None for plain TCP.
+    FallbackToH1,
+}
+
 /// Lazily initialized TLS client config with HTTP/2 ALPN support.
 static TLS_H2_CLIENT_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
     std::sync::LazyLock::new(|| {
@@ -123,39 +132,40 @@ impl H2Pool {
     }
 }
 
-/// Establishes a new HTTP/2 connection to the upstream server.
+/// Attempts to establish an HTTP/2 connection to the upstream server.
 ///
-/// This function performs TLS handshake with ALPN negotiation and
-/// establishes an HTTP/2 connection.
+/// This function performs TLS handshake with ALPN negotiation for TLS connections.
+/// Returns `H2ConnectResult::FallbackToH1` if:
+/// - The upstream doesn't use TLS (HTTP/2 requires TLS in practice)
+/// - The upstream uses TLS but doesn't support HTTP/2 via ALPN
 pub async fn connect_h2(
     endpoint: &str,
     sock_address: &str,
     use_tls: bool,
-) -> Result<H2Connection, Error> {
-    let stream = TcpStream::connect(sock_address).await?;
-
-    if use_tls {
-        let connector = new_h2_tls_connector();
-        let server_name: rustls_pki_types::ServerName<'static> = endpoint
-            .to_string()
-            .try_into()
-            .map_err(|_| Error::InvalidServerName(endpoint.to_string()))?;
-        let tls_stream = connector.connect(server_name, stream).await?;
-
-        // Check ALPN negotiation result
-        let alpn = tls_stream.get_ref().1.alpn_protocol();
-        if !matches!(alpn, Some(b"h2")) {
-            // Server doesn't support HTTP/2, this is an error for our use case
-            return Err(Error::IO(std::io::Error::other(
-                "upstream server does not support HTTP/2",
-            )));
-        }
-
-        connect_h2_over_stream(tls_stream, endpoint).await
-    } else {
-        // For non-TLS, we use HTTP/2 with prior knowledge (h2c)
-        connect_h2_over_stream(stream, endpoint).await
+) -> Result<H2ConnectResult, Error> {
+    // For non-TLS upstream, fallback to HTTP/1.1
+    // (h2c / HTTP/2 with prior knowledge is not widely supported)
+    if !use_tls {
+        return Ok(H2ConnectResult::FallbackToH1);
     }
+
+    let stream = TcpStream::connect(sock_address).await?;
+    let connector = new_h2_tls_connector();
+    let server_name: rustls_pki_types::ServerName<'static> = endpoint
+        .to_string()
+        .try_into()
+        .map_err(|_| Error::InvalidServerName(endpoint.to_string()))?;
+    let tls_stream = connector.connect(server_name, stream).await?;
+
+    // Check ALPN negotiation result
+    let alpn = tls_stream.get_ref().1.alpn_protocol();
+    if !matches!(alpn, Some(b"h2")) {
+        // Server doesn't support HTTP/2, fallback to HTTP/1.1
+        return Ok(H2ConnectResult::FallbackToH1);
+    }
+
+    let conn = connect_h2_over_stream(tls_stream, endpoint).await?;
+    Ok(H2ConnectResult::H2(conn))
 }
 
 /// Establishes HTTP/2 connection over any AsyncRead+AsyncWrite stream.
@@ -269,8 +279,15 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h2_connection_refused() {
         // Test that connect_h2 returns an error when connection is refused
-        // Using localhost with an unlikely port
-        let result = connect_h2("localhost", "127.0.0.1:1", false).await;
+        // Using localhost with an unlikely port and TLS (to actually attempt connection)
+        let result = connect_h2("localhost", "127.0.0.1:1", true).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_h2_non_tls_fallback() {
+        // Test that connect_h2 returns FallbackToH1 for non-TLS connections
+        let result = connect_h2("localhost", "127.0.0.1:80", false).await;
+        assert!(matches!(result, Ok(H2ConnectResult::FallbackToH1)));
     }
 }
