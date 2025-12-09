@@ -75,6 +75,14 @@ jobs:
             echo "::error::OPENAI_API_KEY secret is not set"
             exit 1
           fi
+          if [ -z "$GEMINI_HOST" ]; then
+            echo "::error::GEMINI_HOST secret is not set"
+            exit 1
+          fi
+          if [ -z "$GEMINI_KEY" ]; then
+            echo "::error::GEMINI_API_KEY secret is not set"
+            exit 1
+          fi
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
           # Strip protocol prefix if present (https:// or http://)
@@ -85,11 +93,11 @@ jobs:
           API_KEY="${OPENAI_KEY}"
           echo "Using endpoint: ${ENDPOINT}"
 
-          # Process Gemini config if available
+          # Process Gemini config
           GEMINI_ENDPOINT="${GEMINI_HOST#https://}"
           GEMINI_ENDPOINT="${GEMINI_ENDPOINT#http://}"
           GEMINI_ENDPOINT="${GEMINI_ENDPOINT%/}"
-          echo "Using Gemini endpoint: ${GEMINI_ENDPOINT:-not configured}"
+          echo "Using Gemini endpoint: ${GEMINI_ENDPOINT}"
 
           # Build config file
           cat > config.yml << YAML
@@ -133,12 +141,7 @@ jobs:
               host: nested-path.local/api/v1
               endpoint: ${ENDPOINT}
               api_key: ${API_KEY}
-          YAML
-
-          # Add Gemini provider if configured
-          if [ -n "$GEMINI_HOST" ] && [ -n "$GEMINI_KEY" ]; then
-            cat >> config.yml << YAML
-            # Gemini provider
+            # Gemini providers
             - type: gemini
               host: gemini.localhost:8443
               endpoint: ${GEMINI_ENDPOINT}
@@ -148,11 +151,6 @@ jobs:
               endpoint: ${GEMINI_ENDPOINT}
               api_key: ${GEMINI_KEY}
           YAML
-            echo "GEMINI_CONFIGURED=true" >> $GITHUB_ENV
-          else
-            echo "GEMINI_CONFIGURED=false" >> $GITHUB_ENV
-            echo "::warning::Gemini secrets not configured, skipping Gemini tests"
-          fi
 
           cat config.yml
 
@@ -255,7 +253,6 @@ jobs:
           python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
 
       - name: Run Gemini E2E tests (HTTPS with curl)
-        if: env.GEMINI_CONFIGURED == 'true'
         env:
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
@@ -291,7 +288,6 @@ jobs:
           echo "Gemini HTTPS/H2 test passed!"
 
       - name: Run Gemini E2E tests (HTTP with curl)
-        if: env.GEMINI_CONFIGURED == 'true'
         env:
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
         run: |
