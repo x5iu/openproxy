@@ -418,6 +418,8 @@ where
                     };
                     let auth_header = provider.auth_header().map(|s| s.to_string());
                     let path_prefix = provider.path_prefix().map(|s| s.to_string());
+                    let api_key = provider.api_key().map(|s| s.to_string());
+                    let auth_query_key = provider.auth_query_key();
 
                     // Drop the read lock before async operations
                     drop(p);
@@ -452,6 +454,11 @@ where
                             } else if let Some(remaining) = path.strip_prefix(prefix.as_str()) {
                                 path = if remaining.is_empty() { "/".to_string() } else { remaining.to_string() };
                             }
+                        }
+
+                        // Replace auth query key value with real API key (e.g., for Gemini)
+                        if let (Some(ref key), Some(query_key)) = (&api_key, auth_query_key) {
+                            path = replace_query_param_value(&path, query_key, key);
                         }
 
                         // Build upstream URI
@@ -683,6 +690,11 @@ where
                             } else if let Some(remaining) = path.strip_prefix(prefix.as_str()) {
                                 path = if remaining.is_empty() { "/".to_string() } else { remaining.to_string() };
                             }
+                        }
+
+                        // Replace auth query key value with real API key (e.g., for Gemini)
+                        if let (Some(ref key), Some(query_key)) = (&api_key, auth_query_key) {
+                            path = replace_query_param_value(&path, query_key, key);
                         }
 
                         let req_str = format!(
@@ -1574,6 +1586,47 @@ fn is_http2_invalid_headers(key: &str) -> bool {
         || key.eq_ignore_ascii_case("content-length")
 }
 
+/// Replace the value of a query parameter in a path string.
+/// For example, "/path?key=placeholder&other=value" with key="key" and value="real_key"
+/// becomes "/path?key=real_key&other=value".
+fn replace_query_param_value(path: &str, query_key: &str, new_value: &str) -> String {
+    let Some(query_start) = path.find('?') else {
+        return path.to_string();
+    };
+
+    let (path_part, query_part) = path.split_at(query_start + 1);
+    let query = query_part.trim_end_matches('#');
+
+    let mut result = String::with_capacity(path.len() + new_value.len());
+    result.push_str(path_part);
+
+    let mut first = true;
+    for part in query.split('&') {
+        if !first {
+            result.push('&');
+        }
+        first = false;
+
+        if let Some(eq_pos) = part.find('=') {
+            let (k, _v) = part.split_at(eq_pos);
+            if k == query_key {
+                result.push_str(k);
+                result.push('=');
+                result.push_str(new_value);
+                continue;
+            }
+        }
+        result.push_str(part);
+    }
+
+    // Preserve fragment if present
+    if let Some(fragment_start) = query_part.find('#') {
+        result.push_str(&query_part[fragment_start..]);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1664,5 +1717,62 @@ mod tests {
         assert!(!is_http2_invalid_headers("authorization"));
         assert!(!is_http2_invalid_headers("host"));
         assert!(!is_http2_invalid_headers("x-custom-header"));
+    }
+
+    #[test]
+    fn test_replace_query_param_value() {
+        // Basic replacement
+        assert_eq!(
+            replace_query_param_value("/path?key=placeholder", "key", "real_key"),
+            "/path?key=real_key"
+        );
+
+        // Multiple params, replace first
+        assert_eq!(
+            replace_query_param_value("/path?key=placeholder&other=value", "key", "real_key"),
+            "/path?key=real_key&other=value"
+        );
+
+        // Multiple params, replace middle
+        assert_eq!(
+            replace_query_param_value("/path?first=1&key=placeholder&last=2", "key", "real_key"),
+            "/path?first=1&key=real_key&last=2"
+        );
+
+        // Multiple params, replace last
+        assert_eq!(
+            replace_query_param_value("/path?other=value&key=placeholder", "key", "real_key"),
+            "/path?other=value&key=real_key"
+        );
+
+        // Key not found
+        assert_eq!(
+            replace_query_param_value("/path?other=value", "key", "real_key"),
+            "/path?other=value"
+        );
+
+        // No query string
+        assert_eq!(
+            replace_query_param_value("/path", "key", "real_key"),
+            "/path"
+        );
+
+        // Empty value replacement
+        assert_eq!(
+            replace_query_param_value("/path?key=", "key", "real_key"),
+            "/path?key=real_key"
+        );
+
+        // Gemini-style path
+        assert_eq!(
+            replace_query_param_value("/v1beta/models?key=placeholder&pageSize=1", "key", "AIza123"),
+            "/v1beta/models?key=AIza123&pageSize=1"
+        );
+
+        // With fragment
+        assert_eq!(
+            replace_query_param_value("/path?key=placeholder#section", "key", "real_key"),
+            "/path?key=real_key#section"
+        );
     }
 }
