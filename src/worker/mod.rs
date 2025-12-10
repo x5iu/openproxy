@@ -445,15 +445,7 @@ where
 
                         // Strip path prefix if present
                         if let Some(ref prefix) = path_prefix {
-                            if let Some(query_pos) = path.find('?') {
-                                let (path_part, query_part) = path.split_at(query_pos);
-                                if let Some(remaining) = path_part.strip_prefix(prefix.as_str()) {
-                                    let new_path = if remaining.is_empty() { "/" } else { remaining };
-                                    path = format!("{}{}", new_path, query_part);
-                                }
-                            } else if let Some(remaining) = path.strip_prefix(prefix.as_str()) {
-                                path = if remaining.is_empty() { "/".to_string() } else { remaining.to_string() };
-                            }
+                            path = strip_path_prefix(&path, prefix);
                         }
 
                         // Replace auth query key value with real API key (e.g., for Gemini)
@@ -679,15 +671,7 @@ where
                             .unwrap_or_else(|| "/".to_string());
 
                         if let Some(ref prefix) = path_prefix {
-                            if let Some(query_pos) = path.find('?') {
-                                let (path_part, query_part) = path.split_at(query_pos);
-                                if let Some(remaining) = path_part.strip_prefix(prefix.as_str()) {
-                                    let new_path = if remaining.is_empty() { "/" } else { remaining };
-                                    path = format!("{}{}", new_path, query_part);
-                                }
-                            } else if let Some(remaining) = path.strip_prefix(prefix.as_str()) {
-                                path = if remaining.is_empty() { "/".to_string() } else { remaining.to_string() };
-                            }
+                            path = strip_path_prefix(&path, prefix);
                         }
 
                         // Replace auth query key value with real API key (e.g., for Gemini)
@@ -1582,6 +1566,25 @@ fn is_http2_invalid_headers(key: &str) -> bool {
         || key.eq_ignore_ascii_case("content-length")
 }
 
+/// Strip path prefix from a path string, preserving query parameters.
+/// For example, "/v1/api/models?key=value" with prefix "/v1/api" becomes "/models?key=value".
+fn strip_path_prefix(path: &str, prefix: &str) -> String {
+    if let Some(query_pos) = path.find('?') {
+        let (path_part, query_part) = path.split_at(query_pos);
+        if let Some(remaining) = path_part.strip_prefix(prefix) {
+            let new_path = if remaining.is_empty() { "/" } else { remaining };
+            return format!("{}{}", new_path, query_part);
+        }
+    } else if let Some(remaining) = path.strip_prefix(prefix) {
+        return if remaining.is_empty() {
+            "/".to_string()
+        } else {
+            remaining.to_string()
+        };
+    }
+    path.to_string()
+}
+
 /// Replace the value of a query parameter in a path string.
 /// For example, "/path?key=placeholder&other=value" with key="key" and value="real_key"
 /// becomes "/path?key=real_key&other=value".
@@ -1770,5 +1773,44 @@ mod tests {
             replace_query_param_value("/path?key=placeholder#section", "key", "real_key"),
             "/path?key=real_key#section"
         );
+    }
+
+    #[test]
+    fn test_strip_path_prefix() {
+        // Basic prefix stripping
+        assert_eq!(strip_path_prefix("/v1/api/models", "/v1/api"), "/models");
+
+        // Prefix at root
+        assert_eq!(strip_path_prefix("/v1/api", "/v1/api"), "/");
+
+        // No match
+        assert_eq!(strip_path_prefix("/other/path", "/v1/api"), "/other/path");
+
+        // With query parameters
+        assert_eq!(
+            strip_path_prefix("/v1/api/models?key=value", "/v1/api"),
+            "/models?key=value"
+        );
+
+        // Prefix with query, prefix at root
+        assert_eq!(
+            strip_path_prefix("/v1/api?key=value", "/v1/api"),
+            "/?key=value"
+        );
+
+        // No prefix match with query
+        assert_eq!(
+            strip_path_prefix("/other/path?key=value", "/v1/api"),
+            "/other/path?key=value"
+        );
+
+        // Partial prefix match (strips because /v1/api is a valid prefix)
+        assert_eq!(strip_path_prefix("/v1/api2/models", "/v1/api"), "2/models");
+
+        // Empty path after prefix
+        assert_eq!(strip_path_prefix("/prefix", "/prefix"), "/");
+
+        // Root path
+        assert_eq!(strip_path_prefix("/", "/"), "/");
     }
 }
