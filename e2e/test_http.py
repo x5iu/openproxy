@@ -178,6 +178,38 @@ test_invalid_host_header_http()
 test_connection_reuse_http()
 test_bad_request_handling_http()
 
+
+def test_invalid_auth_key_http():
+    """Test that invalid API key returns 401 from proxy (HTTP/1.1 no TLS)."""
+    print(f"\n{'='*50}")
+    print("Testing HTTP invalid auth key -> 401")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+
+    with httpx.Client(base_url=base_url, http2=False, timeout=10) as client:
+        # Test with completely invalid key
+        resp = client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer invalid-key-12345"},
+        )
+        print(f"  Invalid key: Status {resp.status_code}")
+        print(f"  Response body: {resp.text}")
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
+
+        # Test with missing auth header
+        resp = client.get("/v1/models")
+        print(f"  Missing auth: Status {resp.status_code}")
+        print(f"  Response body: {resp.text}")
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "missing authentication" in resp.text.lower(), f"Expected 'missing authentication' in body, got: {resp.text}"
+
+    print("\u2713 HTTP invalid auth key test passed!")
+
+
+test_invalid_auth_key_http()
+
 print("\n" + "="*50)
 print("\u2713 All HTTP tests passed!")
 print("="*50)

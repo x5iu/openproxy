@@ -190,7 +190,7 @@ def test_h2_upstream_connection_reuse():
 
 
 def test_h2_upstream_error_handling():
-    """Test HTTP/2 upstream error handling."""
+    """Test HTTP/2 upstream error handling (404 from upstream)."""
     print(f"\n{'='*50}")
     print("Testing HTTP/2 upstream error handling")
     print('='*50)
@@ -199,27 +199,52 @@ def test_h2_upstream_error_handling():
     api_key = os.environ["OPENAI_API_KEY"]
     ssl_cert = os.environ.get("SSL_CERT_FILE")
 
-    # Test with invalid endpoint
+    # Test with invalid endpoint - should get 404 from upstream
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
         resp = client.get(
             "/v1/nonexistent-endpoint",
             headers={"Authorization": f"Bearer {api_key}"},
         )
         print(f"Invalid endpoint: Status {resp.status_code}")
-        # Should get 404 from upstream
+        print(f"HTTP Version: {resp.http_version}")
+        assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
         assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
 
-    # Test with invalid auth
-    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
+    print("\u2713 HTTP/2 upstream error handling test passed!")
+
+
+def test_h2_invalid_auth_key():
+    """Test that invalid API key returns 401 from proxy (HTTP/2)."""
+    print(f"\n{'='*50}")
+    print("Testing HTTP/2 invalid auth key -> 401")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=10) as client:
+        # Test with completely invalid key
         resp = client.get(
             "/v1/models",
             headers={"Authorization": "Bearer invalid-key-12345"},
         )
-        print(f"Invalid auth: Status {resp.status_code}")
-        # Should get 401 from upstream or proxy
-        assert resp.status_code in [401, 403], f"Expected 401 or 403, got {resp.status_code}"
+        print(f"  Invalid key: Status {resp.status_code}")
+        print(f"  HTTP Version: {resp.http_version}")
+        print(f"  Response body: {resp.text}")
+        assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
 
-    print("\u2713 HTTP/2 upstream error handling test passed!")
+        # Test with missing auth header
+        resp = client.get("/v1/models")
+        print(f"  Missing auth: Status {resp.status_code}")
+        print(f"  HTTP Version: {resp.http_version}")
+        print(f"  Response body: {resp.text}")
+        assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "missing authentication" in resp.text.lower(), f"Expected 'missing authentication' in body, got: {resp.text}"
+
+    print("\u2713 HTTP/2 invalid auth key test passed!")
 
 
 def test_h2_upstream_concurrent_streams():
@@ -292,6 +317,7 @@ if __name__ == "__main__":
     test_h2_upstream_large_request()
     test_h2_upstream_connection_reuse()
     test_h2_upstream_error_handling()
+    test_h2_invalid_auth_key()
     test_h2_upstream_concurrent_streams()
     test_h2_upstream_headers_preservation()
 
