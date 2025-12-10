@@ -69,7 +69,7 @@ impl<P: PoolTrait> Executor<P> {
                             }
                             provider.set_healthy(true);
                         }
-                        worker.add(provider.endpoint(), conn).await;
+                        worker.return_h1_conn(provider.endpoint(), conn).await;
                     };
                     if tokio::time::timeout(Duration::from_secs(30), fut)
                         .await

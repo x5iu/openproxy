@@ -45,7 +45,7 @@ pub trait WorkerTrait<P>
 where
     P: PoolTrait,
 {
-    fn new(injector: Arc<P>, h2pool: Arc<H2Pool>) -> Self;
+    fn new(pool: Arc<P>, h2pool: Arc<H2Pool>) -> Self;
     fn get_outgoing_conn<'a>(
         &'a mut self,
         provider: &'a dyn Provider,
@@ -65,7 +65,7 @@ where
     ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static;
-    fn add<'a>(
+    fn return_h1_conn<'a>(
         &'a mut self,
         endpoint: &'a str,
         conn: <P as PoolTrait>::Item,
@@ -95,7 +95,7 @@ where
         <P as PoolTrait>::Item: Send,
     {
         Box::pin(async move {
-            if let Some(conn) = self.select(provider.endpoint()).await {
+            if let Some(conn) = self.select_h1(provider.endpoint()).await {
                 Ok(conn)
             } else {
                 let stream = TcpStream::connect(provider.sock_address()).await?;
@@ -233,7 +233,7 @@ where
                 let conn_keep_alive = response.payload.conn_keep_alive;
                 drop(response);
                 if conn_keep_alive {
-                    self.add(provider.endpoint(), outgoing).await;
+                    self.return_h1_conn(provider.endpoint(), outgoing).await;
                 }
                 if !incoming_conn_keep_alive {
                     break;
@@ -429,7 +429,7 @@ where
                     drop(p);
 
                     // Try to get or create HTTP/2 connection to upstream
-                    let h2result = match worker.get_or_create_h2_conn(&info.endpoint, &info.sock_address, info.use_tls).await {
+                    let h2result = match worker.get_or_create_h2(&info.endpoint, &info.sock_address, info.use_tls).await {
                         Ok(result) => result,
                         Err(e) => {
                             invalid!(respond, 502, format!("upstream: {}", e));
@@ -451,7 +451,7 @@ where
         })
     }
 
-    fn add<'a>(
+    fn return_h1_conn<'a>(
         &'a mut self,
         endpoint: &'a str,
         conn: <P as PoolTrait>::Item,
@@ -787,7 +787,7 @@ impl UpstreamInfo {
         };
 
         let mut outgoing = match worker
-            .get_or_create_h1_conn(&self.endpoint, &self.sock_address, self.use_tls)
+            .get_or_create_h1(&self.endpoint, &self.sock_address, self.use_tls)
             .await
         {
             Ok(conn) => conn,
@@ -889,7 +889,7 @@ impl UpstreamInfo {
 
         if response.payload.conn_keep_alive {
             drop(response);
-            worker.add(&self.endpoint, outgoing).await;
+            worker.return_h1(&self.endpoint, outgoing).await;
         }
     }
 }
@@ -922,7 +922,8 @@ where
     P: PoolTrait,
     <P as PoolTrait>::Item: ConnTrait + Send,
 {
-    async fn select(&mut self, endpoint: &str) -> Option<<P as PoolTrait>::Item> {
+    /// Selects an existing healthy HTTP/1.1 connection from the pool.
+    async fn select_h1(&mut self, endpoint: &str) -> Option<<P as PoolTrait>::Item> {
         let mut retry_times = 0;
         while retry_times < 3 {
             let Some(mut conn) = self.pool.get(endpoint).await else {
@@ -939,9 +940,14 @@ where
         None
     }
 
+    /// Returns an HTTP/1.1 connection to the pool for reuse.
+    async fn return_h1(&self, endpoint: &str, conn: <P as PoolTrait>::Item) {
+        self.pool.add(endpoint, conn).await;
+    }
+
     /// Gets an existing HTTP/2 connection from the pool or creates a new one.
     /// Returns `H2ConnectResult::FallbackToH1` if upstream doesn't support HTTP/2.
-    async fn get_or_create_h2_conn(
+    async fn get_or_create_h2(
         &self,
         endpoint: &str,
         sock_address: &str,
@@ -955,15 +961,14 @@ where
         // Try to create a new connection
         let result = h2client::connect_h2(endpoint, sock_address, use_tls).await?;
         if let H2ConnectResult::H2(ref conn) = result {
-            // Store it in the pool for future use
+            // Store it in the pool for future use (H2 connections are multiplexed)
             self.h2pool.insert(endpoint, conn.clone()).await;
         }
         Ok(result)
     }
 
     /// Gets an existing HTTP/1.1 connection from the pool or creates a new one.
-    /// Used for fallback when HTTP/2 is not supported.
-    async fn get_or_create_h1_conn(
+    async fn get_or_create_h1(
         &mut self,
         endpoint: &str,
         sock_address: &str,
@@ -972,7 +977,7 @@ where
     where
         <P as PoolTrait>::Item: Send,
     {
-        if let Some(conn) = self.select(endpoint).await {
+        if let Some(conn) = self.select_h1(endpoint).await {
             Ok(conn)
         } else {
             let stream = TcpStream::connect(sock_address).await?;
