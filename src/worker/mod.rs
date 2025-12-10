@@ -645,6 +645,9 @@ impl UpstreamInfo {
             }
         }
 
+        // Add header to indicate upstream protocol
+        builder = builder.header("x-upstream-protocol", "h2");
+
         let response_has_body = !upstream_body.is_end_stream();
 
         let mut send = match respond.send_response(builder.body(()).unwrap(), !response_has_body) {
@@ -840,6 +843,9 @@ impl UpstreamInfo {
             };
             mem::swap(&mut body, &mut response.payload.body);
         }
+
+        // Add header to indicate upstream protocol
+        builder = builder.header("x-upstream-protocol", "h1");
 
         let mut send = match respond.send_response(builder.body(()).unwrap(), false) {
             Ok(send) => send,

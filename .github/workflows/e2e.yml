@@ -309,23 +309,32 @@ jobs:
 
           # Client connects via HTTPS/H2, but upstream is plain HTTP
           # Proxy should fallback to HTTP/1.1 for upstream connection
-          RESPONSE=$(curl -s \
+          curl -s -D /tmp/fallback_headers.txt -o /tmp/fallback_response.json \
             --cacert $SSL_CERT_FILE \
             --http2 \
             -H "Host: h1-fallback.localhost:8443" \
             -H "Authorization: Bearer ${PROXY_AUTH_KEY}" \
-            "https://localhost:8443/test-fallback")
+            "https://localhost:8443/test-fallback"
 
-          echo "Response: $RESPONSE"
+          echo "Response headers:"
+          cat /tmp/fallback_headers.txt
+          echo "Response body:"
+          cat /tmp/fallback_response.json
 
           # Verify response contains fallback success marker
-          if echo "$RESPONSE" | grep -q "fallback"; then
-            echo "H2 to H1 fallback test passed!"
-          else
+          if ! grep -q "fallback" /tmp/fallback_response.json; then
             echo "::error::H2 fallback response does not contain success marker"
-            echo "Response was: $RESPONSE"
             exit 1
           fi
+
+          # Verify upstream protocol is H1 (fallback)
+          if ! grep -qi "x-upstream-protocol: h1" /tmp/fallback_headers.txt; then
+            echo "::error::Expected x-upstream-protocol: h1 header but not found"
+            cat /tmp/fallback_headers.txt
+            exit 1
+          fi
+
+          echo "H2 to H1 fallback test passed! (verified upstream protocol is H1)"
 
       - name: Run Gemini E2E tests (HTTPS with curl)
         env:
@@ -336,14 +345,18 @@ jobs:
 
           # Test 1: List models with x-goog-api-key header authentication (HTTP/2)
           echo "Test 1: Gemini list models via H2 proxy"
-          HTTP_CODE=$(curl -s -o /tmp/gemini_response.json -w "%{http_code}" \
+          curl -s -D /tmp/gemini_headers.txt -o /tmp/gemini_response.json \
             --cacert $SSL_CERT_FILE \
             --http2 \
             -H "Host: gemini.localhost:8443" \
             -H "x-goog-api-key: ${PROXY_AUTH_KEY}" \
-            "https://localhost:8443/v1beta/models?key=placeholder&pageSize=1")
+            "https://localhost:8443/v1beta/models?key=placeholder&pageSize=1"
 
+          HTTP_CODE=$(head -1 /tmp/gemini_headers.txt | grep -oE '[0-9]{3}')
           echo "HTTP Status: $HTTP_CODE"
+          echo "Response headers:"
+          cat /tmp/gemini_headers.txt
+          echo "Response body:"
           cat /tmp/gemini_response.json | head -c 500
           echo ""
 
@@ -360,7 +373,14 @@ jobs:
             exit 1
           fi
 
-          echo "Gemini HTTPS/H2 test passed!"
+          # Verify upstream protocol is H2
+          if ! grep -qi "x-upstream-protocol: h2" /tmp/gemini_headers.txt; then
+            echo "::error::Expected x-upstream-protocol: h2 header but not found"
+            cat /tmp/gemini_headers.txt
+            exit 1
+          fi
+
+          echo "Gemini HTTPS/H2 test passed! (verified upstream protocol is H2)"
 
       - name: Run Gemini E2E tests (HTTP with curl)
         env:
