@@ -79,6 +79,31 @@ impl H2Connection {
     }
 }
 
+/// Trait for HTTP/2 connection pool operations.
+///
+/// Unlike HTTP/1.1 pools where connections are borrowed and returned,
+/// HTTP/2 connections are multiplexed and can be shared across requests.
+pub trait H2PoolTrait: Send + Sync {
+    /// Gets an existing HTTP/2 connection for the given endpoint, if available and ready.
+    fn get(
+        &self,
+        endpoint: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<H2Connection>> + Send + '_>>;
+
+    /// Stores an HTTP/2 connection in the pool.
+    fn insert(
+        &self,
+        endpoint: &str,
+        conn: H2Connection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+
+    /// Removes a connection from the pool (e.g., when it's no longer usable).
+    fn remove(
+        &self,
+        endpoint: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
 /// Pool for HTTP/2 client connections.
 ///
 /// HTTP/2 allows multiplexing, so we can reuse a single connection
@@ -100,35 +125,53 @@ impl H2Pool {
             connections: RwLock::new(HashMap::new()),
         }
     }
+}
 
-    /// Gets an existing HTTP/2 connection for the given endpoint, if available and ready.
-    pub async fn get(&self, endpoint: &str) -> Option<H2Connection> {
-        let conn = {
-            let connections = self.connections.read().await;
-            connections.get(endpoint).cloned()
-        };
+impl H2PoolTrait for H2Pool {
+    fn get(
+        &self,
+        endpoint: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<H2Connection>> + Send + '_>> {
+        let endpoint = endpoint.to_string();
+        Box::pin(async move {
+            let conn = {
+                let connections = self.connections.read().await;
+                connections.get(&endpoint).cloned()
+            };
 
-        if let Some(mut conn) = conn {
-            if conn.ready().await {
-                return Some(conn);
-            } else {
-                // Connection is not ready, remove it from the pool
-                self.remove(endpoint).await;
+            if let Some(mut conn) = conn {
+                if conn.ready().await {
+                    return Some(conn);
+                } else {
+                    // Connection is not ready, remove it from the pool
+                    H2PoolTrait::remove(self, &endpoint).await;
+                }
             }
-        }
-        None
+            None
+        })
     }
 
-    /// Stores an HTTP/2 connection in the pool.
-    pub async fn insert(&self, endpoint: &str, conn: H2Connection) {
-        let mut connections = self.connections.write().await;
-        connections.insert(endpoint.to_string(), conn);
+    fn insert(
+        &self,
+        endpoint: &str,
+        conn: H2Connection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let endpoint = endpoint.to_string();
+        Box::pin(async move {
+            let mut connections = self.connections.write().await;
+            connections.insert(endpoint, conn);
+        })
     }
 
-    /// Removes a connection from the pool (e.g., when it's no longer usable).
-    pub async fn remove(&self, endpoint: &str) {
-        let mut connections = self.connections.write().await;
-        connections.remove(endpoint);
+    fn remove(
+        &self,
+        endpoint: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let endpoint = endpoint.to_string();
+        Box::pin(async move {
+            let mut connections = self.connections.write().await;
+            connections.remove(&endpoint);
+        })
     }
 }
 

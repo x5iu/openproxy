@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 
 use bytes::Buf;
 
-use crate::h2client::{self as h2client, H2ConnectResult, H2Pool};
+use crate::h2client::{self as h2client, H2ConnectResult, H2PoolTrait};
 use crate::http;
 use crate::provider::Provider;
 use crate::websocket;
@@ -41,11 +41,12 @@ pub enum ProxyError {
     Abort(Error),
 }
 
-pub trait WorkerTrait<P>
+pub trait WorkerTrait<P, H2P>
 where
     P: PoolTrait,
+    H2P: H2PoolTrait,
 {
-    fn new(pool: Arc<P>, h2pool: Arc<H2Pool>) -> Self;
+    fn new(pool: Arc<P>, h2pool: Arc<H2P>) -> Self;
     fn get_outgoing_conn<'a>(
         &'a mut self,
         provider: &'a dyn Provider,
@@ -73,17 +74,18 @@ where
         <P as PoolTrait>::Item: Send;
 }
 
-pub struct Worker<P> {
+pub struct Worker<P, H2P = crate::h2client::H2Pool> {
     pool: Arc<P>,
-    h2pool: Arc<H2Pool>,
+    h2pool: Arc<H2P>,
 }
 
-impl<P> WorkerTrait<P> for Worker<P>
+impl<P, H2P> WorkerTrait<P, H2P> for Worker<P, H2P>
 where
     P: PoolTrait + Send + Sync + 'static,
+    H2P: H2PoolTrait + 'static,
     <P as PoolTrait>::Item: ConnTrait,
 {
-    fn new(pool: Arc<P>, h2pool: Arc<H2Pool>) -> Self {
+    fn new(pool: Arc<P>, h2pool: Arc<H2P>) -> Self {
         Self { pool, h2pool }
     }
 
@@ -691,14 +693,15 @@ impl UpstreamInfo {
     }
 
     /// Proxy request to upstream using HTTP/1.1 fallback.
-    async fn proxy_h1<P>(
+    async fn proxy_h1<P, H2P>(
         &self,
-        worker: &mut Worker<P>,
+        worker: &mut Worker<P, H2P>,
         request: httplib::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<bytes::Bytes>,
         authority_host: &str,
     ) where
         P: PoolTrait + Send + Sync + 'static,
+        H2P: H2PoolTrait,
         <P as PoolTrait>::Item: ConnTrait + Unpin + Send + Sync,
     {
         macro_rules! invalid {
@@ -917,9 +920,10 @@ pub trait PoolTrait {
         L: ToString + Sync + Ord + ?Sized;
 }
 
-impl<P> Worker<P>
+impl<P, H2P> Worker<P, H2P>
 where
     P: PoolTrait,
+    H2P: H2PoolTrait,
     <P as PoolTrait>::Item: ConnTrait + Send,
 {
     /// Selects an existing healthy HTTP/1.1 connection from the pool.

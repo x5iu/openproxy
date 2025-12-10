@@ -12,29 +12,31 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
-use crate::h2client::H2Pool;
+use crate::h2client::{H2Pool, H2PoolTrait};
 use crate::provider::AsyncReadWrite;
 use crate::worker::{PoolTrait, ProxyError, WorkerTrait};
 
-pub struct Executor<P> {
-    conn_injector: Arc<P>,
-    h2pool: Arc<H2Pool>,
+pub struct Executor<P, H2P = H2Pool> {
+    pool: Arc<P>,
+    h2pool: Arc<H2P>,
 }
 
-impl<P: PoolTrait> Executor<P> {
+impl<P: PoolTrait> Executor<P, H2Pool> {
     pub fn new(pool: P) -> Self {
         Executor {
-            conn_injector: Arc::new(pool),
+            pool: Arc::new(pool),
             h2pool: Arc::new(H2Pool::new()),
         }
     }
+}
 
+impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
     pub fn run_health_check<W>(&self)
     where
-        W: WorkerTrait<P> + Send + 'static,
+        W: WorkerTrait<P, H2P> + Send + 'static,
         <P as PoolTrait>::Item: AsyncReadWrite + 'static,
     {
-        let mut worker = W::new(Arc::clone(&self.conn_injector), Arc::clone(&self.h2pool));
+        let mut worker = W::new(Arc::clone(&self.pool), Arc::clone(&self.h2pool));
         tokio::spawn(async move {
             loop {
                 let p = crate::program();
@@ -85,7 +87,7 @@ impl<P: PoolTrait> Executor<P> {
         });
     }
 
-    pub async fn execute<W: WorkerTrait<P>>(&self, stream: TcpStream)
+    pub async fn execute<W: WorkerTrait<P, H2P>>(&self, stream: TcpStream)
     where
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static,
     {
@@ -98,7 +100,7 @@ impl<P: PoolTrait> Executor<P> {
             log::error!("TLS server config not available for HTTPS connection");
             return;
         };
-        let conn_injector = Arc::clone(&self.conn_injector);
+        let pool = Arc::clone(&self.pool);
         let h2pool = Arc::clone(&self.h2pool);
         tokio::select! {
             _ = shutdown_rx.recv() => {}
@@ -113,7 +115,7 @@ impl<P: PoolTrait> Executor<P> {
                         return;
                     }
                 };
-                let mut worker = W::new(conn_injector, h2pool);
+                let mut worker = W::new(pool, h2pool);
                 let alpn = tls_stream.get_ref().1.alpn_protocol();
                 #[cfg(debug_assertions)]
                 log::info!(alpn = alpn.map(|v| String::from_utf8_lossy(v)); "alpn_protocol");
@@ -161,18 +163,18 @@ impl<P: PoolTrait> Executor<P> {
     }
 
     /// Execute HTTP (plaintext) connection - HTTP/1.1 only, no HTTP/2 support
-    pub async fn execute_http<W: WorkerTrait<P>>(&self, mut stream: TcpStream)
+    pub async fn execute_http<W: WorkerTrait<P, H2P>>(&self, mut stream: TcpStream)
     where
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static,
     {
         let p = crate::program();
         let mut shutdown_rx = p.read().await.shutdown_tx.subscribe();
-        let conn_injector = Arc::clone(&self.conn_injector);
+        let pool = Arc::clone(&self.pool);
         let h2pool = Arc::clone(&self.h2pool);
         tokio::select! {
             _ = shutdown_rx.recv() => {}
             _ = async {
-                let mut worker = W::new(conn_injector, h2pool);
+                let mut worker = W::new(pool, h2pool);
                 #[cfg(debug_assertions)]
                 log::info!(protocol = "http/1.1"; "http_connection");
                 match worker.proxy(&mut stream).await {
@@ -531,7 +533,7 @@ mod tests {
         let pool: Pool<i32> = Pool::new();
         let executor = Executor::new(pool);
         // Just verify it can be created
-        assert!(Arc::strong_count(&executor.conn_injector) >= 1);
+        assert!(Arc::strong_count(&executor.pool) >= 1);
     }
 
     #[test]
