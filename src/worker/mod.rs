@@ -716,7 +716,7 @@ where
                             Err(e) => { invalid!(respond, 400, e.to_string()); return; }
                         };
 
-                        let mut outgoing = match worker.get_outgoing_conn_by_address(&endpoint, &sock_address, provider_tls).await {
+                        let mut outgoing = match worker.get_or_create_h1_conn(&endpoint, &sock_address, provider_tls).await {
                             Ok(conn) => conn,
                             Err(e) => { invalid!(respond, 502, format!("upstream: {}", e)); return; }
                         };
@@ -900,9 +900,9 @@ where
         Ok(result)
     }
 
-    /// Gets an HTTP/1.1 connection from the pool or creates a new one by address.
+    /// Gets an existing HTTP/1.1 connection from the pool or creates a new one.
     /// Used for fallback when HTTP/2 is not supported.
-    async fn get_outgoing_conn_by_address(
+    async fn get_or_create_h1_conn(
         &mut self,
         endpoint: &str,
         sock_address: &str,
