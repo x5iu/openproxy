@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 
 use bytes::Buf;
 
-use crate::h2client::{self as h2client, H2ConnectResult, H2Connection, H2Pool};
+use crate::h2client::{self as h2client, H2ConnectResult, H2Pool};
 use crate::http;
 use crate::provider::Provider;
 use crate::websocket;
@@ -426,16 +426,15 @@ where
                     drop(p);
 
                     // Try to get or create HTTP/2 connection to upstream
-                    let h2_conn = match worker.get_or_create_h2_conn(&endpoint, &sock_address, provider_tls).await {
-                        Ok(Some(conn)) => Some(conn),
-                        Ok(None) => None, // Fallback to HTTP/1.1
+                    let h2_result = match worker.get_or_create_h2_conn(&endpoint, &sock_address, provider_tls).await {
+                        Ok(result) => result,
                         Err(e) => {
                             invalid!(respond, 502, format!("upstream: {}", e));
                             return;
                         }
                     };
 
-                    if let Some(h2_conn) = h2_conn {
+                    if let H2ConnectResult::H2(h2_conn) = h2_result {
                         // Use HTTP/2 upstream
                         let mut send_request = h2_conn.send_request();
 
@@ -880,27 +879,25 @@ where
     }
 
     /// Gets an existing HTTP/2 connection from the pool or creates a new one.
-    /// Returns `None` if upstream doesn't support HTTP/2 and should fallback to HTTP/1.1.
+    /// Returns `H2ConnectResult::FallbackToH1` if upstream doesn't support HTTP/2.
     async fn get_or_create_h2_conn(
         &self,
         endpoint: &str,
         sock_address: &str,
         use_tls: bool,
-    ) -> Result<Option<H2Connection>, Error> {
+    ) -> Result<H2ConnectResult, Error> {
         // Try to get an existing connection
         if let Some(conn) = self.h2pool.get(endpoint).await {
-            return Ok(Some(conn));
+            return Ok(H2ConnectResult::H2(conn));
         }
 
         // Try to create a new connection
-        match h2client::connect_h2(endpoint, sock_address, use_tls).await? {
-            H2ConnectResult::H2(conn) => {
-                // Store it in the pool for future use
-                self.h2pool.insert(endpoint, conn.clone()).await;
-                Ok(Some(conn))
-            }
-            H2ConnectResult::FallbackToH1 => Ok(None),
+        let result = h2client::connect_h2(endpoint, sock_address, use_tls).await?;
+        if let H2ConnectResult::H2(ref conn) = result {
+            // Store it in the pool for future use
+            self.h2pool.insert(endpoint, conn.clone()).await;
         }
+        Ok(result)
     }
 
     /// Gets an HTTP/1.1 connection from the pool or creates a new one by address.
