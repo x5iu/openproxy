@@ -510,21 +510,17 @@ async fn proxy_h2_upstream(
     let mut send_request = h2_conn.send_request();
 
     // Build the upstream request path
-    let mut path = request
+    let raw_path = request
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-
-    // Strip path prefix if present
-    if let Some(ref prefix) = info.path_prefix {
-        path = strip_path_prefix(&path, prefix);
-    }
-
-    // Replace auth query key value with real API key (e.g., for Gemini)
-    if let (Some(ref key), Some(query_key)) = (&info.api_key, info.auth_query_key) {
-        path = replace_query_param_value(&path, query_key, key);
-    }
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let path = build_upstream_path(
+        raw_path,
+        info.path_prefix.as_deref(),
+        info.api_key.as_deref(),
+        info.auth_query_key,
+    );
 
     // Build upstream URI
     let upstream_uri = httplib::Uri::builder()
@@ -570,10 +566,7 @@ async fn proxy_h2_upstream(
 
     // Add provider's auth header if present
     if let Some(ref auth) = info.auth_header {
-        // auth_header is like "Authorization: Bearer xxx\r\n"
-        if let Some(colon_pos) = auth.find(':') {
-            let header_name = auth[..colon_pos].trim();
-            let header_value = auth[colon_pos + 1..].trim().trim_end_matches("\r\n");
+        if let Some((header_name, header_value)) = parse_auth_header(auth) {
             upstream_request = upstream_request.header(header_name, header_value);
         }
     }
@@ -739,52 +732,29 @@ async fn proxy_h1_upstream<P>(
         .entry("Host")
         .or_insert(httplib::HeaderValue::from_str(authority_host).unwrap());
 
-    // Build HTTP/1.1 request headers
-    let mut req_headers = String::with_capacity(1024);
-    for (key, value) in request.headers() {
-        let key_str = key.as_str();
-        // Skip auth header - will be replaced by provider auth
-        if let Some(provider_auth_key) = info.auth_header_key {
-            if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
-                continue;
-            }
-        }
-        // Replace Host header
-        if key_str.eq_ignore_ascii_case("host") {
-            req_headers.push_str(&format!("Host: {}\r\n", info.host_header_value));
-            continue;
-        }
-        req_headers.push_str(key_str);
-        req_headers.push_str(": ");
-        req_headers.push_str(String::from_utf8_lossy(value.as_bytes()).as_ref());
-        req_headers.push_str("\r\n");
-    }
-
-    // Add provider's auth header if present
-    if let Some(ref auth) = info.auth_header {
-        req_headers.push_str(auth);
-    }
-
     let has_content_length = request.headers().contains_key("content-length");
-    if !has_content_length {
-        req_headers.push_str("Transfer-Encoding: chunked\r\n");
-    }
 
-    // Build path with prefix stripping
-    let mut path = request
+    // Build HTTP/1.1 request headers
+    let req_headers = build_h1_request_headers(
+        request.headers().iter(),
+        &info.host_header_value,
+        info.auth_header_key,
+        info.auth_header.as_deref(),
+        has_content_length,
+    );
+
+    // Build path with prefix stripping and auth query replacement
+    let raw_path = request
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-
-    if let Some(ref prefix) = info.path_prefix {
-        path = strip_path_prefix(&path, prefix);
-    }
-
-    // Replace auth query key value with real API key (e.g., for Gemini)
-    if let (Some(ref key), Some(query_key)) = (&info.api_key, info.auth_query_key) {
-        path = replace_query_param_value(&path, query_key, key);
-    }
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let path = build_upstream_path(
+        raw_path,
+        info.path_prefix.as_deref(),
+        info.api_key.as_deref(),
+        info.auth_query_key,
+    );
 
     let req_str = format!(
         "{} {} HTTP/1.1\r\n{}\r\n",
@@ -1666,6 +1636,83 @@ fn is_http2_invalid_headers(key: &str) -> bool {
         || key.eq_ignore_ascii_case("content-length")
 }
 
+/// Build upstream path by stripping prefix and replacing auth query param.
+fn build_upstream_path(
+    path: &str,
+    path_prefix: Option<&str>,
+    api_key: Option<&str>,
+    auth_query_key: Option<&str>,
+) -> String {
+    let mut result = path.to_string();
+
+    // Strip path prefix if present
+    if let Some(prefix) = path_prefix {
+        result = strip_path_prefix(&result, prefix);
+    }
+
+    // Replace auth query key value with real API key (e.g., for Gemini)
+    if let (Some(key), Some(query_key)) = (api_key, auth_query_key) {
+        result = replace_query_param_value(&result, query_key, key);
+    }
+
+    result
+}
+
+/// Build HTTP/1.1 request headers string from an iterator of headers.
+/// Filters out auth headers and replaces Host header with the upstream host.
+fn build_h1_request_headers<'a, I>(
+    headers: I,
+    host_header_value: &str,
+    auth_header_key: Option<&str>,
+    auth_header: Option<&str>,
+    has_content_length: bool,
+) -> String
+where
+    I: Iterator<Item = (&'a httplib::HeaderName, &'a httplib::HeaderValue)>,
+{
+    let mut req_headers = String::with_capacity(1024);
+
+    for (key, value) in headers {
+        let key_str = key.as_str();
+        // Skip auth header - will be replaced by provider auth
+        if let Some(provider_auth_key) = auth_header_key {
+            if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
+                continue;
+            }
+        }
+        // Replace Host header
+        if key_str.eq_ignore_ascii_case("host") {
+            req_headers.push_str(&format!("Host: {}\r\n", host_header_value));
+            continue;
+        }
+        req_headers.push_str(key_str);
+        req_headers.push_str(": ");
+        req_headers.push_str(String::from_utf8_lossy(value.as_bytes()).as_ref());
+        req_headers.push_str("\r\n");
+    }
+
+    // Add provider's auth header if present
+    if let Some(auth) = auth_header {
+        req_headers.push_str(auth);
+    }
+
+    // Add Transfer-Encoding if no Content-Length
+    if !has_content_length {
+        req_headers.push_str("Transfer-Encoding: chunked\r\n");
+    }
+
+    req_headers
+}
+
+/// Parse auth header string like "Authorization: Bearer xxx\r\n" into (name, value).
+fn parse_auth_header(auth: &str) -> Option<(&str, &str)> {
+    auth.find(':').map(|colon_pos| {
+        let header_name = auth[..colon_pos].trim();
+        let header_value = auth[colon_pos + 1..].trim().trim_end_matches("\r\n");
+        (header_name, header_value)
+    })
+}
+
 /// Strip path prefix from a path string, preserving query parameters.
 /// For example, "/v1/api/models?key=value" with prefix "/v1/api" becomes "/models?key=value".
 fn strip_path_prefix(path: &str, prefix: &str) -> String {
@@ -1912,5 +1959,154 @@ mod tests {
 
         // Root path
         assert_eq!(strip_path_prefix("/", "/"), "/");
+    }
+
+    #[test]
+    fn test_build_upstream_path() {
+        // No transformations
+        assert_eq!(
+            build_upstream_path("/v1/models", None, None, None),
+            "/v1/models"
+        );
+
+        // Only prefix stripping
+        assert_eq!(
+            build_upstream_path("/prefix/models", Some("/prefix"), None, None),
+            "/models"
+        );
+
+        // Only query param replacement
+        assert_eq!(
+            build_upstream_path("/models?key=placeholder", None, Some("real_key"), Some("key")),
+            "/models?key=real_key"
+        );
+
+        // Both prefix stripping and query param replacement
+        assert_eq!(
+            build_upstream_path(
+                "/prefix/models?key=placeholder&other=value",
+                Some("/prefix"),
+                Some("real_key"),
+                Some("key")
+            ),
+            "/models?key=real_key&other=value"
+        );
+
+        // Gemini-style path
+        assert_eq!(
+            build_upstream_path(
+                "/v1beta/models?key=user_key&pageSize=10",
+                None,
+                Some("AIza123"),
+                Some("key")
+            ),
+            "/v1beta/models?key=AIza123&pageSize=10"
+        );
+
+        // Missing api_key (no replacement)
+        assert_eq!(
+            build_upstream_path("/models?key=placeholder", None, None, Some("key")),
+            "/models?key=placeholder"
+        );
+
+        // Missing auth_query_key (no replacement)
+        assert_eq!(
+            build_upstream_path("/models?key=placeholder", None, Some("real_key"), None),
+            "/models?key=placeholder"
+        );
+    }
+
+    #[test]
+    fn test_parse_auth_header() {
+        // Standard Authorization header
+        assert_eq!(
+            parse_auth_header("Authorization: Bearer token123\r\n"),
+            Some(("Authorization", "Bearer token123"))
+        );
+
+        // x-goog-api-key header
+        assert_eq!(
+            parse_auth_header("x-goog-api-key: AIza123\r\n"),
+            Some(("x-goog-api-key", "AIza123"))
+        );
+
+        // Header with extra whitespace
+        assert_eq!(
+            parse_auth_header("  Authorization  :   Bearer token123  \r\n"),
+            Some(("Authorization", "Bearer token123"))
+        );
+
+        // Header without trailing CRLF
+        assert_eq!(
+            parse_auth_header("Authorization: Bearer token123"),
+            Some(("Authorization", "Bearer token123"))
+        );
+
+        // Invalid header (no colon)
+        assert_eq!(parse_auth_header("InvalidHeader"), None);
+
+        // Empty string
+        assert_eq!(parse_auth_header(""), None);
+
+        // Just colon
+        assert_eq!(parse_auth_header(":"), Some(("", "")));
+    }
+
+    #[test]
+    fn test_build_h1_request_headers() {
+        use httplib::header::{HeaderMap, HeaderName, HeaderValue};
+
+        // Create test headers
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("client.example.com"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer client_token"),
+        );
+
+        // Test with auth header replacement and no content-length
+        let result = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            Some("Authorization: "),
+            Some("Authorization: Bearer server_token\r\n"),
+            false,
+        );
+
+        assert!(result.contains("Host: upstream.example.com\r\n"));
+        assert!(result.contains("content-type: application/json\r\n"));
+        assert!(result.contains("Authorization: Bearer server_token\r\n"));
+        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
+        // Should NOT contain the client's authorization
+        assert!(!result.contains("Bearer client_token"));
+
+        // Test with content-length (no Transfer-Encoding)
+        let result_with_cl = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            Some("Authorization: "),
+            Some("Authorization: Bearer server_token\r\n"),
+            true,
+        );
+
+        assert!(!result_with_cl.contains("Transfer-Encoding"));
+
+        // Test without auth header replacement
+        let result_no_auth = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            None,
+            None,
+            true,
+        );
+
+        assert!(result_no_auth.contains("authorization: Bearer client_token\r\n"));
     }
 }
