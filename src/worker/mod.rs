@@ -429,7 +429,7 @@ where
                     drop(p);
 
                     // Try to get or create HTTP/2 connection to upstream
-                    let h2_result = match worker.get_or_create_h2_conn(&info.endpoint, &info.sock_address, info.use_tls).await {
+                    let h2result = match worker.get_or_create_h2_conn(&info.endpoint, &info.sock_address, info.use_tls).await {
                         Ok(result) => result,
                         Err(e) => {
                             invalid!(respond, 502, format!("upstream: {}", e));
@@ -437,12 +437,12 @@ where
                         }
                     };
 
-                    match h2_result {
-                        H2ConnectResult::H2(h2_conn) => {
-                            proxy_h2_upstream(h2_conn, request, respond, &info).await;
+                    match h2result {
+                        H2ConnectResult::H2(h2conn) => {
+                            info.proxy_h2(h2conn, request, respond).await;
                         }
                         H2ConnectResult::FallbackToH1 => {
-                            proxy_h1_upstream(&mut worker, request, respond, &info, &authority_host).await;
+                            info.proxy_h1(&mut worker, request, respond, &authority_host).await;
                         }
                     }
                 });
@@ -478,412 +478,413 @@ struct UpstreamInfo {
     auth_query_key: Option<&'static str>,
 }
 
-/// Proxy request to upstream using HTTP/2.
-async fn proxy_h2_upstream(
-    h2_conn: crate::h2client::H2Connection,
-    request: httplib::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<bytes::Bytes>,
-    info: &UpstreamInfo,
-) {
-    macro_rules! invalid {
-        ($respond:expr, $status:expr, $msg:expr) => {{
-            let msg: Cow<str> = $msg.into();
-            let body_bytes = msg.as_bytes();
-            let body: Vec<u8> = Vec::from(body_bytes);
-            let builder = httplib::Response::builder()
-                .version(httplib::Version::HTTP_2)
-                .status($status)
-                .header("content-type", "text/plain; charset=utf-8");
-            let mut send = match $respond.send_response(builder.body(()).unwrap(), false) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
-                    return;
-                }
-            };
-            if let Err(e) = send.send_data(bytes::Bytes::from(body), true) {
-                log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
-            }
-        }};
-    }
-
-    let mut send_request = h2_conn.send_request();
-
-    // Build the upstream request path
-    let raw_path = request
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let path = build_upstream_path(
-        raw_path,
-        info.path_prefix.as_deref(),
-        info.api_key.as_deref(),
-        info.auth_query_key,
-    );
-
-    // Build upstream URI
-    let upstream_uri = httplib::Uri::builder()
-        .scheme(if info.use_tls { "https" } else { "http" })
-        .authority(info.host_header_value.as_str())
-        .path_and_query(path.as_str())
-        .build();
-
-    let upstream_uri = match upstream_uri {
-        Ok(uri) => uri,
-        Err(e) => {
-            invalid!(respond, 502, format!("invalid upstream uri: {}", e));
-            return;
-        }
-    };
-
-    // Build the request to send to upstream
-    let mut upstream_request = httplib::Request::builder()
-        .method(request.method().clone())
-        .uri(upstream_uri)
-        .version(httplib::Version::HTTP_2);
-
-    // Copy headers, filtering out HTTP/2 pseudo-headers and connection-specific headers
-    for (key, value) in request.headers() {
-        let key_str = key.as_str();
-        // Skip pseudo-headers (they start with :) and connection-specific headers
-        if key_str.starts_with(':') || is_http2_invalid_headers(key_str) {
-            continue;
-        }
-        // Replace Host header with upstream host
-        if key_str.eq_ignore_ascii_case("host") {
-            upstream_request = upstream_request.header("host", info.host_header_value.as_str());
-            continue;
-        }
-        // Skip auth header - will be replaced by provider auth
-        if let Some(provider_auth_key) = info.auth_header_key {
-            if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
-                continue; // Will add auth_header below
-            }
-        }
-        upstream_request = upstream_request.header(key, value);
-    }
-
-    // Add provider's auth header if present
-    if let Some(ref auth) = info.auth_header {
-        if let Some((header_name, header_value)) = parse_auth_header(auth) {
-            upstream_request = upstream_request.header(header_name, header_value);
-        }
-    }
-
-    let upstream_request = match upstream_request.body(()) {
-        Ok(req) => req,
-        Err(e) => {
-            invalid!(respond, 502, format!("build request: {}", e));
-            return;
-        }
-    };
-
-    // Get the request body
-    let recv_body = request.into_body();
-
-    // Check if request has a body
-    let has_body = !recv_body.is_end_stream();
-
-    // Send the request
-    let (upstream_response, mut upstream_send_body) = match send_request.send_request(upstream_request, !has_body) {
-        Ok(res) => res,
-        Err(e) => {
-            invalid!(respond, 502, format!("upstream send: {}", e));
-            return;
-        }
-    };
-
-    // Stream the request body to upstream if present
-    if has_body {
-        let mut body_reader = H2StreamReader::new(recv_body);
-        let mut buf = vec![0u8; 16384];
-        loop {
-            match body_reader.read(&mut buf).await {
-                Ok(0) => {
-                    // End of body
-                    if let Err(e) = upstream_send_body.send_data(bytes::Bytes::new(), true) {
-                        log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_end_error");
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                    if let Err(e) = upstream_send_body.send_data(data, false) {
-                        log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_error");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::error!(alpn = "h2", error = e.to_string(); "read_client_body_error");
-                    break;
-                }
-            }
-        }
-    }
-
-    // Wait for the response
-    let upstream_response = match upstream_response.await {
-        Ok(resp) => resp,
-        Err(e) => {
-            invalid!(respond, 502, format!("upstream response: {}", e));
-            return;
-        }
-    };
-
-    // Build response to send back to client
-    let (parts, mut upstream_body) = upstream_response.into_parts();
-    let mut builder = httplib::Response::builder()
-        .version(httplib::Version::HTTP_2)
-        .status(parts.status);
-
-    // Copy response headers
-    for (key, value) in parts.headers.iter() {
-        if !is_http2_invalid_headers(key.as_str()) {
-            builder = builder.header(key, value);
-        }
-    }
-
-    let response_has_body = !upstream_body.is_end_stream();
-
-    let mut send = match respond.send_response(builder.body(()).unwrap(), !response_has_body) {
-        Ok(send) => send,
-        Err(e) => {
-            log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
-            return;
-        }
-    };
-
-    // Stream the response body back to client
-    if response_has_body {
-        loop {
-            match upstream_body.data().await {
-                Some(Ok(data)) => {
-                    // Release flow control capacity
-                    let _ = upstream_body.flow_control().release_capacity(data.len());
-
-                    if send.capacity() < data.len() {
-                        send.reserve_capacity(data.len());
-                    }
-                    if let Err(e) = send.send_data(data, false) {
-                        log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
+impl UpstreamInfo {
+    /// Proxy request to upstream using HTTP/2.
+    async fn proxy_h2(
+        &self,
+        h2conn: crate::h2client::H2Connection,
+        request: httplib::Request<h2::RecvStream>,
+        mut respond: h2::server::SendResponse<bytes::Bytes>,
+    ) {
+        macro_rules! invalid {
+            ($respond:expr, $status:expr, $msg:expr) => {{
+                let msg: Cow<str> = $msg.into();
+                let body_bytes = msg.as_bytes();
+                let body: Vec<u8> = Vec::from(body_bytes);
+                let builder = httplib::Response::builder()
+                    .version(httplib::Version::HTTP_2)
+                    .status($status)
+                    .header("content-type", "text/plain; charset=utf-8");
+                let mut send = match $respond.send_response(builder.body(()).unwrap(), false) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
                         return;
                     }
+                };
+                if let Err(e) = send.send_data(bytes::Bytes::from(body), true) {
+                    log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
                 }
-                Some(Err(e)) => {
-                    log::error!(alpn = "h2", error = e.to_string(); "upstream_body_error");
-                    return;
-                }
-                None => {
-                    // End of stream
-                    if let Err(e) = send.send_data(bytes::Bytes::new(), true) {
-                        log::error!(alpn = "h2", error = e.to_string(); "send_data_end_error");
-                    }
-                    break;
-                }
-            }
+            }};
         }
-    }
-}
 
-/// Proxy request to upstream using HTTP/1.1 fallback.
-/// Returns the outgoing connection if it should be kept alive.
-async fn proxy_h1_upstream<P>(
-    worker: &mut Worker<P>,
-    request: httplib::Request<h2::RecvStream>,
-    mut respond: h2::server::SendResponse<bytes::Bytes>,
-    info: &UpstreamInfo,
-    authority_host: &str,
-) where
-    P: PoolTrait + Send + Sync + 'static,
-    <P as PoolTrait>::Item: ConnTrait + Unpin + Send + Sync,
-{
-    macro_rules! invalid {
-        ($respond:expr, $status:expr, $msg:expr) => {{
-            let msg: Cow<str> = $msg.into();
-            let body_bytes = msg.as_bytes();
-            let body: Vec<u8> = Vec::from(body_bytes);
-            let builder = httplib::Response::builder()
-                .version(httplib::Version::HTTP_2)
-                .status($status)
-                .header("content-type", "text/plain; charset=utf-8");
-            let mut send = match $respond.send_response(builder.body(()).unwrap(), false) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
-                    return;
-                }
-            };
-            if let Err(e) = send.send_data(bytes::Bytes::from(body), true) {
-                log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
-            }
-        }};
-    }
+        let mut send_request = h2conn.send_request();
 
-    let mut request = request;
+        // Build the upstream request path
+        let raw_path = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let path = build_upstream_path(
+            raw_path,
+            self.path_prefix.as_deref(),
+            self.api_key.as_deref(),
+            self.auth_query_key,
+        );
 
-    // Add default headers
-    request
-        .headers_mut()
-        .entry("Connection")
-        .or_insert(httplib::HeaderValue::from_static("keep-alive"));
-    request
-        .headers_mut()
-        .entry("Host")
-        .or_insert(httplib::HeaderValue::from_str(authority_host).unwrap());
+        // Build upstream URI
+        let upstream_uri = httplib::Uri::builder()
+            .scheme(if self.use_tls { "https" } else { "http" })
+            .authority(self.host_header_value.as_str())
+            .path_and_query(path.as_str())
+            .build();
 
-    let has_content_length = request.headers().contains_key("content-length");
-
-    // Build HTTP/1.1 request headers
-    let req_headers = build_h1_request_headers(
-        request.headers().iter(),
-        &info.host_header_value,
-        info.auth_header_key,
-        info.auth_header.as_deref(),
-        has_content_length,
-    );
-
-    // Build path with prefix stripping and auth query replacement
-    let raw_path = request
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let path = build_upstream_path(
-        raw_path,
-        info.path_prefix.as_deref(),
-        info.api_key.as_deref(),
-        info.auth_query_key,
-    );
-
-    let req_str = format!(
-        "{} {} HTTP/1.1\r\n{}\r\n",
-        request.method(),
-        path,
-        req_headers,
-    );
-
-    let h2_stream_reader = H2StreamReader::new(request.into_body());
-    let req_body: Box<dyn AsyncRead + Unpin + Send + Sync> = if has_content_length {
-        Box::new(h2_stream_reader)
-    } else {
-        Box::new(http::reader::ChunkedWriter::new(h2_stream_reader))
-    };
-    let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
-
-    let mut req = match http::Request::new(req_reader).await {
-        Ok(req) => req,
-        Err(e @ Error::NoProviderFound) => {
-            invalid!(respond, 404, e.to_string());
-            return;
-        }
-        Err(e) => {
-            invalid!(respond, 400, e.to_string());
-            return;
-        }
-    };
-
-    let mut outgoing = match worker
-        .get_or_create_h1_conn(&info.endpoint, &info.sock_address, info.use_tls)
-        .await
-    {
-        Ok(conn) => conn,
-        Err(e) => {
-            invalid!(respond, 502, format!("upstream: {}", e));
-            return;
-        }
-    };
-
-    if let Err(e) = req.write_to(&mut outgoing).await {
-        invalid!(respond, 502, format!("upstream: {}", e));
-        return;
-    };
-
-    let mut response = match http::Response::new(&mut outgoing).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            invalid!(respond, 502, format!("upstream: {}", e));
-            return;
-        }
-    };
-
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut parser = httparse::Response::new(&mut headers);
-    if let Err(e) = parser.parse(response.payload.block()) {
-        invalid!(respond, 502, format!("upstream: {}", e));
-        return;
-    };
-
-    let mut builder = httplib::Response::builder()
-        .version(httplib::Version::HTTP_2)
-        .status(parser.code.unwrap_or(502));
-
-    let mut is_transfer_encoding_chunked = false;
-    for header in parser.headers {
-        if header.name.eq_ignore_ascii_case("transfer-encoding")
-            && header.value.eq_ignore_ascii_case(b"chunked")
-        {
-            is_transfer_encoding_chunked = true;
-        }
-        if !is_http2_invalid_headers(header.name) {
-            builder = builder.header(header.name, header.value);
-        }
-    }
-
-    if matches!(&mut response.payload.body, http::Body::Unread(_)) && is_transfer_encoding_chunked {
-        let mut take = http::Body::Read(0..0);
-        mem::swap(&mut take, &mut response.payload.body);
-        let mut body = if let http::Body::Unread(reader) = take {
-            http::Body::Unread(Box::new(http::reader::ChunkedReader::data_only(reader)))
-        } else {
-            unreachable!();
-        };
-        mem::swap(&mut body, &mut response.payload.body);
-    }
-
-    let mut send = match respond.send_response(builder.body(()).unwrap(), false) {
-        Ok(send) => send,
-        Err(e) => {
-            log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
-            return;
-        }
-    };
-
-    loop {
-        let block = match response
-            .payload
-            .next_block()
-            .await
-            .map(|block| block.map(|cow| cow.to_vec()))
-        {
-            Ok(block) => block,
+        let upstream_uri = match upstream_uri {
+            Ok(uri) => uri,
             Err(e) => {
-                log::error!(alpn = "h2", error = e.to_string(); "read_block_error");
+                invalid!(respond, 502, format!("invalid upstream uri: {}", e));
                 return;
             }
         };
 
-        let (data, is_eos) = if let Some(block) = block {
-            if send.capacity() < block.len() {
-                send.reserve_capacity(block.len());
+        // Build the request to send to upstream
+        let mut upstream_request = httplib::Request::builder()
+            .method(request.method().clone())
+            .uri(upstream_uri)
+            .version(httplib::Version::HTTP_2);
+
+        // Copy headers, filtering out HTTP/2 pseudo-headers and connection-specific headers
+        for (key, value) in request.headers() {
+            let key_str = key.as_str();
+            // Skip pseudo-headers (they start with :) and connection-specific headers
+            if key_str.starts_with(':') || is_http2_invalid_headers(key_str) {
+                continue;
             }
-            (bytes::Bytes::from(block), false)
-        } else {
-            (bytes::Bytes::from_static(b""), true)
+            // Replace Host header with upstream host
+            if key_str.eq_ignore_ascii_case("host") {
+                upstream_request = upstream_request.header("host", self.host_header_value.as_str());
+                continue;
+            }
+            // Skip auth header - will be replaced by provider auth
+            if let Some(provider_auth_key) = self.auth_header_key {
+                if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
+                    continue; // Will add auth_header below
+                }
+            }
+            upstream_request = upstream_request.header(key, value);
+        }
+
+        // Add provider's auth header if present
+        if let Some(ref auth) = self.auth_header {
+            if let Some((header_name, header_value)) = parse_auth_header(auth) {
+                upstream_request = upstream_request.header(header_name, header_value);
+            }
+        }
+
+        let upstream_request = match upstream_request.body(()) {
+            Ok(req) => req,
+            Err(e) => {
+                invalid!(respond, 502, format!("build request: {}", e));
+                return;
+            }
         };
 
-        if let Err(e) = send.send_data(data, is_eos) {
-            log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
-            return;
+        // Get the request body
+        let recv_body = request.into_body();
+
+        // Check if request has a body
+        let has_body = !recv_body.is_end_stream();
+
+        // Send the request
+        let (upstream_response, mut upstream_send_body) = match send_request.send_request(upstream_request, !has_body) {
+            Ok(res) => res,
+            Err(e) => {
+                invalid!(respond, 502, format!("upstream send: {}", e));
+                return;
+            }
+        };
+
+        // Stream the request body to upstream if present
+        if has_body {
+            let mut body_reader = H2StreamReader::new(recv_body);
+            let mut buf = vec![0u8; 16384];
+            loop {
+                match body_reader.read(&mut buf).await {
+                    Ok(0) => {
+                        // End of body
+                        if let Err(e) = upstream_send_body.send_data(bytes::Bytes::new(), true) {
+                            log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_end_error");
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                        if let Err(e) = upstream_send_body.send_data(data, false) {
+                            log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_error");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(alpn = "h2", error = e.to_string(); "read_client_body_error");
+                        break;
+                    }
+                }
+            }
         }
-        if is_eos {
-            break;
+
+        // Wait for the response
+        let upstream_response = match upstream_response.await {
+            Ok(resp) => resp,
+            Err(e) => {
+                invalid!(respond, 502, format!("upstream response: {}", e));
+                return;
+            }
+        };
+
+        // Build response to send back to client
+        let (parts, mut upstream_body) = upstream_response.into_parts();
+        let mut builder = httplib::Response::builder()
+            .version(httplib::Version::HTTP_2)
+            .status(parts.status);
+
+        // Copy response headers
+        for (key, value) in parts.headers.iter() {
+            if !is_http2_invalid_headers(key.as_str()) {
+                builder = builder.header(key, value);
+            }
+        }
+
+        let response_has_body = !upstream_body.is_end_stream();
+
+        let mut send = match respond.send_response(builder.body(()).unwrap(), !response_has_body) {
+            Ok(send) => send,
+            Err(e) => {
+                log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
+                return;
+            }
+        };
+
+        // Stream the response body back to client
+        if response_has_body {
+            loop {
+                match upstream_body.data().await {
+                    Some(Ok(data)) => {
+                        // Release flow control capacity
+                        let _ = upstream_body.flow_control().release_capacity(data.len());
+
+                        if send.capacity() < data.len() {
+                            send.reserve_capacity(data.len());
+                        }
+                        if let Err(e) = send.send_data(data, false) {
+                            log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
+                            return;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        log::error!(alpn = "h2", error = e.to_string(); "upstream_body_error");
+                        return;
+                    }
+                    None => {
+                        // End of stream
+                        if let Err(e) = send.send_data(bytes::Bytes::new(), true) {
+                            log::error!(alpn = "h2", error = e.to_string(); "send_data_end_error");
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    if response.payload.conn_keep_alive {
-        drop(response);
-        worker.add(&info.endpoint, outgoing).await;
+    /// Proxy request to upstream using HTTP/1.1 fallback.
+    async fn proxy_h1<P>(
+        &self,
+        worker: &mut Worker<P>,
+        request: httplib::Request<h2::RecvStream>,
+        mut respond: h2::server::SendResponse<bytes::Bytes>,
+        authority_host: &str,
+    ) where
+        P: PoolTrait + Send + Sync + 'static,
+        <P as PoolTrait>::Item: ConnTrait + Unpin + Send + Sync,
+    {
+        macro_rules! invalid {
+            ($respond:expr, $status:expr, $msg:expr) => {{
+                let msg: Cow<str> = $msg.into();
+                let body_bytes = msg.as_bytes();
+                let body: Vec<u8> = Vec::from(body_bytes);
+                let builder = httplib::Response::builder()
+                    .version(httplib::Version::HTTP_2)
+                    .status($status)
+                    .header("content-type", "text/plain; charset=utf-8");
+                let mut send = match $respond.send_response(builder.body(()).unwrap(), false) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
+                        return;
+                    }
+                };
+                if let Err(e) = send.send_data(bytes::Bytes::from(body), true) {
+                    log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
+                }
+            }};
+        }
+
+        let mut request = request;
+
+        // Add default headers
+        request
+            .headers_mut()
+            .entry("Connection")
+            .or_insert(httplib::HeaderValue::from_static("keep-alive"));
+        request
+            .headers_mut()
+            .entry("Host")
+            .or_insert(httplib::HeaderValue::from_str(authority_host).unwrap());
+
+        let has_content_length = request.headers().contains_key("content-length");
+
+        // Build HTTP/1.1 request headers
+        let req_headers = build_h1_request_headers(
+            request.headers().iter(),
+            &self.host_header_value,
+            self.auth_header_key,
+            self.auth_header.as_deref(),
+            has_content_length,
+        );
+
+        // Build path with prefix stripping and auth query replacement
+        let raw_path = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let path = build_upstream_path(
+            raw_path,
+            self.path_prefix.as_deref(),
+            self.api_key.as_deref(),
+            self.auth_query_key,
+        );
+
+        let req_str = format!(
+            "{} {} HTTP/1.1\r\n{}\r\n",
+            request.method(),
+            path,
+            req_headers,
+        );
+
+        let h2stream_reader = H2StreamReader::new(request.into_body());
+        let req_body: Box<dyn AsyncRead + Unpin + Send + Sync> = if has_content_length {
+            Box::new(h2stream_reader)
+        } else {
+            Box::new(http::reader::ChunkedWriter::new(h2stream_reader))
+        };
+        let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
+
+        let mut req = match http::Request::new(req_reader).await {
+            Ok(req) => req,
+            Err(e @ Error::NoProviderFound) => {
+                invalid!(respond, 404, e.to_string());
+                return;
+            }
+            Err(e) => {
+                invalid!(respond, 400, e.to_string());
+                return;
+            }
+        };
+
+        let mut outgoing = match worker
+            .get_or_create_h1_conn(&self.endpoint, &self.sock_address, self.use_tls)
+            .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                invalid!(respond, 502, format!("upstream: {}", e));
+                return;
+            }
+        };
+
+        if let Err(e) = req.write_to(&mut outgoing).await {
+            invalid!(respond, 502, format!("upstream: {}", e));
+            return;
+        };
+
+        let mut response = match http::Response::new(&mut outgoing).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                invalid!(respond, 502, format!("upstream: {}", e));
+                return;
+            }
+        };
+
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut parser = httparse::Response::new(&mut headers);
+        if let Err(e) = parser.parse(response.payload.block()) {
+            invalid!(respond, 502, format!("upstream: {}", e));
+            return;
+        };
+
+        let mut builder = httplib::Response::builder()
+            .version(httplib::Version::HTTP_2)
+            .status(parser.code.unwrap_or(502));
+
+        let mut is_transfer_encoding_chunked = false;
+        for header in parser.headers {
+            if header.name.eq_ignore_ascii_case("transfer-encoding")
+                && header.value.eq_ignore_ascii_case(b"chunked")
+            {
+                is_transfer_encoding_chunked = true;
+            }
+            if !is_http2_invalid_headers(header.name) {
+                builder = builder.header(header.name, header.value);
+            }
+        }
+
+        if matches!(&mut response.payload.body, http::Body::Unread(_)) && is_transfer_encoding_chunked {
+            let mut take = http::Body::Read(0..0);
+            mem::swap(&mut take, &mut response.payload.body);
+            let mut body = if let http::Body::Unread(reader) = take {
+                http::Body::Unread(Box::new(http::reader::ChunkedReader::data_only(reader)))
+            } else {
+                unreachable!();
+            };
+            mem::swap(&mut body, &mut response.payload.body);
+        }
+
+        let mut send = match respond.send_response(builder.body(()).unwrap(), false) {
+            Ok(send) => send,
+            Err(e) => {
+                log::error!(alpn = "h2", error = e.to_string(); "send_response_error");
+                return;
+            }
+        };
+
+        loop {
+            let block = match response
+                .payload
+                .next_block()
+                .await
+                .map(|block| block.map(|cow| cow.to_vec()))
+            {
+                Ok(block) => block,
+                Err(e) => {
+                    log::error!(alpn = "h2", error = e.to_string(); "read_block_error");
+                    return;
+                }
+            };
+
+            let (data, is_eos) = if let Some(block) = block {
+                if send.capacity() < block.len() {
+                    send.reserve_capacity(block.len());
+                }
+                (bytes::Bytes::from(block), false)
+            } else {
+                (bytes::Bytes::from_static(b""), true)
+            };
+
+            if let Err(e) = send.send_data(data, is_eos) {
+                log::error!(alpn = "h2", error = e.to_string(); "send_data_error");
+                return;
+            }
+            if is_eos {
+                break;
+            }
+        }
+
+        if response.payload.conn_keep_alive {
+            drop(response);
+            worker.add(&self.endpoint, outgoing).await;
+        }
     }
 }
 
@@ -1095,7 +1096,7 @@ where
 
                 // Now perform bidirectional proxying between H2 stream and upstream
                 // Create an adapter for the H2 recv_stream
-                let mut h2_reader = H2StreamReader::new(recv_stream);
+                let mut h2reader = H2StreamReader::new(recv_stream);
                 let mut send_stream = H2SendStreamWriter::new(send);
 
                 // Bidirectional copy
@@ -1107,7 +1108,7 @@ where
                         biased;
 
                         // Read from H2 client, write to upstream
-                        result = h2_reader.read(&mut client_buf) => {
+                        result = h2reader.read(&mut client_buf) => {
                             match result {
                                 Ok(0) => {
                                     // Client closed
