@@ -265,21 +265,27 @@ jobs:
           import json
 
           class EchoHandler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
               def do_GET(self):
+                  response = {"path": self.path, "method": "GET", "fallback": "success"}
+                  body = json.dumps(response).encode()
                   self.send_response(200)
                   self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
                   self.end_headers()
-                  response = {"path": self.path, "method": "GET", "fallback": "success"}
-                  self.wfile.write(json.dumps(response).encode())
+                  self.wfile.write(body)
 
               def do_POST(self):
                   content_length = int(self.headers.get("Content-Length", 0))
-                  body = self.rfile.read(content_length)
+                  req_body = self.rfile.read(content_length)
+                  response = {"path": self.path, "method": "POST", "fallback": "success"}
+                  body = json.dumps(response).encode()
                   self.send_response(200)
                   self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
                   self.end_headers()
-                  response = {"path": self.path, "method": "POST", "fallback": "success"}
-                  self.wfile.write(json.dumps(response).encode())
+                  self.wfile.write(body)
 
               def log_message(self, format, *args):
                   pass  # Suppress logging
