@@ -140,6 +140,12 @@ jobs:
               host: nested-path.local/api/v1
               endpoint: ${OPENAI_ENDPOINT}
               api_key: ${OPENAI_API_KEY}
+            # H1 fallback test provider (non-TLS upstream)
+            - type: openai
+              host: h1-fallback.localhost:8443
+              endpoint: localhost
+              port: 9001
+              tls: false
             # Gemini providers
             - type: gemini
               host: gemini.localhost:8443
@@ -251,6 +257,38 @@ jobs:
           cd e2e
           python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
 
+      - name: Start HTTP echo server for fallback test
+        run: |
+          # Start a simple HTTP echo server on port 9001
+          python3 -c '
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json
+
+          class EchoHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  response = {"path": self.path, "method": "GET", "fallback": "success"}
+                  self.wfile.write(json.dumps(response).encode())
+
+              def do_POST(self):
+                  content_length = int(self.headers.get("Content-Length", 0))
+                  body = self.rfile.read(content_length)
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  response = {"path": self.path, "method": "POST", "fallback": "success"}
+                  self.wfile.write(json.dumps(response).encode())
+
+              def log_message(self, format, *args):
+                  pass  # Suppress logging
+
+          HTTPServer(("127.0.0.1", 9001), EchoHandler).serve_forever()
+          ' &
+          sleep 2
+          echo "HTTP echo server started on http://127.0.0.1:9001"
+
       - name: Run H2 to H1 fallback test
         env:
           PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
@@ -258,22 +296,27 @@ jobs:
         run: |
           echo "Testing H2 client -> proxy -> H1 upstream fallback..."
 
-          # Client connects via HTTPS/H2, but upstream (echo server) is plain HTTP
+          # Client connects via HTTPS/H2, but upstream is plain HTTP
           # Proxy should fallback to HTTP/1.1 for upstream connection
-          HTTP_CODE=$(curl -s -o /tmp/h2_fallback_response.txt -w "%{http_code}" \
+          HTTP_CODE=$(curl -s -o /tmp/h2_fallback_response.json -w "%{http_code}" \
             --cacert $SSL_CERT_FILE \
             --http2 \
-            -H "Host: echo.localhost:8443" \
+            -H "Host: h1-fallback.localhost:8443" \
             -H "Authorization: Bearer ${PROXY_AUTH_KEY}" \
             "https://localhost:8443/test-fallback")
 
           echo "HTTP Status: $HTTP_CODE"
-          cat /tmp/h2_fallback_response.txt
+          cat /tmp/h2_fallback_response.json
           echo ""
 
-          # Echo server returns the request, so any 2xx response means success
-          if [ "$HTTP_CODE" -lt "200" ] || [ "$HTTP_CODE" -ge "300" ]; then
+          if [ "$HTTP_CODE" != "200" ]; then
             echo "::error::H2 fallback test failed with status $HTTP_CODE"
+            exit 1
+          fi
+
+          # Verify response contains fallback success marker
+          if ! grep -q "fallback.*success" /tmp/h2_fallback_response.json; then
+            echo "::error::H2 fallback response does not contain success marker"
             exit 1
           fi
 
