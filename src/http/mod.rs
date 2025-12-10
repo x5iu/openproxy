@@ -455,10 +455,6 @@ impl<'a> Payload<'a> {
         self.internal_buffer.as_ref()
     }
 
-    pub(crate) fn state(&self) -> ReadState {
-        self.state
-    }
-
     pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<'_, [u8]>>, Error> {
         match self.state {
             ReadState::Start => {

@@ -1,4 +1,5 @@
 pub mod executor;
+pub mod h2client;
 pub mod http;
 pub mod provider;
 pub mod websocket;

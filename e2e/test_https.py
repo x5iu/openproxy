@@ -239,6 +239,75 @@ test_no_provider_found_https_http2()
 test_connection_reuse_https()
 test_concurrent_requests_https()
 
+
+def test_invalid_auth_key_https_http1():
+    """Test that invalid API key returns 401 from proxy (HTTP/1.1)."""
+    print(f"\n{'='*50}")
+    print("Testing HTTPS (HTTP/1.1) invalid auth key -> 401")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+
+    with httpx.Client(base_url=base_url, http2=False, verify=ssl_cert, timeout=10) as client:
+        # Test with completely invalid key
+        resp = client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer invalid-key-12345"},
+        )
+        print(f"  Invalid key: Status {resp.status_code}")
+        print(f"  Response body: {resp.text}")
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
+
+        # Test with missing auth header
+        # Note: HTTP/1.1 path returns "authentication failed" for both missing and invalid keys
+        resp = client.get("/v1/models")
+        print(f"  Missing auth: Status {resp.status_code}")
+        print(f"  Response body: {resp.text}")
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
+
+    print("\u2713 HTTPS HTTP/1.1 invalid auth key test passed!")
+
+
+def test_invalid_auth_key_https_http2():
+    """Test that invalid API key returns 401 from proxy (HTTP/2)."""
+    print(f"\n{'='*50}")
+    print("Testing HTTPS (HTTP/2) invalid auth key -> 401")
+    print('='*50)
+
+    base_url = os.environ["OPENAI_BASE_URL"]
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
+
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=10) as client:
+        # Test with completely invalid key
+        resp = client.get(
+            "/v1/models",
+            headers={"Authorization": "Bearer invalid-key-12345"},
+        )
+        print(f"  Invalid key: Status {resp.status_code}")
+        print(f"  HTTP Version: {resp.http_version}")
+        print(f"  Response body: {resp.text}")
+        assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
+
+        # Test with missing auth header
+        resp = client.get("/v1/models")
+        print(f"  Missing auth: Status {resp.status_code}")
+        print(f"  HTTP Version: {resp.http_version}")
+        print(f"  Response body: {resp.text}")
+        assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
+        assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
+        assert "missing authentication" in resp.text.lower(), f"Expected 'missing authentication' in body, got: {resp.text}"
+
+    print("\u2713 HTTPS HTTP/2 invalid auth key test passed!")
+
+
+test_invalid_auth_key_https_http1()
+test_invalid_auth_key_https_http2()
+
 print("\n" + "="*50)
 print("\u2713 All HTTPS tests passed!")
 print("="*50)

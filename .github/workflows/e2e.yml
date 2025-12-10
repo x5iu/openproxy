@@ -62,69 +62,101 @@ jobs:
       - name: Generate auth key and config
         env:
           OPENAI_HOST: ${{ secrets.OPENAI_HOST }}
-          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_HOST: ${{ secrets.GEMINI_HOST }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           # Check required secrets
           if [ -z "$OPENAI_HOST" ]; then
             echo "::error::OPENAI_HOST secret is not set"
             exit 1
           fi
-          if [ -z "$OPENAI_KEY" ]; then
+          if [ -z "$OPENAI_API_KEY" ]; then
             echo "::error::OPENAI_API_KEY secret is not set"
+            exit 1
+          fi
+          if [ -z "$GEMINI_HOST" ]; then
+            echo "::error::GEMINI_HOST secret is not set"
+            exit 1
+          fi
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "::error::GEMINI_API_KEY secret is not set"
             exit 1
           fi
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
-          # Strip protocol prefix if present (https:// or http://)
-          ENDPOINT="${OPENAI_HOST#https://}"
-          ENDPOINT="${ENDPOINT#http://}"
-          # Strip trailing slash if present
-          ENDPOINT="${ENDPOINT%/}"
-          API_KEY="${OPENAI_KEY}"
-          echo "Using endpoint: ${ENDPOINT}"
-          printf '%s\n' \
-            "cert_file: fullchain.pem" \
-            "private_key_file: privkey.pem" \
-            "https_port: 8443" \
-            "http_port: 8080" \
-            "" \
-            "auth_keys:" \
-            "  - ${AUTH_KEY}" \
-            "" \
-            "providers:" \
-            "  - type: openai" \
-            "    host: localhost:8443" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: localhost:8080" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: api.openai.com" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: echo.localhost:8443" \
-            "    endpoint: localhost" \
-            "    port: 9000" \
-            "    tls: false" \
-            "  - type: openai" \
-            "    host: echo.localhost:8080" \
-            "    endpoint: localhost" \
-            "    port: 9000" \
-            "    tls: false" \
-            "  # Providers with path prefix for host path routing tests" \
-            "  # Use unique host names to avoid conflicts with other providers" \
-            "  - type: openai" \
-            "    host: path-test.local/openai" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            "  - type: openai" \
-            "    host: nested-path.local/api/v1" \
-            "    endpoint: ${ENDPOINT}" \
-            "    api_key: ${API_KEY}" \
-            > config.yml
+
+          # Process OpenAI config
+          OPENAI_ENDPOINT="${OPENAI_HOST#https://}"
+          OPENAI_ENDPOINT="${OPENAI_ENDPOINT#http://}"
+          OPENAI_ENDPOINT="${OPENAI_ENDPOINT%/}"
+          echo "Using OpenAI endpoint: ${OPENAI_ENDPOINT}"
+
+          # Process Gemini config
+          GEMINI_ENDPOINT="${GEMINI_HOST#https://}"
+          GEMINI_ENDPOINT="${GEMINI_ENDPOINT#http://}"
+          GEMINI_ENDPOINT="${GEMINI_ENDPOINT%/}"
+          echo "Using Gemini endpoint: ${GEMINI_ENDPOINT}"
+
+          # Build config file
+          cat > config.yml << YAML
+          cert_file: fullchain.pem
+          private_key_file: privkey.pem
+          https_port: 8443
+          http_port: 8080
+
+          auth_keys:
+            - ${AUTH_KEY}
+
+          providers:
+            - type: openai
+              host: localhost:8443
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
+            - type: openai
+              host: localhost:8080
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
+            - type: openai
+              host: api.openai.com
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
+            - type: openai
+              host: echo.localhost:8443
+              endpoint: localhost
+              port: 9000
+              tls: false
+            - type: openai
+              host: echo.localhost:8080
+              endpoint: localhost
+              port: 9000
+              tls: false
+            # Providers with path prefix for host path routing tests
+            - type: openai
+              host: path-test.local/openai
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
+            - type: openai
+              host: nested-path.local/api/v1
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
+            # H1 fallback test provider (non-TLS upstream)
+            - type: openai
+              host: h1-fallback.localhost:8443
+              endpoint: localhost
+              port: 9001
+              tls: false
+            # Gemini providers
+            - type: gemini
+              host: gemini.localhost:8443
+              endpoint: ${GEMINI_ENDPOINT}
+              api_key: ${GEMINI_API_KEY}
+            - type: gemini
+              host: gemini.localhost:8080
+              endpoint: ${GEMINI_ENDPOINT}
+              api_key: ${GEMINI_API_KEY}
+          YAML
+
           cat config.yml
 
       - name: Build openproxy
@@ -224,3 +256,160 @@ jobs:
         run: |
           cd e2e
           python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
+
+      - name: Start HTTP echo server for fallback test
+        run: |
+          # Start a simple HTTP echo server on port 9001
+          python3 -c '
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json
+
+          class EchoHandler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def do_GET(self):
+                  response = {"path": self.path, "method": "GET", "fallback": "success"}
+                  body = json.dumps(response).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_POST(self):
+                  content_length = int(self.headers.get("Content-Length", 0))
+                  req_body = self.rfile.read(content_length)
+                  response = {"path": self.path, "method": "POST", "fallback": "success"}
+                  body = json.dumps(response).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, format, *args):
+                  pass  # Suppress logging
+
+          HTTPServer(("127.0.0.1", 9001), EchoHandler).serve_forever()
+          ' &
+          sleep 2
+          echo "HTTP echo server started on http://127.0.0.1:9001"
+
+      - name: Run H2 to H1 fallback test
+        env:
+          PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          echo "Testing H2 client -> proxy -> H1 upstream fallback..."
+
+          # First verify the echo server is working directly
+          echo "Verifying echo server directly..."
+          curl -s http://127.0.0.1:9001/test | head -c 200
+          echo ""
+
+          # Client connects via HTTPS/H2, but upstream is plain HTTP
+          # Proxy should fallback to HTTP/1.1 for upstream connection
+          curl -s -D /tmp/fallback_headers.txt -o /tmp/fallback_response.json \
+            --cacert $SSL_CERT_FILE \
+            --http2 \
+            -H "Host: h1-fallback.localhost:8443" \
+            -H "Authorization: Bearer ${PROXY_AUTH_KEY}" \
+            "https://localhost:8443/test-fallback"
+
+          echo "Response headers:"
+          cat /tmp/fallback_headers.txt
+          echo "Response body:"
+          cat /tmp/fallback_response.json
+
+          # Verify response contains fallback success marker
+          if ! grep -q "fallback" /tmp/fallback_response.json; then
+            echo "::error::H2 fallback response does not contain success marker"
+            exit 1
+          fi
+
+          # Verify upstream protocol is H1 (fallback)
+          if ! grep -qi "x-upstream-protocol: h1" /tmp/fallback_headers.txt; then
+            echo "::error::Expected x-upstream-protocol: h1 header but not found"
+            cat /tmp/fallback_headers.txt
+            exit 1
+          fi
+
+          echo "H2 to H1 fallback test passed! (verified upstream protocol is H1)"
+
+      - name: Run Gemini E2E tests (HTTPS with curl)
+        env:
+          PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          echo "Testing Gemini API via HTTPS proxy with HTTP/2..."
+
+          # Test 1: List models with x-goog-api-key header authentication (HTTP/2)
+          echo "Test 1: Gemini list models via H2 proxy"
+          curl -s -D /tmp/gemini_headers.txt -o /tmp/gemini_response.json \
+            --cacert $SSL_CERT_FILE \
+            --http2 \
+            -H "Host: gemini.localhost:8443" \
+            -H "x-goog-api-key: ${PROXY_AUTH_KEY}" \
+            "https://localhost:8443/v1beta/models?key=placeholder&pageSize=1"
+
+          HTTP_CODE=$(head -1 /tmp/gemini_headers.txt | grep -oE '[0-9]{3}')
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response headers:"
+          cat /tmp/gemini_headers.txt
+          echo "Response body:"
+          cat /tmp/gemini_response.json | head -c 500
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Gemini H2 test failed with status $HTTP_CODE"
+            cat /tmp/gemini_response.json
+            exit 1
+          fi
+
+          # Verify response contains models
+          if ! grep -q "models" /tmp/gemini_response.json; then
+            echo "::error::Gemini response does not contain models"
+            cat /tmp/gemini_response.json
+            exit 1
+          fi
+
+          # Verify upstream protocol is H2
+          if ! grep -qi "x-upstream-protocol: h2" /tmp/gemini_headers.txt; then
+            echo "::error::Expected x-upstream-protocol: h2 header but not found"
+            cat /tmp/gemini_headers.txt
+            exit 1
+          fi
+
+          echo "Gemini HTTPS/H2 test passed! (verified upstream protocol is H2)"
+
+      - name: Run Gemini E2E tests (HTTP with curl)
+        env:
+          PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          echo "Testing Gemini API via HTTP proxy..."
+
+          # Test: List models with x-goog-api-key header authentication (HTTP/1.1)
+          echo "Test: Gemini list models via HTTP/1.1 proxy"
+          HTTP_CODE=$(curl -s -o /tmp/gemini_response_http.json -w "%{http_code}" \
+            -H "Host: gemini.localhost:8080" \
+            -H "x-goog-api-key: ${PROXY_AUTH_KEY}" \
+            "http://localhost:8080/v1beta/models?key=placeholder&pageSize=1")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/gemini_response_http.json | head -c 500
+          echo ""
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Gemini HTTP test failed with status $HTTP_CODE"
+            cat /tmp/gemini_response_http.json
+            exit 1
+          fi
+
+          # Verify response contains models
+          if ! grep -q "models" /tmp/gemini_response_http.json; then
+            echo "::error::Gemini response does not contain models"
+            cat /tmp/gemini_response_http.json
+            exit 1
+          fi
+
+          echo "Gemini HTTP/1.1 test passed!"
