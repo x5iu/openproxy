@@ -62,16 +62,16 @@ jobs:
       - name: Generate auth key and config
         env:
           OPENAI_HOST: ${{ secrets.OPENAI_HOST }}
-          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_HOST: ${{ secrets.GEMINI_HOST }}
-          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           # Check required secrets
           if [ -z "$OPENAI_HOST" ]; then
             echo "::error::OPENAI_HOST secret is not set"
             exit 1
           fi
-          if [ -z "$OPENAI_KEY" ]; then
+          if [ -z "$OPENAI_API_KEY" ]; then
             echo "::error::OPENAI_API_KEY secret is not set"
             exit 1
           fi
@@ -79,19 +79,18 @@ jobs:
             echo "::error::GEMINI_HOST secret is not set"
             exit 1
           fi
-          if [ -z "$GEMINI_KEY" ]; then
+          if [ -z "$GEMINI_API_KEY" ]; then
             echo "::error::GEMINI_API_KEY secret is not set"
             exit 1
           fi
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
-          # Strip protocol prefix if present (https:// or http://)
-          ENDPOINT="${OPENAI_HOST#https://}"
-          ENDPOINT="${ENDPOINT#http://}"
-          # Strip trailing slash if present
-          ENDPOINT="${ENDPOINT%/}"
-          API_KEY="${OPENAI_KEY}"
-          echo "Using endpoint: ${ENDPOINT}"
+
+          # Process OpenAI config
+          OPENAI_ENDPOINT="${OPENAI_HOST#https://}"
+          OPENAI_ENDPOINT="${OPENAI_ENDPOINT#http://}"
+          OPENAI_ENDPOINT="${OPENAI_ENDPOINT%/}"
+          echo "Using OpenAI endpoint: ${OPENAI_ENDPOINT}"
 
           # Process Gemini config
           GEMINI_ENDPOINT="${GEMINI_HOST#https://}"
@@ -112,16 +111,16 @@ jobs:
           providers:
             - type: openai
               host: localhost:8443
-              endpoint: ${ENDPOINT}
-              api_key: ${API_KEY}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             - type: openai
               host: localhost:8080
-              endpoint: ${ENDPOINT}
-              api_key: ${API_KEY}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             - type: openai
               host: api.openai.com
-              endpoint: ${ENDPOINT}
-              api_key: ${API_KEY}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             - type: openai
               host: echo.localhost:8443
               endpoint: localhost
@@ -135,21 +134,21 @@ jobs:
             # Providers with path prefix for host path routing tests
             - type: openai
               host: path-test.local/openai
-              endpoint: ${ENDPOINT}
-              api_key: ${API_KEY}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             - type: openai
               host: nested-path.local/api/v1
-              endpoint: ${ENDPOINT}
-              api_key: ${API_KEY}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             # Gemini providers
             - type: gemini
               host: gemini.localhost:8443
               endpoint: ${GEMINI_ENDPOINT}
-              api_key: ${GEMINI_KEY}
+              api_key: ${GEMINI_API_KEY}
             - type: gemini
               host: gemini.localhost:8080
               endpoint: ${GEMINI_ENDPOINT}
-              api_key: ${GEMINI_KEY}
+              api_key: ${GEMINI_API_KEY}
           YAML
 
           cat config.yml
