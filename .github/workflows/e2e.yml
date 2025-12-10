@@ -251,6 +251,34 @@ jobs:
           cd e2e
           python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
 
+      - name: Run H2 to H1 fallback test
+        env:
+          PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          echo "Testing H2 client -> proxy -> H1 upstream fallback..."
+
+          # Client connects via HTTPS/H2, but upstream (echo server) is plain HTTP
+          # Proxy should fallback to HTTP/1.1 for upstream connection
+          HTTP_CODE=$(curl -s -o /tmp/h2_fallback_response.txt -w "%{http_code}" \
+            --cacert $SSL_CERT_FILE \
+            --http2 \
+            -H "Host: echo.localhost:8443" \
+            -H "Authorization: Bearer ${PROXY_AUTH_KEY}" \
+            "https://localhost:8443/test-fallback")
+
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/h2_fallback_response.txt
+          echo ""
+
+          # Echo server returns the request, so any 2xx response means success
+          if [ "$HTTP_CODE" -lt "200" ] || [ "$HTTP_CODE" -ge "300" ]; then
+            echo "::error::H2 fallback test failed with status $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "H2 to H1 fallback test passed!"
+
       - name: Run Gemini E2E tests (HTTPS with curl)
         env:
           PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
