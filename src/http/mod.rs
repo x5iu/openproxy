@@ -343,19 +343,19 @@ impl<'a> Payload<'a> {
                     }
                 }
             }
-            // When using OAuth (dynamic auth), we need to filter out the anthropic-beta header
-            // because we'll add a new one with the oauth value
-            if provider.uses_dynamic_auth() {
+            // When using dynamic auth, we may need to filter out a specific header
+            // (e.g., anthropic-beta for Anthropic OAuth) because we'll add a new one with modified value
+            if let Some(filter_header_key) = provider.dynamic_auth_filter_header_key() {
                 let header_lines = HeaderLines::new(&crlfs, header);
                 for line in header_lines.skip(1) {
                     let Ok(header_str) = std::str::from_utf8(line) else {
                         continue;
                     };
-                    if is_header(header_str, HEADER_ANTHROPIC_BETA) {
+                    if is_header(header_str, filter_header_key) {
                         let start = {
                             let block_start = &block[0] as *const u8 as usize;
-                            let beta_start = &line[0] as *const u8 as usize;
-                            beta_start - block_start
+                            let filter_header_start = &line[0] as *const u8 as usize;
+                            filter_header_start - block_start
                         };
                         header_chunks[3] = Some(start..start + line.len());
                         break;
@@ -555,9 +555,11 @@ impl<'a> Payload<'a> {
                     }
 
                     // Get additional headers (e.g., anthropic-beta for OAuth)
-                    // First, we need to find the existing anthropic-beta header value if any
-                    let existing_anthropic_beta = self.find_header_value(b"anthropic-beta");
-                    let additional_headers = provider.get_additional_headers(existing_anthropic_beta.as_deref());
+                    // First, we need to find the existing filter header value if any
+                    let existing_filter_header_value = provider
+                        .dynamic_auth_filter_header_key()
+                        .and_then(|key| self.find_header_value(key.trim_end_matches(": ").as_bytes()));
+                    let additional_headers = provider.get_additional_headers(existing_filter_header_value.as_deref());
                     for header in additional_headers {
                         result.extend_from_slice(header.as_bytes());
                     }

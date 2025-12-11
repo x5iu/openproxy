@@ -144,10 +144,17 @@ pub trait Provider: Send + Sync {
         Err("Dynamic auth not supported".into())
     }
 
+    /// Returns the header key that should be filtered and replaced when using dynamic auth.
+    /// For example, Anthropic uses "anthropic-beta: " header.
+    /// Returns None if no header needs to be filtered.
+    fn dynamic_auth_filter_header_key(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Get additional headers that should be added to the request.
-    /// The input is the existing anthropic-beta header value (if any).
+    /// The input is the existing value of the filter header (from dynamic_auth_filter_header_key).
     /// Returns a list of headers to add (each should end with \r\n).
-    fn get_additional_headers(&self, _existing_anthropic_beta: Option<&str>) -> Vec<String> {
+    fn get_additional_headers(&self, _existing_filter_header_value: Option<&str>) -> Vec<String> {
         Vec::new()
     }
 
@@ -777,7 +784,15 @@ impl Provider for AnthropicProvider {
         }
     }
 
-    fn get_additional_headers(&self, existing_anthropic_beta: Option<&str>) -> Vec<String> {
+    fn dynamic_auth_filter_header_key(&self) -> Option<&'static str> {
+        if self.oauth_command.is_some() {
+            Some(http::HEADER_ANTHROPIC_BETA)
+        } else {
+            None
+        }
+    }
+
+    fn get_additional_headers(&self, existing_filter_header_value: Option<&str>) -> Vec<String> {
         // Only add anthropic-beta header when using OAuth
         if self.oauth_command.is_none() {
             return Vec::new();
@@ -785,7 +800,7 @@ impl Provider for AnthropicProvider {
 
         const OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
 
-        match existing_anthropic_beta {
+        match existing_filter_header_value {
             Some(existing) => {
                 // Check if oauth-2025-04-20 is already in the existing header
                 let values: Vec<&str> = existing.split(',').map(|s| s.trim()).collect();
@@ -794,12 +809,12 @@ impl Provider for AnthropicProvider {
                     Vec::new()
                 } else {
                     // Append the oauth beta value to existing header
-                    vec![format!("anthropic-beta: {},{}\r\n", existing, OAUTH_BETA_VALUE)]
+                    vec![format!("{}{},{}\r\n", http::HEADER_ANTHROPIC_BETA, existing, OAUTH_BETA_VALUE)]
                 }
             }
             None => {
                 // No existing header, add new one
-                vec![format!("anthropic-beta: {}\r\n", OAUTH_BETA_VALUE)]
+                vec![format!("{}{}\r\n", http::HEADER_ANTHROPIC_BETA, OAUTH_BETA_VALUE)]
             }
         }
     }
