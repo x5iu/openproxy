@@ -144,18 +144,17 @@ pub trait Provider: Send + Sync {
         Err("Dynamic auth not supported".into())
     }
 
-    /// Returns the header key that should be filtered and replaced when using dynamic auth.
-    /// For example, Anthropic uses "anthropic-beta: " header.
-    /// Returns None if no header needs to be filtered.
-    fn dynamic_auth_filter_header_key(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// Get additional headers that should be added to the request.
-    /// The input is the existing value of the filter header (from dynamic_auth_filter_header_key).
-    /// Returns a list of headers to add (each should end with \r\n).
-    fn get_additional_headers(&self, _existing_filter_header_value: Option<&str>) -> Vec<String> {
-        Vec::new()
+    /// Transform or add headers when using dynamic auth.
+    ///
+    /// This method allows providers to filter existing headers and add new ones.
+    /// It receives all request headers as input and returns:
+    /// - `filter_header_key`: The header key to filter out (e.g., "anthropic-beta: "), or None
+    /// - `additional_headers`: New headers to add (each should end with \r\n)
+    ///
+    /// The filter_header_key's value will be passed to this method on the next call
+    /// so the provider can merge/modify the existing value.
+    fn transform_headers(&self, _existing_header_value: Option<&str>) -> HeaderTransform {
+        HeaderTransform::default()
     }
 
     #[allow(clippy::type_complexity)]
@@ -171,6 +170,16 @@ pub trait Provider: Send + Sync {
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+
+/// Result of header transformation for dynamic auth.
+#[derive(Default)]
+pub struct HeaderTransform {
+    /// The header key to filter out from the original request (e.g., "anthropic-beta: ").
+    /// If Some, this header will be removed and its value passed to transform_headers().
+    pub filter_header_key: Option<&'static str>,
+    /// Additional headers to add to the request (each should end with \r\n).
+    pub additional_headers: Vec<String>,
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct HealthCheckConfig {
@@ -784,29 +793,21 @@ impl Provider for AnthropicProvider {
         }
     }
 
-    fn dynamic_auth_filter_header_key(&self) -> Option<&'static str> {
-        if self.oauth_command.is_some() {
-            Some(http::HEADER_ANTHROPIC_BETA)
-        } else {
-            None
-        }
-    }
-
-    fn get_additional_headers(&self, existing_filter_header_value: Option<&str>) -> Vec<String> {
-        // Only add anthropic-beta header when using OAuth
+    fn transform_headers(&self, existing_header_value: Option<&str>) -> HeaderTransform {
+        // Only transform headers when using OAuth
         if self.oauth_command.is_none() {
-            return Vec::new();
+            return HeaderTransform::default();
         }
 
         const OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
 
-        match existing_filter_header_value {
+        let additional_headers = match existing_header_value {
             Some(existing) => {
                 // Check if oauth-2025-04-20 is already in the existing header
                 let values: Vec<&str> = existing.split(',').map(|s| s.trim()).collect();
                 if values.iter().any(|v| *v == OAUTH_BETA_VALUE) {
                     // Already contains the value, no need to add
-                    Vec::new()
+                    vec![]
                 } else {
                     // Append the oauth beta value to existing header
                     vec![format!("{}{},{}\r\n", http::HEADER_ANTHROPIC_BETA, existing, OAUTH_BETA_VALUE)]
@@ -816,6 +817,11 @@ impl Provider for AnthropicProvider {
                 // No existing header, add new one
                 vec![format!("{}{}\r\n", http::HEADER_ANTHROPIC_BETA, OAUTH_BETA_VALUE)]
             }
+        };
+
+        HeaderTransform {
+            filter_header_key: Some(http::HEADER_ANTHROPIC_BETA),
+            additional_headers,
         }
     }
 
@@ -1576,7 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_provider_oauth_additional_headers() {
+    fn test_anthropic_provider_oauth_transform_headers() {
         let auth_keys = Arc::new(vec![]);
         let provider = AnthropicProvider::new(
             "api.anthropic.com",
@@ -1591,26 +1597,30 @@ mod tests {
         ).unwrap();
 
         // Without existing anthropic-beta header
-        let headers = provider.get_additional_headers(None);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0], "anthropic-beta: oauth-2025-04-20\r\n");
+        let transform = provider.transform_headers(None);
+        assert_eq!(transform.filter_header_key, Some(http::HEADER_ANTHROPIC_BETA));
+        assert_eq!(transform.additional_headers.len(), 1);
+        assert_eq!(transform.additional_headers[0], "anthropic-beta: oauth-2025-04-20\r\n");
 
         // With existing anthropic-beta header (without oauth value)
-        let headers = provider.get_additional_headers(Some("streaming-2024-01-01"));
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0], "anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n");
+        let transform = provider.transform_headers(Some("streaming-2024-01-01"));
+        assert_eq!(transform.filter_header_key, Some(http::HEADER_ANTHROPIC_BETA));
+        assert_eq!(transform.additional_headers.len(), 1);
+        assert_eq!(transform.additional_headers[0], "anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n");
 
         // With existing anthropic-beta header (already contains oauth value)
-        let headers = provider.get_additional_headers(Some("oauth-2025-04-20"));
-        assert!(headers.is_empty());
+        let transform = provider.transform_headers(Some("oauth-2025-04-20"));
+        assert_eq!(transform.filter_header_key, Some(http::HEADER_ANTHROPIC_BETA));
+        assert!(transform.additional_headers.is_empty());
 
         // With existing anthropic-beta header (already contains oauth value among others)
-        let headers = provider.get_additional_headers(Some("streaming-2024-01-01, oauth-2025-04-20"));
-        assert!(headers.is_empty());
+        let transform = provider.transform_headers(Some("streaming-2024-01-01, oauth-2025-04-20"));
+        assert_eq!(transform.filter_header_key, Some(http::HEADER_ANTHROPIC_BETA));
+        assert!(transform.additional_headers.is_empty());
     }
 
     #[test]
-    fn test_anthropic_provider_standard_no_additional_headers() {
+    fn test_anthropic_provider_standard_no_transform() {
         let auth_keys = Arc::new(vec![]);
         let provider = AnthropicProvider::new(
             "api.anthropic.com",
@@ -1624,12 +1634,14 @@ mod tests {
             None,
         ).unwrap();
 
-        // Standard mode should not add any additional headers
-        let headers = provider.get_additional_headers(None);
-        assert!(headers.is_empty());
+        // Standard mode should not transform any headers
+        let transform = provider.transform_headers(None);
+        assert!(transform.filter_header_key.is_none());
+        assert!(transform.additional_headers.is_empty());
 
-        let headers = provider.get_additional_headers(Some("streaming-2024-01-01"));
-        assert!(headers.is_empty());
+        let transform = provider.transform_headers(Some("streaming-2024-01-01"));
+        assert!(transform.filter_header_key.is_none());
+        assert!(transform.additional_headers.is_empty());
     }
 }
 

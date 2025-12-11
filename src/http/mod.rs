@@ -345,7 +345,8 @@ impl<'a> Payload<'a> {
             }
             // When using dynamic auth, we may need to filter out a specific header
             // (e.g., anthropic-beta for Anthropic OAuth) because we'll add a new one with modified value
-            if let Some(filter_header_key) = provider.dynamic_auth_filter_header_key() {
+            let transform = provider.transform_headers(None);
+            if let Some(filter_header_key) = transform.filter_header_key {
                 let header_lines = HeaderLines::new(&crlfs, header);
                 for line in header_lines.skip(1) {
                     let Ok(header_str) = std::str::from_utf8(line) else {
@@ -554,13 +555,15 @@ impl<'a> Payload<'a> {
                         result.extend_from_slice(auth_header.as_bytes());
                     }
 
-                    // Get additional headers (e.g., anthropic-beta for OAuth)
-                    // First, we need to find the existing filter header value if any
-                    let existing_filter_header_value = provider
-                        .dynamic_auth_filter_header_key()
+                    // Transform headers (e.g., add anthropic-beta for OAuth)
+                    // First, get the transform config to find the filter header key
+                    let transform_config = provider.transform_headers(None);
+                    let existing_header_value = transform_config
+                        .filter_header_key
                         .and_then(|key| self.find_header_value(key.trim_end_matches(": ").as_bytes()));
-                    let additional_headers = provider.get_additional_headers(existing_filter_header_value.as_deref());
-                    for header in additional_headers {
+                    // Now get the actual transform with the existing header value
+                    let transform = provider.transform_headers(existing_header_value.as_deref());
+                    for header in transform.additional_headers {
                         result.extend_from_slice(header.as_bytes());
                     }
 
