@@ -133,6 +133,35 @@ pub trait Provider: Send + Sync {
     fn is_healthy(&self) -> bool;
     fn set_healthy(&self, healthy: bool);
 
+    /// Returns true if this provider uses dynamic auth (e.g., OAuth)
+    fn uses_dynamic_auth(&self) -> bool {
+        false
+    }
+
+    /// Get dynamic auth header. Called per-request for providers that use dynamic auth.
+    /// Returns the full auth header string (e.g., "Authorization: Bearer token\r\n")
+    fn get_dynamic_auth_header(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Err("Dynamic auth not supported".into())
+    }
+
+    /// Returns the list of header keys that need to be transformed/replaced.
+    /// For example, Anthropic OAuth needs to transform "anthropic-beta: " header.
+    /// Each key should include the ": " suffix (e.g., "anthropic-beta: ").
+    fn extra_headers(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Transform a header value for a given header key.
+    /// Called for each header key returned by `extra_headers()`.
+    ///
+    /// - `header_key`: The header key (e.g., "anthropic-beta: ")
+    /// - `existing_value`: The existing value if the header was present in the request
+    ///
+    /// Returns the new header line to add (should end with \r\n), or None to skip.
+    fn transform_extra_header(&self, _header_key: &str, _existing_value: Option<&str>) -> Option<String> {
+        None
+    }
+
     #[allow(clippy::type_complexity)]
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
@@ -540,13 +569,46 @@ pub struct AnthropicProvider {
     tls: bool,
     weight: f64,
     host_header: String,
-    auth_header: String,
+    /// Static auth header (for x-api-key style authentication)
+    auth_header: Option<String>,
+    /// Command to execute to get OAuth token (for Authorization Bearer style)
+    oauth_command: Option<String>,
     sock_address: String,
     server_name: rustls_pki_types::ServerName<'static>,
     auth_keys: Arc<Vec<String>>,
     provider_auth_keys: Option<Vec<String>>,
     is_healthy: AtomicBool,
     health_check_config: Option<HealthCheckConfig>,
+}
+
+/// Check if the api_key is a command pattern like $(command)
+fn is_oauth_command(api_key: &str) -> bool {
+    api_key.starts_with("$(") && api_key.ends_with(')')
+}
+
+/// Extract the command from the $(command) pattern
+fn extract_oauth_command(api_key: &str) -> Option<&str> {
+    if is_oauth_command(api_key) {
+        Some(&api_key[2..api_key.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Execute a shell command and return the stdout as a string
+fn execute_oauth_command(command: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("OAuth command failed: {}", stderr).into());
+    }
+
+    let token = String::from_utf8(output.stdout)?;
+    Ok(token.trim().to_string())
 }
 
 impl AnthropicProvider {
@@ -575,7 +637,16 @@ impl AnthropicProvider {
         } else {
             format!("Host: {}:{}\r\n", endpoint, port)
         };
-        let auth_header = format!("{}{}\r\n", http::HEADER_X_API_KEY, api_key);
+
+        // Check if api_key is a command pattern for OAuth
+        let (auth_header, oauth_command) = if let Some(cmd) = extract_oauth_command(api_key) {
+            // OAuth mode: use Authorization Bearer header, execute command for each request
+            (None, Some(cmd.to_string()))
+        } else {
+            // Standard mode: use X-API-Key header
+            (Some(format!("{}{}\r\n", http::HEADER_X_API_KEY, api_key)), None)
+        };
+
         let sock_address = format!("{}:{}", endpoint, port);
         Ok(Self {
             host,
@@ -585,6 +656,7 @@ impl AnthropicProvider {
             weight,
             host_header,
             auth_header,
+            oauth_command,
             sock_address,
             server_name,
             auth_keys,
@@ -592,6 +664,22 @@ impl AnthropicProvider {
             is_healthy: AtomicBool::new(true),
             health_check_config,
         })
+    }
+
+    /// Check if this provider uses OAuth authentication
+    pub fn uses_oauth(&self) -> bool {
+        self.oauth_command.is_some()
+    }
+
+    /// Get the OAuth token by executing the command.
+    /// Returns the Authorization header value.
+    pub fn get_oauth_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref cmd) = self.oauth_command {
+            let token = execute_oauth_command(cmd)?;
+            Ok(token)
+        } else {
+            Err("Not an OAuth provider".into())
+        }
     }
 }
 
@@ -629,7 +717,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn auth_header(&self) -> Option<&str> {
-        Some(&self.auth_header)
+        self.auth_header.as_deref()
     }
 
     fn auth_header_key(&self) -> Option<&'static str> {
@@ -685,6 +773,58 @@ impl Provider for AnthropicProvider {
 
     fn set_healthy(&self, healthy: bool) {
         self.is_healthy.store(healthy, Ordering::SeqCst)
+    }
+
+    fn uses_dynamic_auth(&self) -> bool {
+        self.oauth_command.is_some()
+    }
+
+    fn get_dynamic_auth_header(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref cmd) = self.oauth_command {
+            let token = execute_oauth_command(cmd)?;
+            Ok(format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, token))
+        } else {
+            Err("Not an OAuth provider".into())
+        }
+    }
+
+    fn extra_headers(&self) -> Vec<&'static str> {
+        if self.oauth_command.is_some() {
+            vec![http::HEADER_ANTHROPIC_BETA]
+        } else {
+            vec![]
+        }
+    }
+
+    fn transform_extra_header(&self, header_key: &str, existing_value: Option<&str>) -> Option<String> {
+        // Only transform headers when using OAuth
+        if self.oauth_command.is_none() {
+            return None;
+        }
+
+        if header_key == http::HEADER_ANTHROPIC_BETA {
+            const OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
+
+            match existing_value {
+                Some(existing) => {
+                    // Check if oauth-2025-04-20 is already in the existing header
+                    let values: Vec<&str> = existing.split(',').map(|s| s.trim()).collect();
+                    if values.iter().any(|v| *v == OAUTH_BETA_VALUE) {
+                        // Already contains the value, keep as is
+                        Some(format!("{}{}\r\n", header_key, existing))
+                    } else {
+                        // Append the oauth beta value to existing header
+                        Some(format!("{}{},{}\r\n", header_key, existing, OAUTH_BETA_VALUE))
+                    }
+                }
+                None => {
+                    // No existing header, add new one
+                    Some(format!("{}{}\r\n", header_key, OAUTH_BETA_VALUE))
+                }
+            }
+        } else {
+            None
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -1349,6 +1489,239 @@ mod tests {
 
         // Anthropic trims whitespace
         assert!(anthropic_provider.authenticate_key("  valid-key  ").is_ok());
+    }
+
+    #[test]
+    fn test_is_oauth_command() {
+        assert!(is_oauth_command("$(echo test)"));
+        assert!(is_oauth_command("$(cat .credentials.json | jq .token)"));
+        assert!(is_oauth_command("$()"));
+
+        assert!(!is_oauth_command("sk-12345"));
+        assert!(!is_oauth_command("$(incomplete"));
+        assert!(!is_oauth_command("incomplete)"));
+        assert!(!is_oauth_command("$incomplete"));
+        assert!(!is_oauth_command(""));
+    }
+
+    #[test]
+    fn test_extract_oauth_command() {
+        assert_eq!(extract_oauth_command("$(echo test)"), Some("echo test"));
+        assert_eq!(
+            extract_oauth_command("$(cat .credentials.json | jq .token)"),
+            Some("cat .credentials.json | jq .token")
+        );
+        assert_eq!(extract_oauth_command("$()"), Some(""));
+
+        assert_eq!(extract_oauth_command("sk-12345"), None);
+        assert_eq!(extract_oauth_command("$(incomplete"), None);
+    }
+
+    #[test]
+    fn test_execute_oauth_command() {
+        // Test successful command
+        let result = execute_oauth_command("echo test-token");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test-token");
+
+        // Test command with whitespace trimming
+        let result = execute_oauth_command("echo '  token  '");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "token");
+
+        // Test failing command
+        let result = execute_oauth_command("exit 1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_mode() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(echo oauth-token-123)"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+        assert!(provider.auth_header().is_none()); // Static auth header should be None
+
+        // Should return dynamic auth header
+        let dynamic_auth = provider.get_dynamic_auth_header();
+        assert!(dynamic_auth.is_ok());
+        assert_eq!(dynamic_auth.unwrap(), "Authorization: Bearer oauth-token-123\r\n");
+    }
+
+    #[test]
+    fn test_anthropic_provider_standard_mode() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("sk-ant-api-key-123"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should NOT be in OAuth mode
+        assert!(!provider.uses_oauth());
+        assert_eq!(provider.auth_header(), Some("X-API-Key: sk-ant-api-key-123\r\n"));
+
+        // Dynamic auth should fail
+        let dynamic_auth = provider.get_dynamic_auth_header();
+        assert!(dynamic_auth.is_err());
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_extra_headers() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(echo token)"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should have anthropic-beta in extra headers
+        let extra = provider.extra_headers();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0], http::HEADER_ANTHROPIC_BETA);
+
+        // Without existing anthropic-beta header
+        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, None);
+        assert_eq!(result, Some("anthropic-beta: oauth-2025-04-20\r\n".to_string()));
+
+        // With existing anthropic-beta header (without oauth value)
+        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
+        assert_eq!(result, Some("anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n".to_string()));
+
+        // With existing anthropic-beta header (already contains oauth value)
+        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("oauth-2025-04-20"));
+        assert_eq!(result, Some("anthropic-beta: oauth-2025-04-20\r\n".to_string()));
+
+        // With existing anthropic-beta header (already contains oauth value among others)
+        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01, oauth-2025-04-20"));
+        assert_eq!(result, Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string()));
+    }
+
+    #[test]
+    fn test_anthropic_provider_standard_no_extra_headers() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("sk-ant-api-key-123"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Standard mode should not have any extra headers
+        let extra = provider.extra_headers();
+        assert!(extra.is_empty());
+
+        // transform_extra_header should return None
+        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, None);
+        assert!(result.is_none());
+
+        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_command_failure() {
+        let auth_keys = Arc::new(vec![]);
+        // Use a command that will fail (non-existent command)
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(nonexistent_command_that_will_fail_12345)"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+        assert!(provider.uses_dynamic_auth());
+
+        // Dynamic auth should fail
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_command_returns_empty() {
+        let auth_keys = Arc::new(vec![]);
+        // Use a command that returns empty output
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(echo -n '')"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+
+        // Dynamic auth should succeed but return empty token
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_ok());
+        // Even with empty token, the header format is still valid
+        assert_eq!(result.unwrap(), "Authorization: Bearer \r\n");
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_command_nonzero_exit() {
+        let auth_keys = Arc::new(vec![]);
+        // Use a command that exits with non-zero status
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(exit 1)"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+
+        // Dynamic auth should fail due to non-zero exit
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("OAuth command failed"));
     }
 }
 

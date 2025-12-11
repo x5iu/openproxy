@@ -413,3 +413,13 @@ jobs:
           fi
 
           echo "Gemini HTTP/1.1 test passed!"
+
+      - name: Install PyYAML for Anthropic OAuth tests
+        run: pip install pyyaml
+
+      - name: Run Anthropic OAuth E2E tests
+        run: |
+          echo "Testing Anthropic OAuth authentication..."
+          cd e2e
+          python test_anthropic_oauth.py
+          echo "Anthropic OAuth E2E tests passed!"
