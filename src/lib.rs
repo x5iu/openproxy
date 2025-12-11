@@ -461,6 +461,9 @@ mod tests {
 
         let no_provider = Error::NoProviderFound;
         assert_eq!(no_provider.to_string(), "No provider found");
+
+        let dynamic_auth_failed = Error::DynamicAuthFailed;
+        assert_eq!(dynamic_auth_failed.to_string(), "Dynamic authentication failed");
     }
 
     #[test]

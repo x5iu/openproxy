@@ -1646,6 +1646,83 @@ mod tests {
         let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_anthropic_provider_oauth_command_failure() {
+        let auth_keys = Arc::new(vec![]);
+        // Use a command that will fail (non-existent command)
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(nonexistent_command_that_will_fail_12345)"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+        assert!(provider.uses_dynamic_auth());
+
+        // Dynamic auth should fail
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_command_returns_empty() {
+        let auth_keys = Arc::new(vec![]);
+        // Use a command that returns empty output
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(echo -n '')"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+
+        // Dynamic auth should succeed but return empty token
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_ok());
+        // Even with empty token, the header format is still valid
+        assert_eq!(result.unwrap(), "Authorization: Bearer \r\n");
+    }
+
+    #[test]
+    fn test_anthropic_provider_oauth_command_nonzero_exit() {
+        let auth_keys = Arc::new(vec![]);
+        // Use a command that exits with non-zero status
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(exit 1)"),
+            auth_keys,
+            None,
+            None,
+        ).unwrap();
+
+        // Should be in OAuth mode
+        assert!(provider.uses_oauth());
+
+        // Dynamic auth should fail due to non-zero exit
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("OAuth command failed"));
+    }
 }
 
 async fn health_check(
