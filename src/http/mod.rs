@@ -343,20 +343,20 @@ impl<'a> Payload<'a> {
                     }
                 }
             }
-            // When using dynamic auth, we may need to filter out a specific header
-            // (e.g., anthropic-beta for Anthropic OAuth) because we'll add a new one with modified value
-            let transform = provider.transform_headers(None);
-            if let Some(filter_header_key) = transform.filter_header_key {
+            // Filter out extra headers that will be transformed/replaced
+            // (e.g., anthropic-beta for Anthropic OAuth)
+            let extra_header_keys = provider.extra_headers();
+            if let Some(first_extra_key) = extra_header_keys.first() {
                 let header_lines = HeaderLines::new(&crlfs, header);
                 for line in header_lines.skip(1) {
                     let Ok(header_str) = std::str::from_utf8(line) else {
                         continue;
                     };
-                    if is_header(header_str, filter_header_key) {
+                    if is_header(header_str, first_extra_key) {
                         let start = {
                             let block_start = &block[0] as *const u8 as usize;
-                            let filter_header_start = &line[0] as *const u8 as usize;
-                            filter_header_start - block_start
+                            let extra_header_start = &line[0] as *const u8 as usize;
+                            extra_header_start - block_start
                         };
                         header_chunks[3] = Some(start..start + line.len());
                         break;
@@ -555,16 +555,17 @@ impl<'a> Payload<'a> {
                         result.extend_from_slice(auth_header.as_bytes());
                     }
 
-                    // Transform headers (e.g., add anthropic-beta for OAuth)
-                    // First, get the transform config to find the filter header key
-                    let transform_config = provider.transform_headers(None);
-                    let existing_header_value = transform_config
-                        .filter_header_key
-                        .and_then(|key| self.find_header_value(key.trim_end_matches(": ").as_bytes()));
-                    // Now get the actual transform with the existing header value
-                    let transform = provider.transform_headers(existing_header_value.as_deref());
-                    for header in transform.additional_headers {
-                        result.extend_from_slice(header.as_bytes());
+                    // Transform extra headers (e.g., add anthropic-beta for OAuth)
+                    for header_key in provider.extra_headers() {
+                        let existing_value = self.find_header_value(
+                            header_key.trim_end_matches(": ").as_bytes()
+                        );
+                        if let Some(new_header) = provider.transform_extra_header(
+                            header_key,
+                            existing_value.as_deref()
+                        ) {
+                            result.extend_from_slice(new_header.as_bytes());
+                        }
                     }
 
                     if !result.is_empty() {
