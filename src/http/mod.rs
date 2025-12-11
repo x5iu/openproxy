@@ -153,7 +153,8 @@ pub(crate) struct Payload<'a> {
     auth_range: Option<Range<usize>>,
     pub(crate) body: Body<'a>,
     state: ReadState,
-    header_chunks: [Option<Range<usize>>; 5],
+    /// Ranges of header chunks to output (gaps between filtered headers)
+    header_chunks: Vec<Range<usize>>,
     header_current_chunk: usize,
     pub(crate) conn_keep_alive: bool,
     pub(crate) is_websocket_upgrade: bool,
@@ -209,7 +210,7 @@ impl<'a> Payload<'a> {
         let mut transfer_encoding_chunked = false;
         let mut host_range: Option<Range<usize>> = None;
         let mut auth_range: Option<Range<usize>> = None;
-        let mut header_chunks: [Option<Range<usize>>; 5] = [None, None, None, None, None];
+        let mut filtered_headers: Vec<Range<usize>> = Vec::new();
         let mut conn_keep_alive = false;
         // WebSocket upgrade detection
         let mut is_upgrade_websocket = false;
@@ -240,7 +241,7 @@ impl<'a> Payload<'a> {
                     let host_start = &line[0] as *const u8 as usize;
                     host_start - block_start
                 };
-                header_chunks[0] = Some(start..start + line.len());
+                filtered_headers.push(start..start + line.len());
                 host_range = Some(start..start + line.len());
             } else if is_header(header, HEADER_CONNECTION) {
                 let start = {
@@ -248,7 +249,7 @@ impl<'a> Payload<'a> {
                     let connection_start = &line[0] as *const u8 as usize;
                     connection_start - block_start
                 };
-                header_chunks[2] = Some(start..start + line.len());
+                filtered_headers.push(start..start + line.len());
                 let connection_value = &header[HEADER_CONNECTION.len()..];
                 if connection_value.eq_ignore_ascii_case(CONNECTION_KEEP_ALIVE) {
                     conn_keep_alive = true;
@@ -326,7 +327,7 @@ impl<'a> Payload<'a> {
                                 let auth_start = &line[0] as *const u8 as usize;
                                 auth_start - block_start
                             };
-                            header_chunks[1] = Some(start..start + line.len());
+                            filtered_headers.push(start..start + line.len());
                             auth_range = Some(start..start + line.len());
                         }
                     }
@@ -346,19 +347,19 @@ impl<'a> Payload<'a> {
             // Filter out extra headers that will be transformed/replaced
             // (e.g., anthropic-beta for Anthropic OAuth)
             let extra_header_keys = provider.extra_headers();
-            if let Some(first_extra_key) = extra_header_keys.first() {
+            for extra_key in &extra_header_keys {
                 let header_lines = HeaderLines::new(&crlfs, header);
                 for line in header_lines.skip(1) {
                     let Ok(header_str) = std::str::from_utf8(line) else {
                         continue;
                     };
-                    if is_header(header_str, first_extra_key) {
+                    if is_header(header_str, extra_key) {
                         let start = {
                             let block_start = &block[0] as *const u8 as usize;
                             let extra_header_start = &line[0] as *const u8 as usize;
                             extra_header_start - block_start
                         };
-                        header_chunks[3] = Some(start..start + line.len());
+                        filtered_headers.push(start..start + line.len());
                         break;
                     }
                 }
@@ -432,7 +433,7 @@ impl<'a> Payload<'a> {
             auth_range,
             body,
             state: ReadState::Start,
-            header_chunks: split_header_chunks(header_chunks, header_length),
+            header_chunks: split_header_chunks(filtered_headers, header_length),
             header_current_chunk: 0,
             conn_keep_alive,
             is_websocket_upgrade,
@@ -499,23 +500,22 @@ impl<'a> Payload<'a> {
         match self.state {
             ReadState::Start => {
                 if self.header_current_chunk < self.header_chunks.len() {
-                    if let Some(ref range) = self.header_chunks[self.header_current_chunk] {
-                        let cur_idx = self.header_current_chunk;
-                        self.header_current_chunk += 1;
-                        #[cfg(debug_assertions)]
-                        log::info!(step = "ReadState::Start"; "current_block:header_chunks({})", cur_idx);
-                        if cur_idx == 0 && self.host_range.is_some() {
-                            select_provider!((self.host().unwrap(), self.path()) => provider);
-                            if let Some(rewritten) = provider.rewrite_first_header_block(
-                                &self.internal_buffer[range.start..range.end],
-                            ) {
-                                return Ok(Some(Cow::Owned(rewritten)));
-                            }
-                        }
-                        return Ok(Some(Cow::Borrowed(
+                    let range = &self.header_chunks[self.header_current_chunk];
+                    let cur_idx = self.header_current_chunk;
+                    self.header_current_chunk += 1;
+                    #[cfg(debug_assertions)]
+                    log::info!(step = "ReadState::Start"; "current_block:header_chunks({})", cur_idx);
+                    if cur_idx == 0 && self.host_range.is_some() {
+                        select_provider!((self.host().unwrap(), self.path()) => provider);
+                        if let Some(rewritten) = provider.rewrite_first_header_block(
                             &self.internal_buffer[range.start..range.end],
-                        )));
+                        ) {
+                            return Ok(Some(Cow::Owned(rewritten)));
+                        }
                     }
+                    return Ok(Some(Cow::Borrowed(
+                        &self.internal_buffer[range.start..range.end],
+                    )));
                 }
                 self.state = ReadState::HostHeader;
                 Box::pin(self.next_block()).await
@@ -944,50 +944,65 @@ mod tests {
 
     #[test]
     fn test_split_header_chunks() {
-        // Test with no special headers
-        let header: [Option<Range<usize>>; 5] = [None, None, None, None, None];
-        let result = split_header_chunks(header, 100);
-        assert_eq!(result[0], Some(0..100));
-        assert!(result[1].is_none());
-        assert!(result[2].is_none());
-        assert!(result[3].is_none());
-        assert!(result[4].is_none());
+        // Test with no filtered headers
+        let filtered: Vec<Range<usize>> = vec![];
+        let result = split_header_chunks(filtered, 100);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 0..100);
 
-        // Test with one header (Host)
-        let header: [Option<Range<usize>>; 5] = [Some(20..40), None, None, None, None];
-        let result = split_header_chunks(header, 100);
-        assert_eq!(result[0], Some(0..20));
-        assert_eq!(result[1], Some(42..100)); // +2 for CRLF
-        assert!(result[2].is_none());
-        assert!(result[3].is_none());
-        assert!(result[4].is_none());
+        // Test with one filtered header (Host)
+        let filtered = vec![20..40];
+        let result = split_header_chunks(filtered, 100);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 0..20);
+        assert_eq!(result[1], 42..100); // +2 for CRLF
 
-        // Test with two headers (Host and Auth)
-        let header: [Option<Range<usize>>; 5] = [Some(20..40), Some(50..70), None, None, None];
-        let result = split_header_chunks(header, 100);
-        assert_eq!(result[0], Some(0..20));
-        assert_eq!(result[1], Some(42..50));
-        assert_eq!(result[2], Some(72..100));
-        assert!(result[3].is_none());
-        assert!(result[4].is_none());
+        // Test with two filtered headers (Host and Auth)
+        let filtered = vec![20..40, 50..70];
+        let result = split_header_chunks(filtered, 100);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], 0..20);
+        assert_eq!(result[1], 42..50);
+        assert_eq!(result[2], 72..100);
 
-        // Test with three headers (Host, Auth, Connection)
-        let header: [Option<Range<usize>>; 5] = [Some(20..40), Some(50..70), Some(80..95), None, None];
-        let result = split_header_chunks(header, 100);
-        assert_eq!(result[0], Some(0..20));
-        assert_eq!(result[1], Some(42..50));
-        assert_eq!(result[2], Some(72..80));
-        assert_eq!(result[3], Some(97..100));
-        assert!(result[4].is_none());
+        // Test with three filtered headers (Host, Auth, Connection)
+        let filtered = vec![20..40, 50..70, 80..95];
+        let result = split_header_chunks(filtered, 100);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0], 0..20);
+        assert_eq!(result[1], 42..50);
+        assert_eq!(result[2], 72..80);
+        assert_eq!(result[3], 97..100);
 
-        // Test with four headers (Host, Auth, Connection, AnthropicBeta)
-        let header: [Option<Range<usize>>; 5] = [Some(20..40), Some(50..70), Some(80..95), Some(105..120), None];
-        let result = split_header_chunks(header, 130);
-        assert_eq!(result[0], Some(0..20));
-        assert_eq!(result[1], Some(42..50));
-        assert_eq!(result[2], Some(72..80));
-        assert_eq!(result[3], Some(97..105));
-        assert_eq!(result[4], Some(122..130));
+        // Test with four filtered headers
+        let filtered = vec![20..40, 50..70, 80..95, 105..120];
+        let result = split_header_chunks(filtered, 130);
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], 0..20);
+        assert_eq!(result[1], 42..50);
+        assert_eq!(result[2], 72..80);
+        assert_eq!(result[3], 97..105);
+        assert_eq!(result[4], 122..130);
+
+        // Test with unsorted input (should be sorted internally)
+        let filtered = vec![50..70, 20..40];
+        let result = split_header_chunks(filtered, 100);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], 0..20);
+        assert_eq!(result[1], 42..50);
+        assert_eq!(result[2], 72..100);
+
+        // Test with many filtered headers (more than the old fixed-size array could hold)
+        let filtered = vec![10..20, 30..40, 50..60, 70..80, 90..100, 110..120];
+        let result = split_header_chunks(filtered, 150);
+        assert_eq!(result.len(), 7);
+        assert_eq!(result[0], 0..10);
+        assert_eq!(result[1], 22..30);
+        assert_eq!(result[2], 42..50);
+        assert_eq!(result[3], 62..70);
+        assert_eq!(result[4], 82..90);
+        assert_eq!(result[5], 102..110);
+        assert_eq!(result[6], 122..150);
     }
 
     #[test]
@@ -1181,44 +1196,38 @@ pub(crate) fn is_header(header: &str, key: &str) -> bool {
     header.len() >= key.len() && header[..key.len()].eq_ignore_ascii_case(key)
 }
 
+/// Split the header buffer into chunks, excluding the filtered header ranges.
+/// Takes a Vec of filtered header ranges and returns the non-filtered chunks.
 #[inline]
 fn split_header_chunks(
-    mut header: [Option<Range<usize>>; 5],
+    mut filtered_headers: Vec<Range<usize>>,
     header_length: usize,
-) -> [Option<Range<usize>>; 5] {
-    header.sort_by_key(|range| range.as_ref().map(|r| r.start).unwrap_or(usize::MAX));
-    match header {
-        [Some(first), Some(second), Some(third), Some(fourth), None] => [
-            Some(0..first.start),
-            Some(first.end + CRLF.len()..second.start),
-            Some(second.end + CRLF.len()..third.start),
-            Some(third.end + CRLF.len()..fourth.start),
-            Some(fourth.end + CRLF.len()..header_length),
-        ],
-        [Some(first), Some(second), Some(third), None, None] => [
-            Some(0..first.start),
-            Some(first.end + CRLF.len()..second.start),
-            Some(second.end + CRLF.len()..third.start),
-            Some(third.end + CRLF.len()..header_length),
-            None,
-        ],
-        [Some(first), Some(second), None, None, None] => [
-            Some(0..first.start),
-            Some(first.end + CRLF.len()..second.start),
-            Some(second.end + CRLF.len()..header_length),
-            None,
-            None,
-        ],
-        [Some(first), None, None, None, None] => [
-            Some(0..first.start),
-            Some(first.end + CRLF.len()..header_length),
-            None,
-            None,
-            None,
-        ],
-        [None, None, None, None, None] => [Some(0..header_length), None, None, None, None],
-        _ => unreachable!(),
+) -> Vec<Range<usize>> {
+    if filtered_headers.is_empty() {
+        return vec![0..header_length];
     }
+
+    // Sort by start position
+    filtered_headers.sort_by_key(|r| r.start);
+
+    let mut chunks = Vec::with_capacity(filtered_headers.len() + 1);
+    let mut current_pos = 0;
+
+    for range in filtered_headers {
+        // Add chunk before this filtered header (if any)
+        if current_pos < range.start {
+            chunks.push(current_pos..range.start);
+        }
+        // Move past this filtered header and its CRLF
+        current_pos = range.end + CRLF.len();
+    }
+
+    // Add remaining chunk after the last filtered header (if any)
+    if current_pos < header_length {
+        chunks.push(current_pos..header_length);
+    }
+
+    chunks
 }
 
 #[inline]
