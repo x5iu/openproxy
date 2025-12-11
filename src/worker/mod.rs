@@ -410,6 +410,49 @@ where
                     }
 
                     // Extract provider info into UpstreamInfo struct
+                    // For dynamic auth, get the auth header now
+                    let auth_header = if provider.uses_dynamic_auth() {
+                        match provider.get_dynamic_auth_header() {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                log::error!(error = e.to_string(); "failed_to_get_dynamic_auth_header");
+                                None
+                            }
+                        }
+                    } else {
+                        provider.auth_header().map(|s| s.to_string())
+                    };
+
+                    // Get extra headers that need transformation
+                    let provider_extra_header_keys = provider.extra_headers();
+
+                    // Pre-compute transformed extra headers
+                    // For each extra header key, find if request has it and transform
+                    let mut extra_headers_transformed = Vec::new();
+                    let extra_header_keys: Vec<String> = provider_extra_header_keys
+                        .iter()
+                        .map(|k| k.trim_end_matches(": ").to_lowercase())
+                        .collect();
+
+                    for extra_key in &provider_extra_header_keys {
+                        // Get existing value from request if present
+                        let key_without_colon = extra_key.trim_end_matches(": ");
+                        let existing_value = request.headers()
+                            .get(key_without_colon)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+
+                        // Transform the header
+                        if let Some(transformed) = provider.transform_extra_header(extra_key, existing_value.as_deref()) {
+                            // Parse "header-name: value\r\n" format
+                            if let Some(colon_pos) = transformed.find(':') {
+                                let name = transformed[..colon_pos].trim().to_string();
+                                let value = transformed[colon_pos + 1..].trim().trim_end_matches("\r\n").to_string();
+                                extra_headers_transformed.push((name, value));
+                            }
+                        }
+                    }
+
                     let info = UpstreamInfo {
                         endpoint: provider.endpoint().to_string(),
                         sock_address: provider.sock_address().to_string(),
@@ -419,11 +462,13 @@ where
                             // Extract just the host value from "Host: example.com\r\n"
                             h.trim_start_matches("Host: ").trim_end_matches("\r\n").to_string()
                         },
-                        auth_header: provider.auth_header().map(|s| s.to_string()),
+                        auth_header,
                         auth_header_key: provider.auth_header_key(),
                         path_prefix: provider.path_prefix().map(|s| s.to_string()),
                         api_key: provider.api_key().map(|s| s.to_string()),
                         auth_query_key: provider.auth_query_key(),
+                        extra_header_keys,
+                        extra_headers_transformed,
                     };
                     let authority_host = authority.host().to_string();
 
@@ -478,6 +523,11 @@ struct UpstreamInfo {
     path_prefix: Option<String>,
     api_key: Option<String>,
     auth_query_key: Option<&'static str>,
+    /// Extra headers to filter and transform (key without ": " suffix)
+    extra_header_keys: Vec<String>,
+    /// Pre-computed transformed extra headers to add to upstream request
+    /// Each entry is (header_name, header_value) without CRLF
+    extra_headers_transformed: Vec<(String, String)>,
 }
 
 impl UpstreamInfo {
@@ -564,6 +614,11 @@ impl UpstreamInfo {
                     continue; // Will add auth_header below
                 }
             }
+            // Skip extra headers that will be transformed
+            let key_lower = key_str.to_lowercase();
+            if self.extra_header_keys.iter().any(|k| k == &key_lower) {
+                continue; // Will add transformed extra_headers below
+            }
             upstream_request = upstream_request.header(key, value);
         }
 
@@ -572,6 +627,11 @@ impl UpstreamInfo {
             if let Some((header_name, header_value)) = parse_auth_header(auth) {
                 upstream_request = upstream_request.header(header_name, header_value);
             }
+        }
+
+        // Add transformed extra headers
+        for (name, value) in &self.extra_headers_transformed {
+            upstream_request = upstream_request.header(name.as_str(), value.as_str());
         }
 
         let upstream_request = match upstream_request.body(()) {
@@ -747,6 +807,8 @@ impl UpstreamInfo {
             self.auth_header_key,
             self.auth_header.as_deref(),
             has_content_length,
+            &self.extra_header_keys,
+            &self.extra_headers_transformed,
         );
 
         // Build path with prefix stripping and auth query replacement
@@ -1675,13 +1737,15 @@ fn build_upstream_path(
 }
 
 /// Build HTTP/1.1 request headers string from an iterator of headers.
-/// Filters out auth headers and replaces Host header with the upstream host.
+/// Filters out auth headers, extra headers, and replaces Host header with the upstream host.
 fn build_h1_request_headers<'a, I>(
     headers: I,
     host_header_value: &str,
     auth_header_key: Option<&str>,
     auth_header: Option<&str>,
     has_content_length: bool,
+    extra_header_keys: &[String],
+    extra_headers_transformed: &[(String, String)],
 ) -> String
 where
     I: Iterator<Item = (&'a httplib::HeaderName, &'a httplib::HeaderValue)>,
@@ -1701,6 +1765,11 @@ where
             req_headers.push_str(&format!("Host: {}\r\n", host_header_value));
             continue;
         }
+        // Skip extra headers that will be transformed
+        let key_lower = key_str.to_lowercase();
+        if extra_header_keys.iter().any(|k| k == &key_lower) {
+            continue; // Will add transformed extra_headers below
+        }
         req_headers.push_str(key_str);
         req_headers.push_str(": ");
         req_headers.push_str(String::from_utf8_lossy(value.as_bytes()).as_ref());
@@ -1710,6 +1779,14 @@ where
     // Add provider's auth header if present
     if let Some(auth) = auth_header {
         req_headers.push_str(auth);
+    }
+
+    // Add transformed extra headers
+    for (name, value) in extra_headers_transformed {
+        req_headers.push_str(name);
+        req_headers.push_str(": ");
+        req_headers.push_str(value);
+        req_headers.push_str("\r\n");
     }
 
     // Add Transfer-Encoding if no Content-Length
@@ -2094,6 +2171,8 @@ mod tests {
             Some("Authorization: "),
             Some("Authorization: Bearer server_token\r\n"),
             false,
+            &[],
+            &[],
         );
 
         assert!(result.contains("Host: upstream.example.com\r\n"));
@@ -2110,6 +2189,8 @@ mod tests {
             Some("Authorization: "),
             Some("Authorization: Bearer server_token\r\n"),
             true,
+            &[],
+            &[],
         );
 
         assert!(!result_with_cl.contains("Transfer-Encoding"));
@@ -2121,8 +2202,47 @@ mod tests {
             None,
             None,
             true,
+            &[],
+            &[],
         );
 
         assert!(result_no_auth.contains("authorization: Bearer client_token\r\n"));
+
+        // Test with extra headers filtering and transformation
+        let mut headers_with_extra = HeaderMap::new();
+        headers_with_extra.insert(
+            HeaderName::from_static("host"),
+            HeaderValue::from_static("client.example.com"),
+        );
+        headers_with_extra.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        headers_with_extra.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("existing-value"),
+        );
+
+        let extra_keys = vec!["anthropic-beta".to_string()];
+        let extra_transformed = vec![
+            ("anthropic-beta".to_string(), "existing-value,oauth-2025-04-20".to_string()),
+        ];
+
+        let result_with_extra = build_h1_request_headers(
+            headers_with_extra.iter(),
+            "upstream.example.com",
+            None,
+            None,
+            true,
+            &extra_keys,
+            &extra_transformed,
+        );
+
+        assert!(result_with_extra.contains("Host: upstream.example.com\r\n"));
+        assert!(result_with_extra.contains("content-type: application/json\r\n"));
+        // Should contain transformed header, not original
+        assert!(result_with_extra.contains("anthropic-beta: existing-value,oauth-2025-04-20\r\n"));
+        // Should NOT contain the original value alone
+        assert!(!result_with_extra.contains("anthropic-beta: existing-value\r\n"));
     }
 }
