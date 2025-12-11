@@ -548,7 +548,7 @@ impl<'a> Payload<'a> {
                             }
                             Err(e) => {
                                 log::error!(error = e.to_string(); "failed_to_get_dynamic_auth_header");
-                                // Fall through to next_block() if auth header generation fails
+                                return Err(Error::DynamicAuthFailed);
                             }
                         }
                     } else if let Some(auth_header) = provider.auth_header() {

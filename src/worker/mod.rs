@@ -219,10 +219,24 @@ where
                     .get_outgoing_conn(provider)
                     .await
                     .map_err(ProxyError::Server)?;
-                request
-                    .write_to(&mut outgoing)
-                    .await
-                    .map_err(ProxyError::Server)?;
+                if let Err(e) = request.write_to(&mut outgoing).await {
+                    // Drop the request before using incoming again to avoid borrow conflicts
+                    drop(request);
+                    if matches!(e, Error::DynamicAuthFailed) {
+                        let msg = "dynamic authentication failed";
+                        let resp = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            msg.len(),
+                            msg
+                        );
+                        incoming
+                            .write_all(resp.as_bytes())
+                            .await
+                            .map_err(|e| ProxyError::Client(e.into()))?;
+                        return Ok(());
+                    }
+                    return Err(ProxyError::Server(e));
+                }
                 let incoming_conn_keep_alive = request.payload.conn_keep_alive;
                 drop(request);
                 let mut response = http::Response::new(&mut outgoing)
@@ -416,7 +430,7 @@ where
                             Ok(h) => Some(h),
                             Err(e) => {
                                 log::error!(error = e.to_string(); "failed_to_get_dynamic_auth_header");
-                                None
+                                return invalid!(respond, 502, "dynamic authentication failed");
                             }
                         }
                     } else {

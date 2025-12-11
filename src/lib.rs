@@ -352,6 +352,9 @@ pub enum Error {
 
     #[error("No provider found")]
     NoProviderFound,
+
+    #[error("Dynamic authentication failed")]
+    DynamicAuthFailed,
 }
 
 use executor::{Executor, Pool};
