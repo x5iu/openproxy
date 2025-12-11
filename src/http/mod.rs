@@ -151,8 +151,6 @@ pub(crate) struct Payload<'a> {
     path_range: Range<usize>,
     host_range: Option<Range<usize>>,
     auth_range: Option<Range<usize>>,
-    #[allow(dead_code)]
-    anthropic_beta_range: Option<Range<usize>>,
     pub(crate) body: Body<'a>,
     state: ReadState,
     header_chunks: [Option<Range<usize>>; 5],
@@ -212,7 +210,6 @@ impl<'a> Payload<'a> {
         let mut host_range: Option<Range<usize>> = None;
         let mut auth_range: Option<Range<usize>> = None;
         let mut header_chunks: [Option<Range<usize>>; 5] = [None, None, None, None, None];
-        let mut anthropic_beta_range: Option<Range<usize>> = None;
         let mut conn_keep_alive = false;
         // WebSocket upgrade detection
         let mut is_upgrade_websocket = false;
@@ -361,7 +358,6 @@ impl<'a> Payload<'a> {
                             beta_start - block_start
                         };
                         header_chunks[3] = Some(start..start + line.len());
-                        anthropic_beta_range = Some(start..start + line.len());
                         break;
                     }
                 }
@@ -433,7 +429,6 @@ impl<'a> Payload<'a> {
             path_range,
             host_range,
             auth_range,
-            anthropic_beta_range,
             body,
             state: ReadState::Start,
             header_chunks: split_header_chunks(header_chunks, header_length),
