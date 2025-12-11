@@ -11,6 +11,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 - **Health Monitoring**: Automatic health checks with configurable intervals and failure recovery
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
 - **Authentication & Authorization**: Flexible API key management with per-provider and global authentication
+- **OAuth Support**: Dynamic authentication with shell command execution for Anthropic OAuth tokens
 - **Protocol Support**: Full HTTP/1.1 and HTTP/2 support with automatic protocol negotiation
 - **WebSocket Support**: Transparent WebSocket proxying for both HTTP/1.1 upgrade and HTTP/2 Extended CONNECT (RFC 8441)
 - **HTTP & HTTPS Support**: Run with TLS encryption (HTTPS) or plaintext HTTP for internal networks
@@ -102,7 +103,7 @@ providers:
       method: "GET"
       path: "/v1beta/models"
 
-  # Anthropic Configuration
+  # Anthropic Configuration (Standard API Key)
   - type: "anthropic"
     host: "anthropic.example.com"    # Client uses "Host: anthropic.example.com" header to route to this provider
     endpoint: "api.anthropic.com"    # Actual Anthropic API endpoint
@@ -117,6 +118,16 @@ providers:
       headers:
         - "Content-Type: application/json"
         - "anthropic-version: 2023-06-01"
+
+  # Anthropic Configuration (OAuth)
+  # Use $(command) pattern to execute a shell command that returns the OAuth token
+  # The proxy will use "Authorization: Bearer <token>" instead of "X-API-Key"
+  # and automatically add "anthropic-beta: oauth-2025-04-20" header
+  - type: "anthropic"
+    host: "anthropic-oauth.example.com"
+    endpoint: "api.anthropic.com"
+    api_key: "$(cat /path/to/oauth-token.txt)"  # Or any command that outputs the token
+    # api_key: "$(aws secretsmanager get-secret-value --secret-id anthropic-token --query SecretString --output text)"
 
   # Multiple API Keys for Load Distribution
   - type: "openai"
@@ -251,7 +262,7 @@ To run E2E tests locally:
 
 ```bash
 cd e2e
-pip install openai pydantic "httpx[http2]" websockets websocket-client
+pip install openai pydantic "httpx[http2]" websockets websocket-client pyyaml
 
 # Run HTTP/HTTPS tests
 python test_https.py
@@ -259,6 +270,12 @@ python test_http.py
 
 # Run WebSocket tests
 python test_websocket.py
+
+# Run host path routing tests
+python test_host_path.py
+
+# Run Anthropic OAuth tests
+python test_anthropic_oauth.py
 
 # Run OpenAI Realtime API test (requires OPENAI_API_KEY)
 OPENAI_API_KEY=sk-xxx python test_openai_realtime.py --direct
