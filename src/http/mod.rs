@@ -29,6 +29,7 @@ const HEADER_SEC_WEBSOCKET_KEY: &str = "Sec-WebSocket-Key: ";
 const HEADER_SEC_WEBSOCKET_VERSION: &str = "Sec-WebSocket-Version: ";
 const HEADER_SEC_WEBSOCKET_PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
 const HEADER_SEC_WEBSOCKET_EXTENSIONS: &str = "Sec-WebSocket-Extensions: ";
+pub(crate) const HEADER_ANTHROPIC_BETA: &str = "anthropic-beta: ";
 
 const TRANSFER_ENCODING_CHUNKED: &str = "chunked";
 const CONNECTION_KEEP_ALIVE: &str = "keep-alive";
@@ -150,9 +151,11 @@ pub(crate) struct Payload<'a> {
     path_range: Range<usize>,
     host_range: Option<Range<usize>>,
     auth_range: Option<Range<usize>>,
+    #[allow(dead_code)]
+    anthropic_beta_range: Option<Range<usize>>,
     pub(crate) body: Body<'a>,
     state: ReadState,
-    header_chunks: [Option<Range<usize>>; 4],
+    header_chunks: [Option<Range<usize>>; 5],
     header_current_chunk: usize,
     pub(crate) conn_keep_alive: bool,
     pub(crate) is_websocket_upgrade: bool,
@@ -208,7 +211,8 @@ impl<'a> Payload<'a> {
         let mut transfer_encoding_chunked = false;
         let mut host_range: Option<Range<usize>> = None;
         let mut auth_range: Option<Range<usize>> = None;
-        let mut header_chunks: [Option<Range<usize>>; 4] = [None, None, None, None];
+        let mut header_chunks: [Option<Range<usize>>; 5] = [None, None, None, None, None];
+        let mut anthropic_beta_range: Option<Range<usize>> = None;
         let mut conn_keep_alive = false;
         // WebSocket upgrade detection
         let mut is_upgrade_websocket = false;
@@ -342,6 +346,26 @@ impl<'a> Payload<'a> {
                     }
                 }
             }
+            // When using OAuth (dynamic auth), we need to filter out the anthropic-beta header
+            // because we'll add a new one with the oauth value
+            if provider.uses_dynamic_auth() {
+                let header_lines = HeaderLines::new(&crlfs, header);
+                for line in header_lines.skip(1) {
+                    let Ok(header_str) = std::str::from_utf8(line) else {
+                        continue;
+                    };
+                    if is_header(header_str, HEADER_ANTHROPIC_BETA) {
+                        let start = {
+                            let block_start = &block[0] as *const u8 as usize;
+                            let beta_start = &line[0] as *const u8 as usize;
+                            beta_start - block_start
+                        };
+                        header_chunks[3] = Some(start..start + line.len());
+                        anthropic_beta_range = Some(start..start + line.len());
+                        break;
+                    }
+                }
+            }
         };
         // Security: Reject requests with both Content-Length and Transfer-Encoding headers
         // to prevent HTTP request smuggling attacks (RFC 7230 Section 3.3.3)
@@ -409,6 +433,7 @@ impl<'a> Payload<'a> {
             path_range,
             host_range,
             auth_range,
+            anthropic_beta_range,
             body,
             state: ReadState::Start,
             header_chunks: split_header_chunks(header_chunks, header_length),
@@ -455,6 +480,25 @@ impl<'a> Payload<'a> {
         self.internal_buffer.as_ref()
     }
 
+    /// Find the value of a header by name (case-insensitive).
+    /// Returns the header value without the header name prefix.
+    fn find_header_value(&self, header_name: &[u8]) -> Option<String> {
+        let header = &self.internal_buffer[..self.header_length];
+        let header_str = std::str::from_utf8(header).ok()?;
+
+        // Create a search pattern like "anthropic-beta: " (case-insensitive)
+        let search_pattern = format!("{}: ", String::from_utf8_lossy(header_name));
+
+        for line in header_str.split("\r\n") {
+            if line.len() >= search_pattern.len()
+                && line[..search_pattern.len()].eq_ignore_ascii_case(&search_pattern)
+            {
+                return Some(line[search_pattern.len()..].to_string());
+            }
+        }
+        None
+    }
+
     pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<'_, [u8]>>, Error> {
         match self.state {
             ReadState::Start => {
@@ -497,8 +541,34 @@ impl<'a> Payload<'a> {
                     #[cfg(debug_assertions)]
                     log::info!(step = "ReadState::AuthHeader"; "current_block:auth_header");
                     select_provider!((self.host().unwrap(), self.path()) => provider);
-                    if let Some(auth_header) = provider.auth_header() {
-                        Ok(Some(Cow::Owned(auth_header.as_bytes().to_vec())))
+
+                    let mut result = Vec::new();
+
+                    // Get auth header (either static or dynamic)
+                    if provider.uses_dynamic_auth() {
+                        match provider.get_dynamic_auth_header() {
+                            Ok(auth_header) => {
+                                result.extend_from_slice(auth_header.as_bytes());
+                            }
+                            Err(e) => {
+                                log::error!(error = e.to_string(); "failed_to_get_dynamic_auth_header");
+                                // Fall through to next_block() if auth header generation fails
+                            }
+                        }
+                    } else if let Some(auth_header) = provider.auth_header() {
+                        result.extend_from_slice(auth_header.as_bytes());
+                    }
+
+                    // Get additional headers (e.g., anthropic-beta for OAuth)
+                    // First, we need to find the existing anthropic-beta header value if any
+                    let existing_anthropic_beta = self.find_header_value(b"anthropic-beta");
+                    let additional_headers = provider.get_additional_headers(existing_anthropic_beta.as_deref());
+                    for header in additional_headers {
+                        result.extend_from_slice(header.as_bytes());
+                    }
+
+                    if !result.is_empty() {
+                        Ok(Some(Cow::Owned(result)))
                     } else {
                         Box::pin(self.next_block()).await
                     }
@@ -874,36 +944,49 @@ mod tests {
     #[test]
     fn test_split_header_chunks() {
         // Test with no special headers
-        let header: [Option<Range<usize>>; 4] = [None, None, None, None];
+        let header: [Option<Range<usize>>; 5] = [None, None, None, None, None];
         let result = split_header_chunks(header, 100);
         assert_eq!(result[0], Some(0..100));
         assert!(result[1].is_none());
         assert!(result[2].is_none());
         assert!(result[3].is_none());
+        assert!(result[4].is_none());
 
         // Test with one header (Host)
-        let header: [Option<Range<usize>>; 4] = [Some(20..40), None, None, None];
+        let header: [Option<Range<usize>>; 5] = [Some(20..40), None, None, None, None];
         let result = split_header_chunks(header, 100);
         assert_eq!(result[0], Some(0..20));
         assert_eq!(result[1], Some(42..100)); // +2 for CRLF
         assert!(result[2].is_none());
         assert!(result[3].is_none());
+        assert!(result[4].is_none());
 
         // Test with two headers (Host and Auth)
-        let header: [Option<Range<usize>>; 4] = [Some(20..40), Some(50..70), None, None];
+        let header: [Option<Range<usize>>; 5] = [Some(20..40), Some(50..70), None, None, None];
         let result = split_header_chunks(header, 100);
         assert_eq!(result[0], Some(0..20));
         assert_eq!(result[1], Some(42..50));
         assert_eq!(result[2], Some(72..100));
         assert!(result[3].is_none());
+        assert!(result[4].is_none());
 
         // Test with three headers (Host, Auth, Connection)
-        let header: [Option<Range<usize>>; 4] = [Some(20..40), Some(50..70), Some(80..95), None];
+        let header: [Option<Range<usize>>; 5] = [Some(20..40), Some(50..70), Some(80..95), None, None];
         let result = split_header_chunks(header, 100);
         assert_eq!(result[0], Some(0..20));
         assert_eq!(result[1], Some(42..50));
         assert_eq!(result[2], Some(72..80));
         assert_eq!(result[3], Some(97..100));
+        assert!(result[4].is_none());
+
+        // Test with four headers (Host, Auth, Connection, AnthropicBeta)
+        let header: [Option<Range<usize>>; 5] = [Some(20..40), Some(50..70), Some(80..95), Some(105..120), None];
+        let result = split_header_chunks(header, 130);
+        assert_eq!(result[0], Some(0..20));
+        assert_eq!(result[1], Some(42..50));
+        assert_eq!(result[2], Some(72..80));
+        assert_eq!(result[3], Some(97..105));
+        assert_eq!(result[4], Some(122..130));
     }
 
     #[test]
@@ -1099,30 +1182,40 @@ pub(crate) fn is_header(header: &str, key: &str) -> bool {
 
 #[inline]
 fn split_header_chunks(
-    mut header: [Option<Range<usize>>; 4],
+    mut header: [Option<Range<usize>>; 5],
     header_length: usize,
-) -> [Option<Range<usize>>; 4] {
+) -> [Option<Range<usize>>; 5] {
     header.sort_by_key(|range| range.as_ref().map(|r| r.start).unwrap_or(usize::MAX));
     match header {
-        [Some(first), Some(second), Some(third), None] => [
+        [Some(first), Some(second), Some(third), Some(fourth), None] => [
+            Some(0..first.start),
+            Some(first.end + CRLF.len()..second.start),
+            Some(second.end + CRLF.len()..third.start),
+            Some(third.end + CRLF.len()..fourth.start),
+            Some(fourth.end + CRLF.len()..header_length),
+        ],
+        [Some(first), Some(second), Some(third), None, None] => [
             Some(0..first.start),
             Some(first.end + CRLF.len()..second.start),
             Some(second.end + CRLF.len()..third.start),
             Some(third.end + CRLF.len()..header_length),
+            None,
         ],
-        [Some(first), Some(second), None, None] => [
+        [Some(first), Some(second), None, None, None] => [
             Some(0..first.start),
             Some(first.end + CRLF.len()..second.start),
             Some(second.end + CRLF.len()..header_length),
             None,
+            None,
         ],
-        [Some(first), None, None, None] => [
+        [Some(first), None, None, None, None] => [
             Some(0..first.start),
             Some(first.end + CRLF.len()..header_length),
             None,
             None,
+            None,
         ],
-        [None, None, None, None] => [Some(0..header_length), None, None, None],
+        [None, None, None, None, None] => [Some(0..header_length), None, None, None, None],
         _ => unreachable!(),
     }
 }
