@@ -10,9 +10,6 @@ on:
     - cron: '0 0 * * 1'
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   # Rust dependency vulnerability scan
   cargo-audit:
@@ -21,6 +18,8 @@ jobs:
     permissions:
       issues: write
       contents: read
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +35,8 @@ jobs:
       security-events: write
       actions: read
       contents: read
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
 
@@ -125,6 +126,9 @@ jobs:
   trivy:
     name: Trivy Vulnerability Scan
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
