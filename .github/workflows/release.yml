@@ -47,6 +47,18 @@ jobs:
           git tag -a "$VERSION" -m "Release $VERSION"
           git push origin "$VERSION"
 
+      - name: Setup Rust
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux amd64 binary
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/openproxy dist/openproxy-linux-amd64
+          cd dist && tar -czvf openproxy-linux-amd64.tar.gz openproxy-linux-amd64
+
       - name: Setup Node.js
         if: steps.check_version.outputs.should_release == 'true'
         uses: actions/setup-node@v4
@@ -74,5 +86,7 @@ jobs:
           tag_name: ${{ steps.check_version.outputs.version }}
           body_path: release_notes.md
           generate_release_notes: false
+          files: |
+            dist/openproxy-linux-amd64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
