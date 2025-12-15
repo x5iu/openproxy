@@ -35,9 +35,20 @@ cargo build --release
 
 ```bash
 # Pull and run the pre-built image
+# Port mapping should match your config.yml (https_port/http_port)
 docker run -d \
   --name openproxy \
   -p 443:443 \
+  -v /path/to/config.yml:/config.yml \
+  -v /path/to/certificate.pem:/certs/certificate.pem \
+  -v /path/to/private-key.pem:/certs/private-key.pem \
+  x5iu/openproxy:latest
+
+# Example with custom ports (e.g., https_port: 8443, http_port: 8080 in config)
+docker run -d \
+  --name openproxy \
+  -p 8443:8443 \
+  -p 8080:8080 \
   -v /path/to/config.yml:/config.yml \
   -v /path/to/certificate.pem:/certs/certificate.pem \
   -v /path/to/private-key.pem:/certs/private-key.pem \

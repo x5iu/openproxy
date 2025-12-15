@@ -18,8 +18,8 @@ FROM ubuntu:22.04
 # Copy the binary from builder stage
 COPY --from=builder /usr/src/app/target/release/openproxy /usr/local/bin/openproxy
 
-# Expose port
-EXPOSE 443
+# Note: Port is determined by config file (https_port/http_port)
+# Map ports at runtime: docker run -p <host_port>:<container_port>
 
 # Run the application
 ENTRYPOINT ["/usr/local/bin/openproxy"]
