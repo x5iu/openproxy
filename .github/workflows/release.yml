@@ -1,0 +1,78 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "Cargo.toml"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version and create tag if needed
+        id: check_version
+        run: |
+          # Extract version from Cargo.toml
+          VERSION=$(grep -oP '^version = "\K[^"]+' Cargo.toml)
+          TAG_VERSION="v$VERSION"
+          echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+
+          # Get latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+          # Check if version differs from latest tag
+          if [ "$TAG_VERSION" != "$LATEST_TAG" ]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "Version $TAG_VERSION differs from latest tag $LATEST_TAG, will create new release"
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "Version $TAG_VERSION matches latest tag, skipping release"
+          fi
+
+      - name: Create new tag
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          VERSION="${{ steps.check_version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+
+      - name: Setup Node.js
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        if: steps.check_version.outputs.should_release == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate release notes with Claude
+        if: steps.check_version.outputs.should_release == 'true'
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          CURRENT_TAG="${{ steps.check_version.outputs.version }}"
+          PREV_TAG="${{ steps.check_version.outputs.latest_tag }}"
+          claude -p "Generate release notes for OpenProxy ${CURRENT_TAG} (a high-performance LLM proxy server that routes requests to multiple providers like OpenAI, Gemini, and Anthropic). Previous version: ${PREV_TAG}. Instructions: 1) Read the git commits between ${PREV_TAG} and ${CURRENT_TAG} using: git log ${PREV_TAG}..HEAD --oneline; 2) Output ONLY the release notes content in Markdown format, nothing else; 3) Do NOT include any preamble, explanation, or commentary about what you are doing; 4) Format: ## Summary, ## New Features, ## Bug Fixes, ## Breaking Changes (omit empty sections); 5) Be concise and professional." --output-format text > release_notes.md
+
+      - name: Create Release
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check_version.outputs.version }}
+          body_path: release_notes.md
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
