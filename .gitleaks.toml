@@ -1,0 +1,11 @@
+# Gitleaks configuration for openproxy
+# See: https://github.com/gitleaks/gitleaks#configuration
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore documentation examples"
+paths = [
+    '''README\.md''',
+]
