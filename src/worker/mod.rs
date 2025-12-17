@@ -9,7 +9,6 @@ use std::task::{Context, Poll};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
-
 use bytes::Buf;
 
 use crate::h2client::{self as h2client, H2ConnectResult, H2PoolTrait};
@@ -47,30 +46,31 @@ where
     H2P: H2PoolTrait,
 {
     fn new(pool: Arc<P>, h2pool: Arc<H2P>) -> Self;
-    fn get_outgoing_conn<'a>(
+    fn get_http1_conn<'a>(
         &'a mut self,
         provider: &'a dyn Provider,
-    ) -> Pin<Box<dyn Future<Output=Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Send;
     fn proxy<'a, S>(
         &'a mut self,
         incoming: &'a mut S,
-    ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send + 'a>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Unpin + Send + Sync;
     fn proxy_h2<'a>(
         &'a mut self,
         incoming: &'a mut TlsIncomingStream,
-    ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static;
-    fn return_h1_conn<'a>(
+    fn return_http1_conn<'a>(
         &'a mut self,
         endpoint: &'a str,
         conn: <P as PoolTrait>::Item,
-    ) -> Pin<Box<dyn Future<Output=()> + Send + 'a>> where
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    where
         <P as PoolTrait>::Item: Send;
 }
 
@@ -89,10 +89,10 @@ where
         Self { pool, h2pool }
     }
 
-    fn get_outgoing_conn<'a>(
+    fn get_http1_conn<'a>(
         &'a mut self,
         provider: &'a dyn Provider,
-    ) -> Pin<Box<dyn Future<Output=Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Send,
     {
@@ -115,7 +115,7 @@ where
     fn proxy<'a, S>(
         &'a mut self,
         mut incoming: &'a mut S,
-    ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send + 'a>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Unpin + Send + Sync,
@@ -184,16 +184,19 @@ where
                     drop(request);
 
                     // Handle WebSocket upgrade
-                    match self.proxy_websocket_with_data(
-                        incoming,
-                        &raw_headers,
-                        &endpoint,
-                        &sock_address,
-                        provider_tls,
-                        &host_header,
-                        auth_header.as_deref(),
-                        path_prefix.as_deref(),
-                    ).await {
+                    match self
+                        .proxy_websocket_with_data(
+                            incoming,
+                            &raw_headers,
+                            &endpoint,
+                            &sock_address,
+                            provider_tls,
+                            &host_header,
+                            auth_header.as_deref(),
+                            path_prefix.as_deref(),
+                        )
+                        .await
+                    {
                         Ok(()) => {
                             // WebSocket connection completed, exit the loop
                             return Ok(());
@@ -216,7 +219,7 @@ where
                 }
 
                 let mut outgoing = self
-                    .get_outgoing_conn(provider)
+                    .get_http1_conn(provider)
                     .await
                     .map_err(ProxyError::Server)?;
                 if let Err(e) = request.write_to(&mut outgoing).await {
@@ -249,7 +252,7 @@ where
                 let conn_keep_alive = response.payload.conn_keep_alive;
                 drop(response);
                 if conn_keep_alive {
-                    self.return_h1_conn(provider.endpoint(), outgoing).await;
+                    self.return_http1_conn(provider.endpoint(), outgoing).await;
                 }
                 if !incoming_conn_keep_alive {
                     break;
@@ -299,7 +302,7 @@ where
     fn proxy_h2<'a>(
         &'a mut self,
         incoming: &'a mut TlsIncomingStream,
-    ) -> Pin<Box<dyn Future<Output=Result<(), ProxyError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Unpin + Send + Sync + 'static,
     {
@@ -340,7 +343,8 @@ where
                         return invalid!(respond, 400, "missing :authority");
                     };
                     let p = p.read().await;
-                    let Some(provider) = p.select_provider(authority.host(), request.uri().path()) else {
+                    let Some(provider) = p.select_provider(authority.host(), request.uri().path())
+                    else {
                         return invalid!(respond, 404, Error::NoProviderFound.to_string());
                     };
                     if provider.has_auth_keys() {
@@ -353,13 +357,10 @@ where
                         }
                         if auth_key.is_none() {
                             if let Some(auth_query_key) = provider.auth_query_key() {
-                                auth_key = request
-                                    .uri()
-                                    .query()
-                                    .and_then(|query| {
-                                        http::get_auth_query_range(query, auth_query_key)
-                                            .map(|range| &query[range])
-                                    })
+                                auth_key = request.uri().query().and_then(|query| {
+                                    http::get_auth_query_range(query, auth_query_key)
+                                        .map(|range| &query[range])
+                                })
                             }
                         }
                         let Some(auth_key) = auth_key else {
@@ -373,7 +374,9 @@ where
                     // Check for WebSocket over HTTP/2 (RFC 8441 Extended CONNECT)
                     // CONNECT method + :protocol = "websocket"
                     let is_h2_websocket = request.method() == httplib::Method::CONNECT
-                        && request.extensions().get::<h2::ext::Protocol>()
+                        && request
+                            .extensions()
+                            .get::<h2::ext::Protocol>()
                             .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
                             .unwrap_or(false);
 
@@ -388,7 +391,9 @@ where
                         let host_header = provider.host_header().to_string();
                         let auth_header = provider.auth_header().map(|s| s.to_string());
                         let path_prefix = provider.path_prefix();
-                        let mut path = request.uri().path_and_query()
+                        let mut path = request
+                            .uri()
+                            .path_and_query()
                             .map(|pq| pq.as_str().to_string())
                             .unwrap_or_else(|| "/".to_string());
 
@@ -396,7 +401,11 @@ where
                         if let Some(prefix) = path_prefix {
                             if path.starts_with(prefix) {
                                 let remaining = &path[prefix.len()..];
-                                path = if remaining.is_empty() { "/".to_string() } else { remaining.to_string() };
+                                path = if remaining.is_empty() {
+                                    "/".to_string()
+                                } else {
+                                    remaining.to_string()
+                                };
                             }
                         }
 
@@ -407,16 +416,19 @@ where
                         let recv_stream = request.into_body();
 
                         #[allow(unused_variables)]
-                        if let Err(e) = worker.proxy_h2_websocket(
-                            respond,
-                            recv_stream,
-                            &endpoint,
-                            &sock_address,
-                            provider_tls,
-                            &host_header,
-                            auth_header.as_deref(),
-                            &path,
-                        ).await {
+                        if let Err(e) = worker
+                            .proxy_h2_websocket(
+                                respond,
+                                recv_stream,
+                                &endpoint,
+                                &sock_address,
+                                provider_tls,
+                                &host_header,
+                                auth_header.as_deref(),
+                                &path,
+                            )
+                            .await
+                        {
                             #[cfg(debug_assertions)]
                             log::error!(error = e.to_string(); "h2_websocket_error");
                         }
@@ -451,17 +463,23 @@ where
                     for extra_key in &provider_extra_header_keys {
                         // Get existing value from request if present
                         let key_without_colon = extra_key.trim_end_matches(": ");
-                        let existing_value = request.headers()
+                        let existing_value = request
+                            .headers()
                             .get(key_without_colon)
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.to_string());
 
                         // Transform the header
-                        if let Some(transformed) = provider.transform_extra_header(extra_key, existing_value.as_deref()) {
+                        if let Some(transformed) =
+                            provider.transform_extra_header(extra_key, existing_value.as_deref())
+                        {
                             // Parse "header-name: value\r\n" format
                             if let Some(colon_pos) = transformed.find(':') {
                                 let name = transformed[..colon_pos].trim().to_string();
-                                let value = transformed[colon_pos + 1..].trim().trim_end_matches("\r\n").to_string();
+                                let value = transformed[colon_pos + 1..]
+                                    .trim()
+                                    .trim_end_matches("\r\n")
+                                    .to_string();
                                 extra_headers_transformed.push((name, value));
                             }
                         }
@@ -474,7 +492,9 @@ where
                         host_header_value: {
                             let h = provider.host_header();
                             // Extract just the host value from "Host: example.com\r\n"
-                            h.trim_start_matches("Host: ").trim_end_matches("\r\n").to_string()
+                            h.trim_start_matches("Host: ")
+                                .trim_end_matches("\r\n")
+                                .to_string()
                         },
                         auth_header,
                         auth_header_key: provider.auth_header_key(),
@@ -490,7 +510,10 @@ where
                     drop(p);
 
                     // Try to get or create HTTP/2 connection to upstream
-                    let h2result = match worker.get_or_create_h2(&info.endpoint, &info.sock_address, info.use_tls).await {
+                    let h2result = match worker
+                        .get_or_create_h2(&info.endpoint, &info.sock_address, info.use_tls)
+                        .await
+                    {
                         Ok(result) => result,
                         Err(e) => {
                             invalid!(respond, 502, format!("upstream: {}", e));
@@ -503,7 +526,8 @@ where
                             info.proxy_h2(h2conn, request, respond).await;
                         }
                         H2ConnectResult::FallbackToH1 => {
-                            info.proxy_h1(&mut worker, request, respond, &authority_host).await;
+                            info.proxy_h1(&mut worker, request, respond, &authority_host)
+                                .await;
                         }
                     }
                 });
@@ -512,11 +536,12 @@ where
         })
     }
 
-    fn return_h1_conn<'a>(
+    fn return_http1_conn<'a>(
         &'a mut self,
         endpoint: &'a str,
         conn: <P as PoolTrait>::Item,
-    ) -> Pin<Box<dyn Future<Output=()> + Send + 'a>> where
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    where
         <P as PoolTrait>::Item: Send,
     {
         Box::pin(async move {
@@ -663,13 +688,14 @@ impl UpstreamInfo {
         let has_body = !recv_body.is_end_stream();
 
         // Send the request
-        let (upstream_response, mut upstream_send_body) = match send_request.send_request(upstream_request, !has_body) {
-            Ok(res) => res,
-            Err(e) => {
-                invalid!(respond, 502, format!("upstream send: {}", e));
-                return;
-            }
-        };
+        let (upstream_response, mut upstream_send_body) =
+            match send_request.send_request(upstream_request, !has_body) {
+                Ok(res) => res,
+                Err(e) => {
+                    invalid!(respond, 502, format!("upstream send: {}", e));
+                    return;
+                }
+            };
 
         // Stream the request body to upstream if present
         if has_body {
@@ -912,7 +938,9 @@ impl UpstreamInfo {
             }
         }
 
-        if matches!(&mut response.payload.body, http::Body::Unread(_)) && is_transfer_encoding_chunked {
+        if matches!(&mut response.payload.body, http::Body::Unread(_))
+            && is_transfer_encoding_chunked
+        {
             let mut take = http::Body::Read(0..0);
             mem::swap(&mut take, &mut response.payload.body);
             let mut body = if let http::Body::Unread(reader) = take {
@@ -924,7 +952,7 @@ impl UpstreamInfo {
         }
 
         // Add header to indicate upstream protocol
-        builder = builder.header("x-upstream-protocol", "h1");
+        builder = builder.header("x-upstream-protocol", "http/1.1");
 
         let mut send = match respond.send_response(builder.body(()).unwrap(), false) {
             Ok(send) => send,
@@ -980,7 +1008,10 @@ fn new_tls_connector() -> tokio_rustls::TlsConnector {
 
 pub trait PoolTrait {
     type Item;
-    fn get<'a, L>(&'a self, label: &'a L) -> Pin<Box<dyn Future<Output=Option<Self::Item>> + Send + 'a>>
+    fn get<'a, L>(
+        &'a self,
+        label: &'a L,
+    ) -> Pin<Box<dyn Future<Output = Option<Self::Item>> + Send + 'a>>
     where
         String: Borrow<L>,
         Self::Item: Send,
@@ -989,7 +1020,7 @@ pub trait PoolTrait {
         &'a self,
         label: &'a L,
         value: Self::Item,
-    ) -> Pin<Box<dyn Future<Output=()> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
     where
         String: Borrow<L>,
         Self::Item: Send,
@@ -1163,7 +1194,8 @@ where
                         .header("content-type", "text/plain");
 
                     let error_msg = format!("WebSocket upgrade rejected by upstream: {}", status);
-                    let mut send = respond.send_response(builder.body(()).unwrap(), false)
+                    let mut send = respond
+                        .send_response(builder.body(()).unwrap(), false)
                         .map_err(|e| Error::IO(io::Error::other(e.to_string())))?;
                     send.send_data(bytes::Bytes::from(error_msg), true)
                         .map_err(|e| Error::IO(io::Error::other(e.to_string())))?;
@@ -1179,7 +1211,8 @@ where
                     .version(httplib::Version::HTTP_2)
                     .status(200);
 
-                let send = respond.send_response(builder.body(()).unwrap(), false)
+                let send = respond
+                    .send_response(builder.body(()).unwrap(), false)
                     .map_err(|e| Error::IO(io::Error::other(e.to_string())))?;
 
                 #[cfg(debug_assertions)]
@@ -1422,8 +1455,7 @@ where
 
 /// Find the end of HTTP headers (double CRLF)
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|window| window == b"\r\n\r\n")
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 pub trait ConnTrait: AsyncRead + AsyncWrite {
@@ -1432,14 +1464,14 @@ pub trait ConnTrait: AsyncRead + AsyncWrite {
         endpoint: &str,
         stream: TcpStream,
         connector: tokio_rustls::TlsConnector,
-    ) -> Pin<Box<dyn Future<Output=Result<Self, Error>> + Send>>
+    ) -> Pin<Box<dyn Future<Output = Result<Self, Error>> + Send>>
     where
         Self: Sized;
     fn endpoint(&self) -> &str;
     fn health_check<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output=Result<(), Error>> + Send + 'a>>;
-    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output=()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 pub struct Conn {
@@ -1459,7 +1491,7 @@ impl ConnTrait for Conn {
         endpoint: &str,
         stream: TcpStream,
         connector: tokio_rustls::TlsConnector,
-    ) -> Pin<Box<dyn Future<Output=Result<Self, Error>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self, Error>> + Send>> {
         let endpoint = endpoint.to_owned();
         Box::pin(async move {
             let server_name = endpoint
@@ -1480,7 +1512,7 @@ impl ConnTrait for Conn {
 
     fn health_check<'a>(
         &'a mut self,
-    ) -> Pin<Box<dyn Future<Output=Result<(), Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
         Box::pin(async {
             self.stream.write_all(b"GET / HTTP/1.1\r\n").await?;
             self.stream.write_all(b"Host: ").await?;
@@ -1504,7 +1536,7 @@ impl ConnTrait for Conn {
         })
     }
 
-    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output=()> + Send + 'a>> {
+    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {
             match &mut self.stream {
                 Stream::Tcp(stream) => {
@@ -1627,9 +1659,7 @@ impl AsyncRead for H2StreamReader {
         }
         let stream = match self.stream.poll_data(cx) {
             Poll::Ready(Some(Ok(stream))) => stream,
-            Poll::Ready(Some(Err(e))) => {
-                return Poll::Ready(Err(io::Error::other(e)))
-            }
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(None) => return Poll::Ready(Ok(())),
             Poll::Pending => return Poll::Pending,
         };
@@ -2018,7 +2048,11 @@ mod tests {
 
         // Gemini-style path
         assert_eq!(
-            replace_query_param_value("/v1beta/models?key=placeholder&pageSize=1", "key", "AIza123"),
+            replace_query_param_value(
+                "/v1beta/models?key=placeholder&pageSize=1",
+                "key",
+                "AIza123"
+            ),
             "/v1beta/models?key=AIza123&pageSize=1"
         );
 
@@ -2084,7 +2118,12 @@ mod tests {
 
         // Only query param replacement
         assert_eq!(
-            build_upstream_path("/models?key=placeholder", None, Some("real_key"), Some("key")),
+            build_upstream_path(
+                "/models?key=placeholder",
+                None,
+                Some("real_key"),
+                Some("key")
+            ),
             "/models?key=real_key"
         );
 
@@ -2238,9 +2277,10 @@ mod tests {
         );
 
         let extra_keys = vec!["anthropic-beta".to_string()];
-        let extra_transformed = vec![
-            ("anthropic-beta".to_string(), "existing-value,oauth-2025-04-20".to_string()),
-        ];
+        let extra_transformed = vec![(
+            "anthropic-beta".to_string(),
+            "existing-value,oauth-2025-04-20".to_string(),
+        )];
 
         let result_with_extra = build_h1_request_headers(
             headers_with_extra.iter(),

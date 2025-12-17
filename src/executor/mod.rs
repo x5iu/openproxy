@@ -56,7 +56,7 @@ impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
                             })
                     };
                     let fut = async {
-                        let Ok(mut conn) = worker.get_outgoing_conn(&**provider).await else {
+                        let Ok(mut conn) = worker.get_http1_conn(&**provider).await else {
                             provider.set_healthy(false);
                             return;
                         };
@@ -71,7 +71,7 @@ impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
                             }
                             provider.set_healthy(true);
                         }
-                        worker.return_h1_conn(provider.endpoint(), conn).await;
+                        worker.return_http1_conn(provider.endpoint(), conn).await;
                     };
                     if tokio::time::timeout(Duration::from_secs(30), fut)
                         .await
