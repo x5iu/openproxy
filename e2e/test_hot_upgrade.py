@@ -19,8 +19,8 @@ import httpx
 import yaml
 
 
-def get_server_pid(port: int) -> int | None:
-    """Get the PID of the process listening on the given port."""
+def get_server_pids(port: int) -> list[int]:
+    """Get all PIDs of processes listening on the given port."""
     try:
         result = subprocess.run(
             ["lsof", "-ti", f":{port}"],
@@ -28,12 +28,16 @@ def get_server_pid(port: int) -> int | None:
             text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
-            # May return multiple PIDs, get the first one
-            pids = result.stdout.strip().split("\n")
-            return int(pids[0])
-        return None
+            return [int(pid) for pid in result.stdout.strip().split("\n")]
+        return []
     except Exception:
-        return None
+        return []
+
+
+def get_server_pid(port: int) -> int | None:
+    """Get the PID of the process listening on the given port."""
+    pids = get_server_pids(port)
+    return pids[0] if pids else None
 
 
 def wait_for_server(base_url: str, timeout: float = 10.0) -> bool:
@@ -109,23 +113,41 @@ def test_hot_upgrade():
         print(f"  Sending SIGUSR2 to PID {original_pid}...")
         os.kill(original_pid, signal.SIGUSR2)
 
-        # Wait for new process to spawn and old process to exit
-        time.sleep(3)
+        # Wait for old process to exit (graceful shutdown takes ~6 seconds)
+        # Poll until old process exits or timeout
+        print("  Waiting for old process to exit...")
+        max_wait = 15  # seconds
+        start_time = time.time()
+        old_process_exited = False
+        while time.time() - start_time < max_wait:
+            try:
+                os.kill(original_pid, 0)
+                time.sleep(0.5)
+            except ProcessLookupError:
+                old_process_exited = True
+                break
 
-        # Get the new PID
-        new_pid = get_server_pid(test_port)
+        elapsed = time.time() - start_time
+        print(f"  Waited {elapsed:.1f}s for old process")
+
+        # Get all PIDs listening on the port
+        all_pids = get_server_pids(test_port)
+        print(f"  PIDs listening on port {test_port}: {all_pids}")
+
+        # Find the new PID (should be different from original)
+        new_pids = [p for p in all_pids if p != original_pid]
+        new_pid = new_pids[0] if new_pids else None
         print(f"  New server PID: {new_pid}")
 
-        # Verify the PID changed (new process spawned)
-        assert new_pid is not None, "No process found listening on port after upgrade"
-        assert new_pid != original_pid, f"PID should have changed after hot upgrade (still {original_pid})"
+        # Verify a new process exists
+        assert len(all_pids) > 0, "No process found listening on port after upgrade"
+        assert new_pid is not None, f"No new process spawned (only found original PID {original_pid})"
 
         # Verify old process exited
-        try:
-            os.kill(original_pid, 0)
-            print(f"  WARNING: Old process {original_pid} still running")
-        except ProcessLookupError:
+        if old_process_exited:
             print(f"  Old process {original_pid} has exited (expected)")
+        else:
+            print(f"  WARNING: Old process {original_pid} still running after {max_wait}s")
 
         # Make a request to verify new server is working
         with httpx.Client(base_url=base_url, timeout=5.0) as client:
