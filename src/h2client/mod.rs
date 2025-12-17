@@ -73,9 +73,7 @@ impl H2Connection {
     /// This attempts a non-blocking poll_ready check.
     pub async fn ready(&mut self) -> bool {
         let mut send_request = self.send_request.clone();
-        poll_fn(|cx| send_request.poll_ready(cx))
-            .await
-            .is_ok()
+        poll_fn(|cx| send_request.poll_ready(cx)).await.is_ok()
     }
 }
 
@@ -131,7 +129,8 @@ impl H2PoolTrait for H2Pool {
     fn get(
         &self,
         endpoint: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<H2Connection>> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<H2Connection>> + Send + '_>>
+    {
         let endpoint = endpoint.to_string();
         Box::pin(async move {
             let conn = {
@@ -216,9 +215,7 @@ async fn connect_h2_over_stream<S>(stream: S, endpoint: &str) -> Result<H2Connec
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (send_request, connection) = h2::client::handshake(stream)
-        .await
-        .map_err(Error::H2)?;
+    let (send_request, connection) = h2::client::handshake(stream).await.map_err(Error::H2)?;
 
     // Spawn a task to drive the connection
     tokio::spawn(async move {

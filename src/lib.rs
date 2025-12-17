@@ -77,7 +77,12 @@ impl Program {
         let http_port = config.http_port;
 
         // For backwards compatibility, if neither port is specified but cert files exist, default to HTTPS on 443
-        let (https_port, http_port) = match (https_port, http_port, &config.cert_file, &config.private_key_file) {
+        let (https_port, http_port) = match (
+            https_port,
+            http_port,
+            &config.cert_file,
+            &config.private_key_file,
+        ) {
             (None, None, Some(_), Some(_)) => (Some(443), None),
             (None, None, None, None) => {
                 return Err("Either https_port (with cert_file and private_key_file) or http_port must be configured".into());
@@ -91,7 +96,9 @@ impl Program {
         // Load TLS configuration if HTTPS is enabled
         let tls_server_config = if https_port.is_some() {
             let cert_file = config.cert_file.ok_or("cert_file is required for HTTPS")?;
-            let private_key_file = config.private_key_file.ok_or("private_key_file is required for HTTPS")?;
+            let private_key_file = config
+                .private_key_file
+                .ok_or("private_key_file is required for HTTPS")?;
 
             if !Path::new(cert_file).exists() {
                 return Err(format!("Certificate file not found: {}", cert_file).into());
@@ -99,8 +106,7 @@ impl Program {
             if !Path::new(private_key_file).exists() {
                 return Err(format!("Private key file not found: {}", private_key_file).into());
             }
-            let certs =
-                CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
+            let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
             let private_key = PrivateKeyDer::from_pem_file(private_key_file)?;
             let mut tls_config = rustls::ServerConfig::builder()
                 .with_no_client_auth()
@@ -463,7 +469,10 @@ mod tests {
         assert_eq!(no_provider.to_string(), "No provider found");
 
         let dynamic_auth_failed = Error::DynamicAuthFailed;
-        assert_eq!(dynamic_auth_failed.to_string(), "Dynamic authentication failed");
+        assert_eq!(
+            dynamic_auth_failed.to_string(),
+            "Dynamic authentication failed"
+        );
     }
 
     #[test]

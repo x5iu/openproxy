@@ -77,8 +77,18 @@ class MockAnthropicServer(BaseHTTPRequestHandler):
         self.wfile.write(response_body)
 
     def do_GET(self):
-        # Health check endpoint
+        # Health check endpoint - also validate OAuth headers
         if self.path == "/health":
+            # Store headers for health check validation
+            MockAnthropicServer.received_headers = dict(self.headers)
+
+            # Validate Authorization header for OAuth mode
+            auth_header = self.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                MockAnthropicServer.validation_errors.append(
+                    f"Health check: Missing or invalid Authorization header: {auth_header}"
+                )
+
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -475,10 +485,276 @@ def test_standard_mode_uses_x_api_key():
         os.unlink(config_path)
 
 
+def test_oauth_health_check():
+    """
+    Test that health check uses OAuth Bearer token in OAuth mode.
+
+    This test verifies:
+    1. Health check request uses Authorization: Bearer header (not X-API-Key)
+    2. The dynamic token from $(command) is correctly used
+    """
+    import subprocess
+    import tempfile
+    import yaml
+
+    print(f"\n{'='*60}")
+    print("Testing Anthropic OAuth Health Check")
+    print("=" * 60)
+
+    # Find free ports
+    mock_port = find_free_port()
+    proxy_http_port = find_free_port()
+
+    # Custom handler for health check that validates OAuth headers
+    class OAuthHealthCheckHandler(BaseHTTPRequestHandler):
+        received_headers = {}
+        health_check_count = 0
+
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/health":
+                OAuthHealthCheckHandler.received_headers = dict(self.headers)
+                OAuthHealthCheckHandler.health_check_count += 1
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+                return
+
+            self.send_response(404)
+            self.end_headers()
+
+    # Start mock server
+    print(f"Starting mock upstream server on port {mock_port}...")
+    server = HTTPServer(("127.0.0.1", mock_port), OAuthHealthCheckHandler)
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+
+    if not wait_for_server("127.0.0.1", mock_port):
+        print("Failed to start mock server")
+        sys.exit(1)
+
+    # Create proxy config with OAuth and health check enabled
+    config = {
+        "http_port": proxy_http_port,
+        "providers": [
+            {
+                "type": "anthropic",
+                "host": "anthropic-oauth-health.local",
+                "endpoint": "127.0.0.1",
+                "port": mock_port,
+                "tls": False,
+                "api_key": "$(echo health-check-oauth-token)",
+                "health_check": {
+                    "path": "/health",
+                },
+            }
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yml", delete=False
+    ) as config_file:
+        yaml.dump(config, config_file)
+        config_path = config_file.name
+
+    print(f"Config written to {config_path}")
+    print(f"Starting proxy with --enable-health-check on HTTP port {proxy_http_port}...")
+
+    # Start the proxy with health check enabled
+    proxy_process = subprocess.Popen(
+        ["cargo", "run", "--release", "--", "start", "-c", config_path, "--enable-health-check"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+
+    try:
+        # Wait for proxy to be ready
+        if not wait_for_server("127.0.0.1", proxy_http_port, timeout=30):
+            stdout, stderr = proxy_process.communicate(timeout=1)
+            print(f"Proxy stdout: {stdout.decode()}")
+            print(f"Proxy stderr: {stderr.decode()}")
+            print("Failed to start proxy")
+            sys.exit(1)
+
+        print("Proxy ready, waiting for health check to execute...")
+
+        # Wait for health check to be performed (default interval is usually quick)
+        time.sleep(3)
+
+        # Verify health check was performed
+        if OAuthHealthCheckHandler.health_check_count == 0:
+            print("ERROR: No health check requests received!")
+            sys.exit(1)
+
+        print(f"Health check requests received: {OAuthHealthCheckHandler.health_check_count}")
+
+        # Verify OAuth headers were used
+        auth_header = OAuthHealthCheckHandler.received_headers.get("Authorization", "")
+        x_api_key = OAuthHealthCheckHandler.received_headers.get("X-API-Key", "")
+
+        print(f"Authorization header: {auth_header}")
+        print(f"X-API-Key header: {x_api_key}")
+
+        assert auth_header == "Bearer health-check-oauth-token", \
+            f"Health check should use Authorization Bearer, got: {auth_header}"
+        assert not x_api_key, \
+            f"X-API-Key should not be present in OAuth mode health check: {x_api_key}"
+
+        print("\u2713 OAuth health check test passed!")
+
+    finally:
+        proxy_process.terminate()
+        try:
+            proxy_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proxy_process.kill()
+
+        os.unlink(config_path)
+
+
+def test_standard_health_check():
+    """
+    Test that health check uses X-API-Key in standard (non-OAuth) mode.
+
+    This test verifies:
+    1. Health check request uses X-API-Key header (not Authorization Bearer)
+    """
+    import subprocess
+    import tempfile
+    import yaml
+
+    print(f"\n{'='*60}")
+    print("Testing Anthropic Standard Mode Health Check")
+    print("=" * 60)
+
+    # Find free ports
+    mock_port = find_free_port()
+    proxy_http_port = find_free_port()
+
+    # Custom handler for health check
+    class StandardHealthCheckHandler(BaseHTTPRequestHandler):
+        received_headers = {}
+        health_check_count = 0
+
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/health":
+                StandardHealthCheckHandler.received_headers = dict(self.headers)
+                StandardHealthCheckHandler.health_check_count += 1
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+                return
+
+            self.send_response(404)
+            self.end_headers()
+
+    # Start mock server
+    print(f"Starting mock upstream server on port {mock_port}...")
+    server = HTTPServer(("127.0.0.1", mock_port), StandardHealthCheckHandler)
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+
+    if not wait_for_server("127.0.0.1", mock_port):
+        print("Failed to start mock server")
+        sys.exit(1)
+
+    # Create proxy config with standard api_key and health check enabled
+    config = {
+        "http_port": proxy_http_port,
+        "providers": [
+            {
+                "type": "anthropic",
+                "host": "anthropic-standard-health.local",
+                "endpoint": "127.0.0.1",
+                "port": mock_port,
+                "tls": False,
+                "api_key": "sk-ant-standard-api-key-12345",
+                "health_check": {
+                    "path": "/health",
+                },
+            }
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yml", delete=False
+    ) as config_file:
+        yaml.dump(config, config_file)
+        config_path = config_file.name
+
+    print(f"Starting proxy with --enable-health-check on HTTP port {proxy_http_port}...")
+
+    # Start the proxy with health check enabled
+    proxy_process = subprocess.Popen(
+        ["cargo", "run", "--release", "--", "start", "-c", config_path, "--enable-health-check"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+
+    try:
+        # Wait for proxy to be ready
+        if not wait_for_server("127.0.0.1", proxy_http_port, timeout=30):
+            stdout, stderr = proxy_process.communicate(timeout=1)
+            print(f"Proxy stdout: {stdout.decode()}")
+            print(f"Proxy stderr: {stderr.decode()}")
+            print("Failed to start proxy")
+            sys.exit(1)
+
+        print("Proxy ready, waiting for health check to execute...")
+
+        # Wait for health check to be performed
+        time.sleep(3)
+
+        # Verify health check was performed
+        if StandardHealthCheckHandler.health_check_count == 0:
+            print("ERROR: No health check requests received!")
+            sys.exit(1)
+
+        print(f"Health check requests received: {StandardHealthCheckHandler.health_check_count}")
+
+        # Verify standard auth headers were used
+        auth_header = StandardHealthCheckHandler.received_headers.get("Authorization", "")
+        x_api_key = StandardHealthCheckHandler.received_headers.get("X-API-Key", "")
+
+        print(f"Authorization header: {auth_header}")
+        print(f"X-API-Key header: {x_api_key}")
+
+        assert x_api_key == "sk-ant-standard-api-key-12345", \
+            f"Health check should use X-API-Key, got: {x_api_key}"
+        assert not auth_header, \
+            f"Authorization header should not be present in standard mode: {auth_header}"
+
+        print("\u2713 Standard mode health check test passed!")
+
+    finally:
+        proxy_process.terminate()
+        try:
+            proxy_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proxy_process.kill()
+
+        os.unlink(config_path)
+
+
 if __name__ == "__main__":
     test_oauth_headers_via_proxy()
     test_oauth_with_existing_beta_header()
     test_standard_mode_uses_x_api_key()
+    test_oauth_health_check()
+    test_standard_health_check()
 
     print("\n" + "=" * 60)
     print("\u2713 All Anthropic OAuth tests passed!")
