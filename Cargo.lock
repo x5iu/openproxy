@@ -432,7 +432,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openproxy"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "bytes",
  "clap",
@@ -440,6 +440,7 @@ dependencies = [
  "h2",
  "http",
  "httparse",
+ "libc",
  "log",
  "rand",
  "rustls",
@@ -447,6 +448,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "signal-hook",
+ "socket2 0.5.10",
  "structured-logger",
  "subtle",
  "thiserror",
@@ -721,6 +723,16 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
@@ -875,7 +887,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.1",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
