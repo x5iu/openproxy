@@ -833,21 +833,31 @@ impl Provider for AnthropicProvider {
         stream: &'stream mut dyn AsyncReadWrite,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
-        if let Some(ref cfg) = self.health_check_config {
-            Box::pin(health_check(
+        Box::pin(async move {
+            let Some(ref cfg) = self.health_check_config else {
+                return Ok(());
+            };
+
+            // For OAuth mode, get dynamic auth header; for standard mode, use static auth header
+            let auth_header = if self.uses_dynamic_auth() {
+                Some(self.get_dynamic_auth_header().map_err(|e| e as Box<dyn std::error::Error>)?)
+            } else {
+                self.auth_header().map(|v| v.to_string())
+            };
+
+            health_check(
                 stream,
                 self.endpoint().as_bytes(),
                 cfg.method.as_ref().map(|v| v.as_bytes()).unwrap_or(b"GET"),
                 cfg.path.as_bytes(),
-                self.auth_header().map(|v| v.as_bytes()),
+                auth_header.as_ref().map(|v| v.as_bytes()),
                 cfg.headers
                     .as_deref()
                     .map(|v| v.iter().map(|x| x.trim().as_bytes())),
                 cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
-            ))
-        } else {
-            Box::pin(async move { Ok(()) })
-        }
+            )
+            .await
+        })
     }
 }
 
@@ -1675,14 +1685,14 @@ mod tests {
     #[test]
     fn test_anthropic_provider_oauth_command_returns_empty() {
         let auth_keys = Arc::new(vec![]);
-        // Use a command that returns empty output
+        // Use a command that returns empty output (printf is portable, echo -n is not)
         let provider = AnthropicProvider::new(
             "api.anthropic.com",
             "api.anthropic.com",
             None,
             true,
             1.0,
-            Some("$(echo -n '')"),
+            Some("$(printf '')"),
             auth_keys,
             None,
             None,
