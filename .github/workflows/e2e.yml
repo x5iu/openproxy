@@ -327,14 +327,14 @@ jobs:
             exit 1
           fi
 
-          # Verify upstream protocol is H1 (fallback)
-          if ! grep -qi "x-upstream-protocol: h1" /tmp/fallback_headers.txt; then
-            echo "::error::Expected x-upstream-protocol: h1 header but not found"
+          # Verify upstream protocol is HTTP/1.1 (fallback)
+          if ! grep -qi "x-upstream-protocol: http/1.1" /tmp/fallback_headers.txt; then
+            echo "::error::Expected x-upstream-protocol: http/1.1 header but not found"
             cat /tmp/fallback_headers.txt
             exit 1
           fi
 
-          echo "H2 to H1 fallback test passed! (verified upstream protocol is H1)"
+          echo "H2 to H1 fallback test passed! (verified upstream protocol is HTTP/1.1)"
 
       - name: Run Gemini E2E tests (HTTPS with curl)
         env:
