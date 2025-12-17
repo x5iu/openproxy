@@ -427,6 +427,9 @@ jobs:
       - name: Run Hot Upgrade E2E tests
         env:
           OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+          OPENAI_HOST: ${{ secrets.OPENAI_HOST }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
           echo "Testing hot upgrade (SIGUSR2)..."
           cd e2e

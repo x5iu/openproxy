@@ -127,7 +127,8 @@ async fn start(
             signal::SIGTERM | signal::SIGINT => break,
             signal::SIGHUP => openproxy::force_update_config(&config).await?,
             signal::SIGUSR2 => {
-                log::info!("hot_upgrade_start");
+                const VERSION: &str = env!("CARGO_PKG_VERSION");
+                log::info!(version = VERSION; "hot_upgrade_start");
                 // Spawn new process with the same arguments
                 let exe = std::env::current_exe()?;
                 let args: Vec<String> = std::env::args().skip(1).collect();
@@ -138,11 +139,11 @@ async fn start(
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         // Graceful shutdown: stop accepting new connections
                         openproxy::graceful_shutdown().await;
-                        log::info!("hot_upgrade_complete");
+                        log::info!(version = VERSION; "hot_upgrade_complete");
                         break;
                     }
                     Err(e) => {
-                        log::error!(error = e.to_string(); "hot_upgrade_spawn_failed");
+                        log::error!(version = VERSION, error = e.to_string(); "hot_upgrade_spawn_failed");
                     }
                 }
             }

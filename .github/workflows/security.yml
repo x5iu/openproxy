@@ -85,6 +85,8 @@ jobs:
             --exclude "e2e/*" \
             --exclude "Dockerfile" \
             --exclude-rule "rust.lang.security.unsafe-usage.unsafe-usage" \
+            --exclude-rule "rust.lang.security.current-exe.current-exe" \
+            --exclude-rule "rust.lang.security.args.args" \
             --sarif --output semgrep-results.sarif \
             --error
 

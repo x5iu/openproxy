@@ -30,4 +30,3 @@ httparse = "1.10.1"
 bytes = "1.10.1"
 subtle = "2.6"
 socket2 = { version = "0.5", features = ["all"] }
-libc = "0.2"

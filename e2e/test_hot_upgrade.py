@@ -68,6 +68,13 @@ def test_hot_upgrade():
         print("ERROR: openproxy binary not found. Build with 'cargo build' first.")
         sys.exit(1)
 
+    # Get OpenAI configuration from environment
+    openai_host = os.environ["OPENAI_HOST"]
+    openai_api_key = os.environ["OPENAI_API_KEY"]
+
+    # Strip protocol prefix from host to get endpoint
+    openai_endpoint = openai_host.replace("https://", "").replace("http://", "").rstrip("/")
+
     # Create a temporary config file
     test_port = 19080
     config = {
@@ -76,8 +83,8 @@ def test_hot_upgrade():
             {
                 "type": "openai",
                 "host": "test.local",
-                "endpoint": "api.openai.com",
-                "api_key": "sk-test-key",
+                "endpoint": openai_endpoint,
+                "api_key": openai_api_key,
             }
         ],
     }
@@ -105,9 +112,10 @@ def test_hot_upgrade():
         print(f"  Server started with PID: {original_pid}")
 
         # Make a request to verify server is working
-        with httpx.Client(base_url=base_url, timeout=5.0) as client:
+        with httpx.Client(base_url=base_url, timeout=10.0) as client:
             resp = client.get("/v1/models", headers={"Host": "test.local"})
             print(f"  Pre-upgrade request: status={resp.status_code}")
+            assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
 
         # Send SIGUSR2 to trigger hot upgrade
         print(f"  Sending SIGUSR2 to PID {original_pid}...")
@@ -150,9 +158,10 @@ def test_hot_upgrade():
             print(f"  WARNING: Old process {original_pid} still running after {max_wait}s")
 
         # Make a request to verify new server is working
-        with httpx.Client(base_url=base_url, timeout=5.0) as client:
+        with httpx.Client(base_url=base_url, timeout=10.0) as client:
             resp = client.get("/v1/models", headers={"Host": "test.local"})
             print(f"  Post-upgrade request: status={resp.status_code}")
+            assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
 
         # Cleanup: kill the new process
         if new_pid:
@@ -186,15 +195,11 @@ def test_hot_upgrade_during_request():
     print("Testing Hot Upgrade with In-Flight Requests")
     print("=" * 50)
 
-    # This test requires a real backend, skip if not available
-    openai_base_url = os.environ.get("OPENAI_BASE_URL")
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not openai_base_url or not openai_api_key:
-        print("  SKIPPED: OPENAI_BASE_URL and OPENAI_API_KEY required")
-        return
+    openai_host = os.environ["OPENAI_HOST"]
+    openai_api_key = os.environ["OPENAI_API_KEY"]
 
     print("  (This test uses the existing proxy from environment)")
+    print(f"  OPENAI_HOST: {openai_host}")
     print("  Note: Manual verification needed for production hot upgrade testing")
     print("✓ Hot upgrade during request test passed (basic check)!")
 
