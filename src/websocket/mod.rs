@@ -4,10 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Bidirectional copy between two streams
 /// This is used after WebSocket handshake to proxy data in both directions
-pub async fn bidirectional_copy<C, S>(
-    client: &mut C,
-    server: &mut S,
-) -> io::Result<(u64, u64)>
+pub async fn bidirectional_copy<C, S>(client: &mut C, server: &mut S) -> io::Result<(u64, u64)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,

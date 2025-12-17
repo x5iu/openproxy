@@ -43,17 +43,14 @@ impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
                 let providers = p.read().await.providers.clone();
                 for provider in providers.iter() {
                     let provider_api_key = || {
-                        provider
-                            .api_key()
-                            .and_then(|k| {
-                                if let (Some(prefix), Some(suffix)) =
-                                    (k.get(..3), k.get(k.len() - 4..))
-                                {
-                                    Some(format!("{}...{}", prefix, suffix))
-                                } else {
-                                    None
-                                }
-                            })
+                        provider.api_key().and_then(|k| {
+                            if let (Some(prefix), Some(suffix)) = (k.get(..3), k.get(k.len() - 4..))
+                            {
+                                Some(format!("{}...{}", prefix, suffix))
+                            } else {
+                                None
+                            }
+                        })
                     };
                     let fut = async {
                         let Ok(mut conn) = worker.get_http1_conn(&**provider).await else {
@@ -94,7 +91,10 @@ impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
         let p = crate::program();
         let (tls_server_config, mut shutdown_rx) = {
             let guard = p.read().await;
-            (guard.tls_server_config.clone(), guard.shutdown_tx.subscribe())
+            (
+                guard.tls_server_config.clone(),
+                guard.shutdown_tx.subscribe(),
+            )
         };
         let Some(tls_server_config) = tls_server_config else {
             log::error!("TLS server config not available for HTTPS connection");
@@ -247,24 +247,20 @@ impl<T> Pool<T> {
 impl<T> PoolTrait for Pool<T> {
     type Item = T;
 
-    fn get<'a, L>(&'a self, label: &'a L) -> Pin<Box<dyn Future<Output=Option<T>> + Send + 'a>>
+    fn get<'a, L>(&'a self, label: &'a L) -> Pin<Box<dyn Future<Output = Option<T>> + Send + 'a>>
     where
         String: Borrow<L>,
         T: Send,
         L: Ord + Sync + ?Sized,
     {
         Box::pin(async move {
-            let result = self.injectors
-                .read()
-                .await
-                .get(label)
-                .and_then(|injector| {
-                    if let Steal::Success(v) = injector.steal() {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
+            let result = self.injectors.read().await.get(label).and_then(|injector| {
+                if let Steal::Success(v) = injector.steal() {
+                    Some(v)
+                } else {
+                    None
+                }
+            });
             // Decrement connection count when taking from pool
             if result.is_some() {
                 if let Some(count) = self.conn_counts.read().await.get(label) {
@@ -275,7 +271,7 @@ impl<T> PoolTrait for Pool<T> {
         })
     }
 
-    fn add<'a, L>(&'a self, label: &'a L, value: T) -> Pin<Box<dyn Future<Output=()> + Send + 'a>>
+    fn add<'a, L>(&'a self, label: &'a L, value: T) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
     where
         String: Borrow<L>,
         T: Send,
@@ -286,7 +282,9 @@ impl<T> PoolTrait for Pool<T> {
             {
                 let mut injectors = self.injectors.write().await;
                 let mut conn_counts = self.conn_counts.write().await;
-                injectors.entry(label.to_string()).or_insert_with(Injector::new);
+                injectors
+                    .entry(label.to_string())
+                    .or_insert_with(Injector::new);
                 conn_counts
                     .entry(label.to_string())
                     .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
@@ -298,10 +296,9 @@ impl<T> PoolTrait for Pool<T> {
                 let Some(count) = counts.get(label) else {
                     return;
                 };
-                count
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                        (c < self.max_connections_per_endpoint).then_some(c + 1)
-                    })
+                count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                    (c < self.max_connections_per_endpoint).then_some(c + 1)
+                })
             };
 
             if let Err(current_count) = current {
@@ -336,7 +333,10 @@ mod tests {
     #[tokio::test]
     async fn test_pool_new() {
         let pool: Pool<i32> = Pool::new();
-        assert_eq!(pool.max_connections_per_endpoint, DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT);
+        assert_eq!(
+            pool.max_connections_per_endpoint,
+            DEFAULT_MAX_CONNECTIONS_PER_ENDPOINT
+        );
     }
 
     #[tokio::test]
@@ -486,7 +486,8 @@ mod tests {
         let pool: Pool<String> = Pool::new();
 
         // Test with owned string
-        pool.add(&String::from("endpoint1"), String::from("value1")).await;
+        pool.add(&String::from("endpoint1"), String::from("value1"))
+            .await;
 
         // Test with &str
         pool.add("endpoint2", String::from("value2")).await;
@@ -552,7 +553,10 @@ mod tests {
         pool.add("endpoint1", 1).await;
 
         // Verify count is 1
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -560,7 +564,10 @@ mod tests {
 
         // Get the value back, count should be 0
         let _ = pool.get("endpoint1").await;
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -568,7 +575,10 @@ mod tests {
 
         // Add again and verify rollback doesn't cause underflow
         pool.add("endpoint1", 2).await;
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -596,7 +606,10 @@ mod tests {
         }
 
         // Count should not exceed capacity
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -607,7 +620,11 @@ mod tests {
         while pool.get("endpoint1").await.is_some() {
             actual_count += 1;
         }
-        assert!(actual_count <= 10, "actual count {} should not exceed capacity 10", actual_count);
+        assert!(
+            actual_count <= 10,
+            "actual count {} should not exceed capacity 10",
+            actual_count
+        );
     }
 
     #[tokio::test]
@@ -621,7 +638,10 @@ mod tests {
         pool.add("endpoint1", 3).await;
 
         // Verify count is 3
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -632,7 +652,10 @@ mod tests {
         assert!(pool.get("endpoint1").await.is_some());
 
         // Verify count is 1
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -645,7 +668,10 @@ mod tests {
         pool.add("endpoint1", 7).await;
 
         // Verify count is 5 (at capacity)
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -655,7 +681,10 @@ mod tests {
         pool.add("endpoint1", 8).await;
 
         // Verify count is still 5
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -674,7 +703,10 @@ mod tests {
         assert!(pool.get("endpoint1").await.is_none());
 
         // Count should be 0
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -729,7 +761,10 @@ mod tests {
         }
 
         // Verify count is consistent with actual items
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -739,7 +774,11 @@ mod tests {
             actual += 1;
         }
 
-        assert_eq!(count, actual, "count {} should match actual items {}", count, actual);
+        assert_eq!(
+            count, actual,
+            "count {} should match actual items {}",
+            count, actual
+        );
     }
 
     #[tokio::test]
@@ -780,7 +819,10 @@ mod tests {
         pool.add("endpoint1", 3).await;
 
         // Count should be 3
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -790,7 +832,10 @@ mod tests {
         pool.get("endpoint1").await;
 
         // Count should be 2
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);
@@ -800,7 +845,10 @@ mod tests {
         pool.get("nonexistent").await;
 
         // Count for endpoint1 should still be 2
-        let count = pool.conn_counts.read().await
+        let count = pool
+            .conn_counts
+            .read()
+            .await
             .get("endpoint1")
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0);

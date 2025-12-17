@@ -56,7 +56,9 @@ impl<R> ChunkedWriter<R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader,
-            frame: Vec::with_capacity(Self::MAX_HEADER_SIZE + CRLF.len() + Self::MAX_DATA_SIZE + CRLF.len()),
+            frame: Vec::with_capacity(
+                Self::MAX_HEADER_SIZE + CRLF.len() + Self::MAX_DATA_SIZE + CRLF.len(),
+            ),
             buf: Vec::with_capacity(Self::MAX_DATA_SIZE),
             pos: 0,
             finished: false,
@@ -83,7 +85,9 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedWriter<R> {
             }
             if this.buf.len() < Self::MAX_DATA_SIZE {
                 // SAFETY: extend to MAX_DATA_SIZE to obtain a writable buffer; truncate after the read.
-                unsafe { this.buf.set_len(Self::MAX_DATA_SIZE); }
+                unsafe {
+                    this.buf.set_len(Self::MAX_DATA_SIZE);
+                }
             }
             let n = {
                 let mut rb = ReadBuf::new(&mut this.buf[..Self::MAX_DATA_SIZE]);
@@ -367,7 +371,6 @@ pub(crate) mod buf_reader {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{ChunkedReader, ChunkedWriter, LimitedReader};
@@ -454,7 +457,10 @@ mod tests {
 
     impl PendingOnceReader {
         fn new(data: Vec<u8>) -> Self {
-            Self { inner: MemReader::new(data), pending: true }
+            Self {
+                inner: MemReader::new(data),
+                pending: true,
+            }
         }
     }
 
@@ -479,7 +485,10 @@ mod tests {
 
     impl PendingNReader {
         fn new(data: Vec<u8>, n: usize) -> Self {
-            Self { inner: MemReader::new(data), remaining: n }
+            Self {
+                inner: MemReader::new(data),
+                remaining: n,
+            }
         }
     }
 
@@ -510,11 +519,14 @@ mod tests {
     }
 
     fn noop_waker() -> std::task::Waker {
-        unsafe fn clone(_: *const ()) -> std::task::RawWaker { std::task::RawWaker::new(std::ptr::null(), &VTABLE) }
+        unsafe fn clone(_: *const ()) -> std::task::RawWaker {
+            std::task::RawWaker::new(std::ptr::null(), &VTABLE)
+        }
         unsafe fn wake(_: *const ()) {}
         unsafe fn wake_by_ref(_: *const ()) {}
         unsafe fn drop(_: *const ()) {}
-        static VTABLE: std::task::RawWakerVTable = std::task::RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        static VTABLE: std::task::RawWakerVTable =
+            std::task::RawWakerVTable::new(clone, wake, wake_by_ref, drop);
         unsafe { std::task::Waker::from_raw(std::task::RawWaker::new(std::ptr::null(), &VTABLE)) }
     }
 
@@ -611,7 +623,9 @@ mod tests {
         let mut tmp = [0u8; 2];
         loop {
             let n = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             enc.extend_from_slice(&tmp[..n]);
         }
         let dec = decode_chunked(enc).await;
@@ -642,7 +656,9 @@ mod tests {
         let mut tmp = [0u8; 256];
         loop {
             let m = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
-            if m == 0 { break; }
+            if m == 0 {
+                break;
+            }
             enc.extend_from_slice(&tmp[..m]);
         }
         let dec = decode_chunked(enc).await;
@@ -674,7 +690,9 @@ mod tests {
         let mut tmp = [0u8; 256];
         loop {
             let m = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
-            if m == 0 { break; }
+            if m == 0 {
+                break;
+            }
             enc.extend_from_slice(&tmp[..m]);
         }
         let dec = decode_chunked(enc).await;
@@ -697,7 +715,9 @@ mod tests {
         let inner = MemReader::new(data.clone());
         let mut limited = LimitedReader::new(inner, 10);
         let mut out = Vec::new();
-        AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap();
+        AsyncReadExt::read_to_end(&mut limited, &mut out)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 10);
         assert_eq!(out, data[..10].to_vec());
     }
@@ -708,7 +728,9 @@ mod tests {
         let inner = MemReader::new(data);
         let mut limited = LimitedReader::new(inner, 0);
         let mut out = Vec::new();
-        AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap();
+        AsyncReadExt::read_to_end(&mut limited, &mut out)
+            .await
+            .unwrap();
         assert!(out.is_empty());
     }
 
@@ -718,7 +740,9 @@ mod tests {
         let inner = MemReader::new(data.clone());
         let mut limited = LimitedReader::new(inner, 32);
         let mut out = Vec::new();
-        AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap();
+        AsyncReadExt::read_to_end(&mut limited, &mut out)
+            .await
+            .unwrap();
         assert_eq!(out, data);
     }
 
@@ -799,10 +823,7 @@ mod tests {
         let mut out = Vec::new();
         let err = rdr.read_to_end(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert_eq!(
-            err.to_string(),
-            "invalid chunk length: \"1a;foo=bar\"",
-        );
+        assert_eq!(err.to_string(), "invalid chunk length: \"1a;foo=bar\"",);
     }
 
     #[tokio::test]
@@ -827,7 +848,9 @@ mod tests {
         let inner = ErrorReader;
         let mut limited = LimitedReader::new(inner, 10);
         let mut out = Vec::new();
-        let err = AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap_err();
+        let err = AsyncReadExt::read_to_end(&mut limited, &mut out)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "inner failure");
     }
@@ -992,7 +1015,9 @@ mod tests {
         let inner = MemReader::new(data.clone());
         let mut limited = LimitedReader::new(inner, 64);
         let mut out = Vec::new();
-        AsyncReadExt::read_to_end(&mut limited, &mut out).await.unwrap();
+        AsyncReadExt::read_to_end(&mut limited, &mut out)
+            .await
+            .unwrap();
         assert_eq!(out, data);
     }
 
@@ -1005,7 +1030,9 @@ mod tests {
         let mut tmp = [0u8; 100]; // Small buffer to force multiple reads
         loop {
             let n = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             enc.extend_from_slice(&tmp[..n]);
         }
         let dec = decode_chunked(enc).await;
@@ -1026,7 +1053,9 @@ mod tests {
         // Read in small chunks to exercise cleaning state
         while total_read < data.len() {
             let n = AsyncReadExt::read(&mut rdr, &mut buf).await.unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             total_read += n;
         }
         assert_eq!(total_read, data.len());

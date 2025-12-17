@@ -51,10 +51,7 @@ impl<'a> Request<'a> {
         })
     }
 
-    pub async fn write_to<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-    ) -> Result<(), Error> {
+    pub async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
         let mut payload_blocks = Vec::new();
@@ -109,10 +106,7 @@ impl<'a> Response<'a> {
         })
     }
 
-    pub async fn write_to<W: AsyncWrite + Unpin>(
-        &mut self,
-        writer: &mut W,
-    ) -> Result<(), Error> {
+    pub async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
         let mut payload_blocks = Vec::new();
@@ -275,28 +269,35 @@ impl<'a> Payload<'a> {
                     let value_start = &line[HEADER_SEC_WEBSOCKET_KEY.len()] as *const u8 as usize;
                     value_start - block_start
                 };
-                sec_websocket_key = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_KEY.len());
+                sec_websocket_key =
+                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_KEY.len());
             } else if is_header(header, HEADER_SEC_WEBSOCKET_VERSION) {
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start = &line[HEADER_SEC_WEBSOCKET_VERSION.len()] as *const u8 as usize;
+                    let value_start =
+                        &line[HEADER_SEC_WEBSOCKET_VERSION.len()] as *const u8 as usize;
                     value_start - block_start
                 };
-                sec_websocket_version = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_VERSION.len());
+                sec_websocket_version =
+                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_VERSION.len());
             } else if is_header(header, HEADER_SEC_WEBSOCKET_PROTOCOL) {
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start = &line[HEADER_SEC_WEBSOCKET_PROTOCOL.len()] as *const u8 as usize;
+                    let value_start =
+                        &line[HEADER_SEC_WEBSOCKET_PROTOCOL.len()] as *const u8 as usize;
                     value_start - block_start
                 };
-                sec_websocket_protocol = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_PROTOCOL.len());
+                sec_websocket_protocol =
+                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_PROTOCOL.len());
             } else if is_header(header, HEADER_SEC_WEBSOCKET_EXTENSIONS) {
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start = &line[HEADER_SEC_WEBSOCKET_EXTENSIONS.len()] as *const u8 as usize;
+                    let value_start =
+                        &line[HEADER_SEC_WEBSOCKET_EXTENSIONS.len()] as *const u8 as usize;
                     value_start - block_start
                 };
-                sec_websocket_extensions = Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_EXTENSIONS.len());
+                sec_websocket_extensions =
+                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_EXTENSIONS.len());
             }
         }
         let Ok(req_line_str) = std::str::from_utf8(req_line) else {
@@ -557,13 +558,11 @@ impl<'a> Payload<'a> {
 
                     // Transform extra headers (e.g., add anthropic-beta for OAuth)
                     for header_key in provider.extra_headers() {
-                        let existing_value = self.find_header_value(
-                            header_key.trim_end_matches(": ").as_bytes()
-                        );
-                        if let Some(new_header) = provider.transform_extra_header(
-                            header_key,
-                            existing_value.as_deref()
-                        ) {
+                        let existing_value =
+                            self.find_header_value(header_key.trim_end_matches(": ").as_bytes());
+                        if let Some(new_header) =
+                            provider.transform_extra_header(header_key, existing_value.as_deref())
+                        {
                             result.extend_from_slice(new_header.as_bytes());
                         }
                     }
@@ -636,7 +635,9 @@ fn get_host(header: Option<&[u8]>) -> Option<&str> {
     header
         .and_then(|header| std::str::from_utf8(header).ok())
         .map(|host| {
-            if host.len() >= HEADER_HOST.len() && host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST) {
+            if host.len() >= HEADER_HOST.len()
+                && host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST)
+            {
                 &host[HEADER_HOST.len()..]
             } else {
                 host
@@ -883,8 +884,14 @@ mod tests {
         assert!(is_header("content-length: 100", HEADER_CONTENT_LENGTH));
 
         // Test Authorization header
-        assert!(is_header("Authorization: Bearer token", HEADER_AUTHORIZATION));
-        assert!(is_header("authorization: Bearer token", HEADER_AUTHORIZATION));
+        assert!(is_header(
+            "Authorization: Bearer token",
+            HEADER_AUTHORIZATION
+        ));
+        assert!(is_header(
+            "authorization: Bearer token",
+            HEADER_AUTHORIZATION
+        ));
 
         // Test non-matching headers
         assert!(!is_header("Content-Type: application/json", HEADER_HOST));
@@ -1108,7 +1115,10 @@ mod tests {
         assert_eq!(HEADER_SEC_WEBSOCKET_KEY, "Sec-WebSocket-Key: ");
         assert_eq!(HEADER_SEC_WEBSOCKET_VERSION, "Sec-WebSocket-Version: ");
         assert_eq!(HEADER_SEC_WEBSOCKET_PROTOCOL, "Sec-WebSocket-Protocol: ");
-        assert_eq!(HEADER_SEC_WEBSOCKET_EXTENSIONS, "Sec-WebSocket-Extensions: ");
+        assert_eq!(
+            HEADER_SEC_WEBSOCKET_EXTENSIONS,
+            "Sec-WebSocket-Extensions: "
+        );
         assert_eq!(UPGRADE_WEBSOCKET, "websocket");
         assert_eq!(CONNECTION_UPGRADE, "upgrade");
     }

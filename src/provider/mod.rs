@@ -158,7 +158,11 @@ pub trait Provider: Send + Sync {
     /// - `existing_value`: The existing value if the header was present in the request
     ///
     /// Returns the new header line to add (should end with \r\n), or None to skip.
-    fn transform_extra_header(&self, _header_key: &str, _existing_value: Option<&str>) -> Option<String> {
+    fn transform_extra_header(
+        &self,
+        _header_key: &str,
+        _existing_value: Option<&str>,
+    ) -> Option<String> {
         None
     }
 
@@ -227,9 +231,8 @@ impl OpenAIProvider {
         } else {
             format!("Host: {}:{}\r\n", endpoint, port)
         };
-        let auth_header = api_key.map(|api_key| {
-            format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, api_key)
-        });
+        let auth_header =
+            api_key.map(|api_key| format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, api_key));
         let sock_address = format!("{}:{}", endpoint, port);
         Ok(Self {
             host,
@@ -538,7 +541,7 @@ impl Provider for GeminiProvider {
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
-    ) -> Pin<Box<dyn Future<Output=Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
             Box::pin(async move {
@@ -554,7 +557,7 @@ impl Provider for GeminiProvider {
                         .map(|v| v.iter().map(|x| x.trim().as_bytes())),
                     cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
                 )
-                    .await
+                .await
             })
         } else {
             Box::pin(async move { Ok(()) })
@@ -596,7 +599,9 @@ fn extract_oauth_command(api_key: &str) -> Option<&str> {
 }
 
 /// Execute a shell command and return the stdout as a string
-fn execute_oauth_command(command: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn execute_oauth_command(
+    command: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -644,7 +649,10 @@ impl AnthropicProvider {
             (None, Some(cmd.to_string()))
         } else {
             // Standard mode: use X-API-Key header
-            (Some(format!("{}{}\r\n", http::HEADER_X_API_KEY, api_key)), None)
+            (
+                Some(format!("{}{}\r\n", http::HEADER_X_API_KEY, api_key)),
+                None,
+            )
         };
 
         let sock_address = format!("{}:{}", endpoint, port);
@@ -782,7 +790,11 @@ impl Provider for AnthropicProvider {
     fn get_dynamic_auth_header(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref cmd) = self.oauth_command {
             let token = execute_oauth_command(cmd)?;
-            Ok(format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, token))
+            Ok(format!(
+                "{}Bearer {}\r\n",
+                http::HEADER_AUTHORIZATION,
+                token
+            ))
         } else {
             Err("Not an OAuth provider".into())
         }
@@ -796,7 +808,11 @@ impl Provider for AnthropicProvider {
         }
     }
 
-    fn transform_extra_header(&self, header_key: &str, existing_value: Option<&str>) -> Option<String> {
+    fn transform_extra_header(
+        &self,
+        header_key: &str,
+        existing_value: Option<&str>,
+    ) -> Option<String> {
         // Only transform headers when using OAuth
         if self.oauth_command.is_none() {
             return None;
@@ -814,7 +830,10 @@ impl Provider for AnthropicProvider {
                         Some(format!("{}{}\r\n", header_key, existing))
                     } else {
                         // Append the oauth beta value to existing header
-                        Some(format!("{}{},{}\r\n", header_key, existing, OAUTH_BETA_VALUE))
+                        Some(format!(
+                            "{}{},{}\r\n",
+                            header_key, existing, OAUTH_BETA_VALUE
+                        ))
                     }
                 }
                 None => {
@@ -840,7 +859,10 @@ impl Provider for AnthropicProvider {
 
             // For OAuth mode, get dynamic auth header; for standard mode, use static auth header
             let auth_header = if self.uses_dynamic_auth() {
-                Some(self.get_dynamic_auth_header().map_err(|e| e as Box<dyn std::error::Error>)?)
+                Some(
+                    self.get_dynamic_auth_header()
+                        .map_err(|e| e as Box<dyn std::error::Error>)?,
+                )
             } else {
                 self.auth_header().map(|v| v.to_string())
             };
@@ -968,7 +990,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(provider.kind(), Type::OpenAI));
         assert_eq!(provider.host(), "api.openai.com");
@@ -979,7 +1002,10 @@ mod tests {
         assert!(provider.is_healthy());
         assert_eq!(provider.sock_address(), "api.openai.com:443");
         assert_eq!(provider.host_header(), "Host: api.openai.com\r\n");
-        assert_eq!(provider.auth_header(), Some("Authorization: Bearer sk-test-key\r\n"));
+        assert_eq!(
+            provider.auth_header(),
+            Some("Authorization: Bearer sk-test-key\r\n")
+        );
         assert_eq!(provider.auth_header_key(), Some(http::HEADER_AUTHORIZATION));
         assert_eq!(provider.auth_query_key(), None);
     }
@@ -997,7 +1023,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!provider.tls());
         assert_eq!(provider.sock_address(), "localhost:8080");
@@ -1017,7 +1044,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Test valid authentication
         let valid_header = "Authorization: Bearer valid-key";
@@ -1025,7 +1053,9 @@ mod tests {
 
         // Test invalid authentication
         let invalid_header = "Authorization: Bearer invalid-key";
-        assert!(provider.authenticate(Some(invalid_header.as_bytes())).is_err());
+        assert!(provider
+            .authenticate(Some(invalid_header.as_bytes()))
+            .is_err());
 
         // Test missing authentication
         assert!(provider.authenticate(None).is_err());
@@ -1049,7 +1079,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Without auth_keys, authentication should pass
         assert!(!provider.has_auth_keys());
@@ -1071,7 +1102,8 @@ mod tests {
             auth_keys,
             provider_auth_keys,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(provider.has_auth_keys());
         assert!(provider.authenticate_key("provider-specific-key").is_ok());
@@ -1091,7 +1123,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Default is healthy
         assert!(provider.is_healthy());
@@ -1118,7 +1151,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(provider.kind(), Type::Gemini));
         assert_eq!(provider.host(), "generativelanguage.googleapis.com");
@@ -1126,7 +1160,10 @@ mod tests {
         assert_eq!(provider.api_key(), Some("gemini-api-key"));
         assert_eq!(provider.weight(), 1.5);
         assert_eq!(provider.auth_query_key(), Some(http::QUERY_KEY_KEY));
-        assert_eq!(provider.auth_header_key(), Some(http::HEADER_X_GOOG_API_KEY));
+        assert_eq!(
+            provider.auth_header_key(),
+            Some(http::HEADER_X_GOOG_API_KEY)
+        );
     }
 
     #[test]
@@ -1160,7 +1197,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Test with x-goog-api-key header
         let valid_header = "x-goog-api-key: client-key";
@@ -1186,7 +1224,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(matches!(provider.kind(), Type::Anthropic));
         assert_eq!(provider.host(), "api.anthropic.com");
@@ -1228,7 +1267,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Test with X-API-Key header
         let valid_header = "X-API-Key: client-key";
@@ -1236,7 +1276,9 @@ mod tests {
 
         // Test invalid header key
         let wrong_header = "Authorization: Bearer client-key";
-        assert!(provider.authenticate(Some(wrong_header.as_bytes())).is_err());
+        assert!(provider
+            .authenticate(Some(wrong_header.as_bytes()))
+            .is_err());
     }
 
     #[test]
@@ -1255,7 +1297,8 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(openai.kind(), Type::OpenAI));
 
         // Test Gemini
@@ -1270,7 +1313,8 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(gemini.kind(), Type::Gemini));
 
         // Test Anthropic
@@ -1285,7 +1329,8 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(matches!(anthropic.kind(), Type::Anthropic));
 
         // Test unsupported provider
@@ -1319,7 +1364,8 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(provider_tls.sock_address(), "api.openai.com:443");
 
         // TLS disabled should default to port 80
@@ -1333,7 +1379,8 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(provider_no_tls.sock_address(), "api.openai.com:80");
 
         // Custom port should override defaults
@@ -1347,7 +1394,8 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(provider_custom.sock_address(), "api.openai.com:8443");
     }
 
@@ -1364,7 +1412,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(provider.api_key(), None);
         assert_eq!(provider.auth_header(), None);
@@ -1385,12 +1434,16 @@ mod tests {
             auth_keys.clone(),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let block = b"GET /v1/completions HTTP/1.1";
         let rewritten = provider.rewrite_first_header_block(block);
         assert!(rewritten.is_some());
-        assert_eq!(String::from_utf8(rewritten.unwrap()).unwrap(), "GET /completions HTTP/1.1");
+        assert_eq!(
+            String::from_utf8(rewritten.unwrap()).unwrap(),
+            "GET /completions HTTP/1.1"
+        );
 
         // Provider without path prefix
         let provider_no_prefix = OpenAIProvider::new(
@@ -1403,7 +1456,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let rewritten = provider_no_prefix.rewrite_first_header_block(block);
         assert!(rewritten.is_none());
@@ -1422,7 +1476,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Test rewriting path and query key
         let block = b"GET /v1beta/models?key=client-key HTTP/1.1";
@@ -1456,7 +1511,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // All keys should work
         assert!(provider.authenticate_key("key1").is_ok());
@@ -1478,7 +1534,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // OpenAI strips "Bearer " prefix
         assert!(provider.authenticate_key("Bearer valid-key").is_ok());
@@ -1495,7 +1552,8 @@ mod tests {
             Arc::new(vec!["valid-key".to_string()]),
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Anthropic trims whitespace
         assert!(anthropic_provider.authenticate_key("  valid-key  ").is_ok());
@@ -1557,7 +1615,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should be in OAuth mode
         assert!(provider.uses_oauth());
@@ -1566,7 +1625,10 @@ mod tests {
         // Should return dynamic auth header
         let dynamic_auth = provider.get_dynamic_auth_header();
         assert!(dynamic_auth.is_ok());
-        assert_eq!(dynamic_auth.unwrap(), "Authorization: Bearer oauth-token-123\r\n");
+        assert_eq!(
+            dynamic_auth.unwrap(),
+            "Authorization: Bearer oauth-token-123\r\n"
+        );
     }
 
     #[test]
@@ -1582,11 +1644,15 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should NOT be in OAuth mode
         assert!(!provider.uses_oauth());
-        assert_eq!(provider.auth_header(), Some("X-API-Key: sk-ant-api-key-123\r\n"));
+        assert_eq!(
+            provider.auth_header(),
+            Some("X-API-Key: sk-ant-api-key-123\r\n")
+        );
 
         // Dynamic auth should fail
         let dynamic_auth = provider.get_dynamic_auth_header();
@@ -1606,7 +1672,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should have anthropic-beta in extra headers
         let extra = provider.extra_headers();
@@ -1615,19 +1682,36 @@ mod tests {
 
         // Without existing anthropic-beta header
         let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, None);
-        assert_eq!(result, Some("anthropic-beta: oauth-2025-04-20\r\n".to_string()));
+        assert_eq!(
+            result,
+            Some("anthropic-beta: oauth-2025-04-20\r\n".to_string())
+        );
 
         // With existing anthropic-beta header (without oauth value)
-        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
-        assert_eq!(result, Some("anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n".to_string()));
+        let result = provider
+            .transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
+        assert_eq!(
+            result,
+            Some("anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n".to_string())
+        );
 
         // With existing anthropic-beta header (already contains oauth value)
-        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("oauth-2025-04-20"));
-        assert_eq!(result, Some("anthropic-beta: oauth-2025-04-20\r\n".to_string()));
+        let result =
+            provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("oauth-2025-04-20"));
+        assert_eq!(
+            result,
+            Some("anthropic-beta: oauth-2025-04-20\r\n".to_string())
+        );
 
         // With existing anthropic-beta header (already contains oauth value among others)
-        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01, oauth-2025-04-20"));
-        assert_eq!(result, Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string()));
+        let result = provider.transform_extra_header(
+            http::HEADER_ANTHROPIC_BETA,
+            Some("streaming-2024-01-01, oauth-2025-04-20"),
+        );
+        assert_eq!(
+            result,
+            Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string())
+        );
     }
 
     #[test]
@@ -1643,7 +1727,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Standard mode should not have any extra headers
         let extra = provider.extra_headers();
@@ -1653,7 +1738,8 @@ mod tests {
         let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, None);
         assert!(result.is_none());
 
-        let result = provider.transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
+        let result = provider
+            .transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
         assert!(result.is_none());
     }
 
@@ -1671,7 +1757,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should be in OAuth mode
         assert!(provider.uses_oauth());
@@ -1696,7 +1783,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should be in OAuth mode
         assert!(provider.uses_oauth());
@@ -1722,7 +1810,8 @@ mod tests {
             auth_keys,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should be in OAuth mode
         assert!(provider.uses_oauth());
@@ -1741,7 +1830,7 @@ async fn health_check(
     method: &[u8],
     path: &[u8],
     authorization: Option<&[u8]>,
-    headers: Option<impl Iterator<Item=&[u8]>>,
+    headers: Option<impl Iterator<Item = &[u8]>>,
     req: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(method).await?;
