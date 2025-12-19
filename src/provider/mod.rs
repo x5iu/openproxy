@@ -166,6 +166,37 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Returns all supported auth header keys for this provider.
+    /// Used to support multiple auth methods (e.g., Anthropic supports both X-API-Key and Authorization).
+    /// Each key should include the ": " suffix (e.g., "X-API-Key: ").
+    fn auth_header_keys(&self) -> Vec<&'static str> {
+        self.auth_header_key().map(|k| vec![k]).unwrap_or_default()
+    }
+
+    /// Authenticate incoming request and return the auth type used.
+    /// Returns Ok(Some(auth_type)) if authenticated successfully with specific type.
+    /// Returns Ok(None) if no auth required.
+    /// Returns Err if authentication failed.
+    fn authenticate_with_type(
+        &self,
+        auth: Option<&[u8]>,
+    ) -> Result<Option<&'static str>, AuthenticationError> {
+        self.authenticate(auth).map(|_| None)
+    }
+
+    /// Get upstream auth header based on incoming auth type.
+    /// `incoming_auth_type` is the value returned by `authenticate_with_type`.
+    fn get_upstream_auth_header(
+        &self,
+        _incoming_auth_type: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.uses_dynamic_auth() {
+            self.get_dynamic_auth_header().map(Some)
+        } else {
+            Ok(self.auth_header().map(|s| s.to_string()))
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
@@ -754,10 +785,21 @@ impl Provider for AnthropicProvider {
         };
         #[cfg(debug_assertions)]
         log::info!(provider = "anthropic", header = header_str; "authentication");
-        if !http::is_header(header_str, http::HEADER_X_API_KEY) {
-            return Err(AuthenticationError);
+
+        // Check X-API-Key header
+        if http::is_header(header_str, http::HEADER_X_API_KEY) {
+            return self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..]);
         }
-        self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..])
+
+        // Check Authorization: Bearer header
+        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
+            let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
+            if let Some(token) = value.strip_prefix("Bearer ") {
+                return self.authenticate_key(token.trim());
+            }
+        }
+
+        Err(AuthenticationError)
     }
 
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError> {
@@ -843,6 +885,64 @@ impl Provider for AnthropicProvider {
             }
         } else {
             None
+        }
+    }
+
+    fn auth_header_keys(&self) -> Vec<&'static str> {
+        vec![http::HEADER_X_API_KEY, http::HEADER_AUTHORIZATION]
+    }
+
+    fn authenticate_with_type(
+        &self,
+        header: Option<&[u8]>,
+    ) -> Result<Option<&'static str>, AuthenticationError> {
+        if !self.has_auth_keys() {
+            return Ok(None);
+        }
+        let Some(header) = header else {
+            return Err(AuthenticationError);
+        };
+        let Ok(header_str) = std::str::from_utf8(header) else {
+            #[cfg(debug_assertions)]
+            log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
+            return Err(AuthenticationError);
+        };
+
+        // Check X-API-Key
+        if http::is_header(header_str, http::HEADER_X_API_KEY) {
+            self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..])?;
+            return Ok(Some("x-api-key"));
+        }
+
+        // Check Authorization: Bearer
+        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
+            let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
+            if let Some(token) = value.strip_prefix("Bearer ") {
+                self.authenticate_key(token.trim())?;
+                return Ok(Some("bearer"));
+            }
+        }
+
+        Err(AuthenticationError)
+    }
+
+    fn get_upstream_auth_header(
+        &self,
+        incoming_auth_type: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        // Highest priority: OAuth command
+        if self.uses_dynamic_auth() {
+            return self.get_dynamic_auth_header().map(Some);
+        }
+
+        // Follow incoming auth type
+        match incoming_auth_type {
+            Some("bearer") => Ok(Some(format!(
+                "{}Bearer {}\r\n",
+                http::HEADER_AUTHORIZATION,
+                self.api_key
+            ))),
+            _ => Ok(self.auth_header.clone()),
         }
     }
 
@@ -1274,11 +1374,155 @@ mod tests {
         let valid_header = "X-API-Key: client-key";
         assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
 
-        // Test invalid header key
-        let wrong_header = "Authorization: Bearer client-key";
+        // Test invalid header key (now Authorization Bearer is also valid)
+        let bearer_header = "Authorization: Bearer client-key";
         assert!(provider
-            .authenticate(Some(wrong_header.as_bytes()))
+            .authenticate(Some(bearer_header.as_bytes()))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_anthropic_authenticate_with_type_x_api_key() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("anthropic-api-key"),
+            auth_keys,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Test with X-API-Key header
+        let header = "X-API-Key: valid-key";
+        let result = provider.authenticate_with_type(Some(header.as_bytes()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("x-api-key"));
+
+        // Test with invalid key
+        let invalid_header = "X-API-Key: invalid-key";
+        assert!(provider
+            .authenticate_with_type(Some(invalid_header.as_bytes()))
             .is_err());
+    }
+
+    #[test]
+    fn test_anthropic_authenticate_with_type_bearer() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("anthropic-api-key"),
+            auth_keys,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Test with Authorization: Bearer header
+        let header = "Authorization: Bearer valid-key";
+        let result = provider.authenticate_with_type(Some(header.as_bytes()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("bearer"));
+
+        // Test with invalid key
+        let invalid_header = "Authorization: Bearer invalid-key";
+        assert!(provider
+            .authenticate_with_type(Some(invalid_header.as_bytes()))
+            .is_err());
+    }
+
+    #[test]
+    fn test_anthropic_auth_header_keys() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("anthropic-api-key"),
+            auth_keys,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let keys = provider.auth_header_keys();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&http::HEADER_X_API_KEY));
+        assert!(keys.contains(&http::HEADER_AUTHORIZATION));
+    }
+
+    #[test]
+    fn test_anthropic_get_upstream_auth_header_follows_incoming() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("upstream-api-key"),
+            auth_keys,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Test with incoming X-API-Key -> upstream X-API-Key
+        let result = provider.get_upstream_auth_header(Some("x-api-key"));
+        assert!(result.is_ok());
+        let header = result.unwrap().unwrap();
+        assert!(header.contains("X-API-Key: "));
+        assert!(header.contains("upstream-api-key"));
+
+        // Test with incoming Bearer -> upstream Bearer
+        let result = provider.get_upstream_auth_header(Some("bearer"));
+        assert!(result.is_ok());
+        let header = result.unwrap().unwrap();
+        assert!(header.contains("Authorization: "));
+        assert!(header.contains("Bearer upstream-api-key"));
+
+        // Test with no incoming auth type -> defaults to X-API-Key
+        let result = provider.get_upstream_auth_header(None);
+        assert!(result.is_ok());
+        let header = result.unwrap().unwrap();
+        assert!(header.contains("X-API-Key: "));
+    }
+
+    #[test]
+    fn test_anthropic_oauth_takes_priority_over_incoming_auth_type() {
+        let auth_keys = Arc::new(vec![]);
+        // Create OAuth mode provider
+        let provider = AnthropicProvider::new(
+            "api.anthropic.com",
+            "api.anthropic.com",
+            None,
+            true,
+            1.0,
+            Some("$(echo oauth-token)"),
+            auth_keys,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(provider.uses_dynamic_auth());
+
+        // Even with incoming X-API-Key, OAuth should use Authorization: Bearer
+        let result = provider.get_upstream_auth_header(Some("x-api-key"));
+        assert!(result.is_ok());
+        let header = result.unwrap().unwrap();
+        assert!(header.contains("Authorization: "));
+        assert!(header.contains("Bearer oauth-token"));
     }
 
     #[test]
