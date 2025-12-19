@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use clap::{Parser, Subcommand};
 use signal_hook::consts::signal;
@@ -26,6 +27,7 @@ ROUTING:
 SIGNALS:
   SIGTERM/SIGINT  Graceful shutdown
   SIGHUP          Reload configuration without restart
+  SIGUSR2         Hot upgrade (spawn new process and graceful shutdown)
 
 For more information, visit: https://github.com/x5iu/openproxy";
 
@@ -114,12 +116,37 @@ async fn start(
     openproxy::serve(enable_health_check)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-    let mut signals =
-        SignalsInfo::<SignalOnly>::new([signal::SIGTERM, signal::SIGINT, signal::SIGHUP])?;
+    let mut signals = SignalsInfo::<SignalOnly>::new([
+        signal::SIGTERM,
+        signal::SIGINT,
+        signal::SIGHUP,
+        signal::SIGUSR2,
+    ])?;
     for signal in &mut signals {
         match signal {
             signal::SIGTERM | signal::SIGINT => break,
             signal::SIGHUP => openproxy::force_update_config(&config).await?,
+            signal::SIGUSR2 => {
+                const VERSION: &str = env!("CARGO_PKG_VERSION");
+                log::info!(version = VERSION; "hot_upgrade_start");
+                // Spawn new process with the same arguments
+                let exe = std::env::current_exe()?;
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                match ProcessCommand::new(&exe).args(&args).spawn() {
+                    Ok(child) => {
+                        log::info!(pid = child.id(); "hot_upgrade_new_process_spawned");
+                        // Give new process time to start and bind to port
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        // Graceful shutdown: stop accepting new connections
+                        openproxy::graceful_shutdown().await;
+                        log::info!(version = VERSION; "hot_upgrade_complete");
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!(version = VERSION, error = e.to_string(); "hot_upgrade_spawn_failed");
+                    }
+                }
+            }
             _ => (),
         }
     }

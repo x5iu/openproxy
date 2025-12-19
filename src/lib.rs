@@ -61,12 +61,25 @@ pub async fn force_update_config(path: impl AsRef<Path>) -> Result<(), Box<dyn s
     load_config(path, false).await
 }
 
+/// Gracefully shutdown the server by sending shutdown signal to all connections.
+/// Existing connections will be allowed to complete before the process exits.
+pub async fn graceful_shutdown() {
+    let p = program();
+    let guard = p.read().await;
+    let _ = guard.shutdown_tx.send(());
+    let timeout = guard.graceful_shutdown_timeout;
+    log::info!(timeout = timeout; "graceful_shutdown_signal_sent");
+    drop(guard);
+    tokio::time::sleep(tokio::time::Duration::from_secs(timeout)).await;
+}
+
 struct Program {
     tls_server_config: Option<Arc<rustls::ServerConfig>>,
     https_port: Option<u16>,
     http_port: Option<u16>,
     providers: Arc<Vec<Box<dyn Provider>>>,
     health_check_interval: u64,
+    graceful_shutdown_timeout: u64,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -168,6 +181,7 @@ impl Program {
             http_port,
             providers: Arc::new(providers),
             health_check_interval: config.health_check_interval.unwrap_or(60),
+            graceful_shutdown_timeout: config.graceful_shutdown_timeout.unwrap_or(5),
             shutdown_tx,
         })
     }
@@ -226,6 +240,8 @@ struct Config<'a> {
     #[serde(skip_serializing)]
     auth_keys: Option<Vec<String>>,
     health_check_interval: Option<u64>,
+    /// Graceful shutdown timeout in seconds (default: 5)
+    graceful_shutdown_timeout: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -364,8 +380,35 @@ pub enum Error {
 }
 
 use executor::{Executor, Pool};
+use socket2::{Domain, Socket, Type};
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use worker::{Conn, Worker};
+
+/// Create a TCP listener with SO_REUSEPORT enabled for hot upgrade support
+#[cfg(unix)]
+fn create_reuse_port_listener(port: u16) -> Result<std::net::TcpListener, Error> {
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+/// Create a TCP listener for non-Unix platforms (without SO_REUSEPORT)
+#[cfg(not(unix))]
+fn create_reuse_port_listener(port: u16) -> Result<std::net::TcpListener, Error> {
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
 
 /// Start the proxy server with the configured listeners
 ///
@@ -393,7 +436,8 @@ pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     // Start HTTPS listener if configured
     if let Some(port) = https_port {
         let executor = Arc::clone(&executor);
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let std_listener = create_reuse_port_listener(port)?;
+        let listener = TcpListener::from_std(std_listener)?;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -416,7 +460,8 @@ pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     // Start HTTP listener if configured (HTTP/1.1 only)
     if let Some(port) = http_port {
         let executor = Arc::clone(&executor);
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let std_listener = create_reuse_port_listener(port)?;
+        let listener = TcpListener::from_std(std_listener)?;
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
