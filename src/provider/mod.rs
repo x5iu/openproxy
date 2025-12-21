@@ -791,11 +791,13 @@ impl Provider for AnthropicProvider {
             return self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..]);
         }
 
-        // Check Authorization: Bearer header
+        // Check Authorization: Bearer header (case-insensitive prefix matching for "Bearer ")
         if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
             let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                return self.authenticate_key(token.trim());
+            // RFC 7235 specifies that auth-scheme is case-insensitive
+            if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
+                let token = value[7..].trim();
+                return self.authenticate_key(token);
             }
         }
 
@@ -914,11 +916,13 @@ impl Provider for AnthropicProvider {
             return Ok(Some("x-api-key"));
         }
 
-        // Check Authorization: Bearer
+        // Check Authorization: Bearer (case-insensitive prefix matching for "Bearer ")
         if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
             let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
-            if let Some(token) = value.strip_prefix("Bearer ") {
-                self.authenticate_key(token.trim())?;
+            // RFC 7235 specifies that auth-scheme is case-insensitive
+            if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
+                let token = value[7..].trim();
+                self.authenticate_key(token)?;
                 return Ok(Some("bearer"));
             }
         }
