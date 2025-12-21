@@ -414,8 +414,8 @@ jobs:
 
           echo "Gemini HTTP/1.1 test passed!"
 
-      - name: Install PyYAML for Anthropic OAuth tests
-        run: pip install pyyaml
+      - name: Install PyYAML and anthropic for Anthropic tests
+        run: pip install pyyaml anthropic
 
       - name: Run Anthropic OAuth E2E tests
         run: |
@@ -423,6 +423,21 @@ jobs:
           cd e2e
           python test_anthropic_oauth.py
           echo "Anthropic OAuth E2E tests passed!"
+
+      - name: Run Anthropic API E2E tests
+        env:
+          ANTHROPIC_HOST: ${{ secrets.ANTHROPIC_HOST }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Skip if secrets are not set
+          if [ -z "$ANTHROPIC_HOST" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_HOST or ANTHROPIC_API_KEY secret is not set, skipping Anthropic API tests"
+            exit 0
+          fi
+          echo "Testing Anthropic API with multiple auth methods..."
+          cd e2e
+          python test_anthropic_api.py
+          echo "Anthropic API E2E tests passed!"
 
       - name: Run Hot Upgrade E2E tests
         env:
