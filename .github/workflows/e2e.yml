@@ -429,10 +429,14 @@ jobs:
           ANTHROPIC_HOST: ${{ secrets.ANTHROPIC_HOST }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Skip if secrets are not set
-          if [ -z "$ANTHROPIC_HOST" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::warning::ANTHROPIC_HOST or ANTHROPIC_API_KEY secret is not set, skipping Anthropic API tests"
-            exit 0
+          # Check required secrets
+          if [ -z "$ANTHROPIC_HOST" ]; then
+            echo "::error::ANTHROPIC_HOST secret is not set"
+            exit 1
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set"
+            exit 1
           fi
           echo "Testing Anthropic API with multiple auth methods..."
           cd e2e
