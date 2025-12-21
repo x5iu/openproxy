@@ -65,6 +65,8 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_HOST: ${{ secrets.GEMINI_HOST }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_HOST: ${{ secrets.ANTHROPIC_HOST }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           # Check required secrets
           if [ -z "$OPENAI_HOST" ]; then
@@ -83,6 +85,14 @@ jobs:
             echo "::error::GEMINI_API_KEY secret is not set"
             exit 1
           fi
+          if [ -z "$ANTHROPIC_HOST" ]; then
+            echo "::error::ANTHROPIC_HOST secret is not set"
+            exit 1
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not set"
+            exit 1
+          fi
           AUTH_KEY=$(openssl rand -hex 32)
           echo "AUTH_KEY=${AUTH_KEY}" >> $GITHUB_ENV
 
@@ -97,6 +107,12 @@ jobs:
           GEMINI_ENDPOINT="${GEMINI_ENDPOINT#http://}"
           GEMINI_ENDPOINT="${GEMINI_ENDPOINT%/}"
           echo "Using Gemini endpoint: ${GEMINI_ENDPOINT}"
+
+          # Process Anthropic config
+          ANTHROPIC_ENDPOINT="${ANTHROPIC_HOST#https://}"
+          ANTHROPIC_ENDPOINT="${ANTHROPIC_ENDPOINT#http://}"
+          ANTHROPIC_ENDPOINT="${ANTHROPIC_ENDPOINT%/}"
+          echo "Using Anthropic endpoint: ${ANTHROPIC_ENDPOINT}"
 
           # Build config file
           cat > config.yml << YAML
@@ -155,6 +171,15 @@ jobs:
               host: gemini.localhost:8080
               endpoint: ${GEMINI_ENDPOINT}
               api_key: ${GEMINI_API_KEY}
+            # Anthropic providers
+            - type: anthropic
+              host: anthropic.localhost:8443
+              endpoint: ${ANTHROPIC_ENDPOINT}
+              api_key: ${ANTHROPIC_API_KEY}
+            - type: anthropic
+              host: anthropic.localhost:8080
+              endpoint: ${ANTHROPIC_ENDPOINT}
+              api_key: ${ANTHROPIC_API_KEY}
           YAML
 
           cat config.yml
@@ -426,18 +451,13 @@ jobs:
 
       - name: Run Anthropic API E2E tests
         env:
-          ANTHROPIC_HOST: ${{ secrets.ANTHROPIC_HOST }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROXY_HTTPS_URL: https://localhost:8443
+          PROXY_HTTP_URL: http://localhost:8080
+          ANTHROPIC_HOST: anthropic.localhost
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+          REQUESTS_CA_BUNDLE: ${{ github.workspace }}/fullchain.pem
         run: |
-          # Check required secrets
-          if [ -z "$ANTHROPIC_HOST" ]; then
-            echo "::error::ANTHROPIC_HOST secret is not set"
-            exit 1
-          fi
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::error::ANTHROPIC_API_KEY secret is not set"
-            exit 1
-          fi
           echo "Testing Anthropic API with multiple auth methods..."
           cd e2e
           python test_anthropic_api.py
