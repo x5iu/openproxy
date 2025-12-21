@@ -102,7 +102,7 @@ def test_anthropic_messages_bearer_http1():
     ) as client:
         print("Sending request with Authorization: Bearer header...")
         response = client.post(
-            "/v1/messages",
+            "/v1/chat/completions",
             headers={
                 "Host": f"{anthropic_host}:8080",
                 "Content-Type": "application/json",
@@ -206,7 +206,7 @@ def test_anthropic_messages_bearer_http2():
     ) as client:
         print("Sending request via HTTP/2 with Authorization: Bearer...")
         response = client.post(
-            "/v1/messages",
+            "/v1/chat/completions",
             headers={
                 "Host": f"{anthropic_host}:8443",
                 "Content-Type": "application/json",
