@@ -83,7 +83,7 @@ def test_anthropic_messages_x_api_key_http1():
     print("\u2713 Anthropic Messages API (HTTP/1.1 + X-API-Key) test passed!")
 
 
-def test_anthropic_messages_bearer_http1():
+def test_anthropic_chat_completions_bearer_http1():
     """
     Test Anthropic Messages API via HTTP/1.1 with Authorization: Bearer authentication.
     """
@@ -188,7 +188,7 @@ def test_anthropic_messages_x_api_key_http2():
     print("\u2713 Anthropic Messages API (HTTP/2 + X-API-Key) test passed!")
 
 
-def test_anthropic_messages_bearer_http2():
+def test_anthropic_chat_completions_bearer_http2():
     """
     Test Anthropic Messages API via HTTP/2 with Authorization: Bearer authentication.
     """
