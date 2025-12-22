@@ -189,6 +189,7 @@ async fn start(
 /// 1. Deleting the old binary
 /// 2. Downloading/copying a new binary to the same path
 /// 3. Sending SIGUSR2 to trigger the hot upgrade
+#[cfg(target_os = "linux")]
 fn resolve_exe_path(exe: PathBuf) -> PathBuf {
     let path_str = exe.to_string_lossy();
     if path_str.ends_with(" (deleted)") {
@@ -196,4 +197,10 @@ fn resolve_exe_path(exe: PathBuf) -> PathBuf {
     } else {
         exe
     }
+}
+
+/// On non-Linux platforms, return the path unchanged.
+#[cfg(not(target_os = "linux"))]
+fn resolve_exe_path(exe: PathBuf) -> PathBuf {
+    exe
 }
