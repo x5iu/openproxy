@@ -151,7 +151,12 @@ async fn start(
                 const VERSION: &str = env!("CARGO_PKG_VERSION");
                 log::info!(version = VERSION; "hot_upgrade_start");
                 // Spawn new process with the same arguments
+                // On Linux, if the executable is deleted while running, /proc/self/exe
+                // (which current_exe() reads) will return a path with " (deleted)" suffix.
+                // We need to strip this suffix and use the original path, which may now
+                // contain a new version of the binary.
                 let exe = std::env::current_exe()?;
+                let exe = resolve_exe_path(exe);
                 let args: Vec<String> = std::env::args().skip(1).collect();
                 match ProcessCommand::new(&exe).args(&args).spawn() {
                     Ok(child) => {
@@ -173,4 +178,22 @@ async fn start(
     }
     log::info!("exit_openproxy");
     Ok(())
+}
+
+/// Resolve the executable path, handling the Linux-specific " (deleted)" suffix.
+///
+/// On Linux, when a running executable is deleted, `/proc/self/exe` (which
+/// `std::env::current_exe()` reads) returns the original path with " (deleted)"
+/// appended. This function strips that suffix to get the actual path, allowing
+/// hot upgrades to work even when the binary is replaced by:
+/// 1. Deleting the old binary
+/// 2. Downloading/copying a new binary to the same path
+/// 3. Sending SIGUSR2 to trigger the hot upgrade
+fn resolve_exe_path(exe: PathBuf) -> PathBuf {
+    let path_str = exe.to_string_lossy();
+    if path_str.ends_with(" (deleted)") {
+        PathBuf::from(path_str.trim_end_matches(" (deleted)"))
+    } else {
+        exe
+    }
 }
