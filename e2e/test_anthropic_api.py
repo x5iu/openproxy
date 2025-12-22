@@ -328,9 +328,9 @@ def test_openai_compatible_http2():
 if __name__ == "__main__":
     # Run all tests
     test_anthropic_messages_x_api_key_http1()
-    test_anthropic_messages_bearer_http1()
+    test_anthropic_chat_completions_bearer_http1()
     test_anthropic_messages_x_api_key_http2()
-    test_anthropic_messages_bearer_http2()
+    test_anthropic_chat_completions_bearer_http2()
     test_openai_compatible_http1()
     test_openai_compatible_http2()
 
