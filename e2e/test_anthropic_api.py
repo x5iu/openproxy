@@ -285,23 +285,27 @@ def test_openai_compatible_http1():
 def test_openai_compatible_http2():
     """
     Test Anthropic's OpenAI-compatible API via HTTP/2 with openai SDK.
+    HTTP/2 requires TLS with ALPN negotiation, so we must use HTTPS.
     """
     print(f"\n{'=' * 60}")
     print("Testing OpenAI-compatible API (HTTP/2)")
     print("=" * 60)
 
-    proxy_http_url = get_env_or_fail("PROXY_HTTP_URL")
+    proxy_https_url = get_env_or_fail("PROXY_HTTPS_URL")
     anthropic_host = get_env_or_fail("ANTHROPIC_HOST")
     auth_key = get_env_or_fail("OPENAI_API_KEY")
+    ssl_cert = os.environ.get("SSL_CERT_FILE")
 
-    # Use openai SDK
+    # Use openai SDK with HTTP/2 over HTTPS
     import openai
 
     client = openai.OpenAI(
         api_key=auth_key,
-        base_url=f"{proxy_http_url}/v1",
-        default_headers={"Host": f"{anthropic_host}:8080"},
-        http_client=httpx.Client(http1=False, http2=True),
+        base_url=f"{proxy_https_url}/v1",
+        default_headers={"Host": f"{anthropic_host}:8443"},
+        http_client=httpx.Client(
+            http1=False, http2=True, verify=ssl_cert if ssl_cert else True
+        ),
     )
 
     print("Sending request via openai SDK (Chat Completions)...")
