@@ -163,6 +163,9 @@ providers:
 
 # With health checks enabled
 ./openproxy start -c config.yml --enable-health-check
+
+# With PID file (useful for systemd integration)
+./openproxy start -c config.yml -p /var/run/openproxy.pid
 ```
 
 ### HTTP-only Mode (No TLS)
@@ -252,6 +255,59 @@ ws.close()
 
 - **SIGTERM/SIGINT**: Graceful shutdown
 - **SIGHUP**: Reload configuration without restart
+- **SIGUSR2**: Hot upgrade (spawn new process with same arguments, then graceful shutdown)
+
+### Hot Upgrade
+
+The hot upgrade feature allows zero-downtime binary upgrades. When SIGUSR2 is received, the proxy:
+1. Spawns a new process with the same arguments
+2. Waits for the new process to start and bind to the port
+3. Gracefully shuts down the old process
+
+```bash
+# Trigger hot upgrade
+kill -USR2 $(cat /var/run/openproxy.pid)
+```
+
+## Systemd Integration
+
+For production deployments, you can use systemd to manage the proxy. The `--pid-file` option enables proper process tracking during hot upgrades.
+
+Create `/etc/systemd/system/openproxy.service`:
+
+```ini
+[Unit]
+Description=OpenProxy - High-Performance LLM Proxy Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openproxy start -c /etc/openproxy/config.yml -p /var/run/openproxy.pid --enable-health-check
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=/var/run/openproxy.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Manage the service:
+
+```bash
+# Enable and start
+sudo systemctl enable openproxy
+sudo systemctl start openproxy
+
+# Reload configuration (SIGHUP)
+sudo systemctl reload openproxy
+
+# Hot upgrade (after replacing the binary)
+sudo kill -USR2 $(cat /var/run/openproxy.pid)
+
+# Check status
+sudo systemctl status openproxy
+```
 
 ## Development
 
