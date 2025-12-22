@@ -51,12 +51,16 @@ jobs:
         if: steps.check_version.outputs.should_release == 'true'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Linux amd64 binary
+      - name: Install cross
+        if: steps.check_version.outputs.should_release == 'true'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build Linux amd64 binary (static linking with musl)
         if: steps.check_version.outputs.should_release == 'true'
         run: |
-          cargo build --release
+          cross build --release --target x86_64-unknown-linux-musl
           mkdir -p dist
-          cp target/release/openproxy dist/openproxy-linux-amd64
+          cp target/x86_64-unknown-linux-musl/release/openproxy dist/openproxy-linux-amd64
           cd dist && tar -czvf openproxy-linux-amd64.tar.gz openproxy-linux-amd64
 
       - name: Setup Node.js
