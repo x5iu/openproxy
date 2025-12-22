@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
@@ -56,6 +57,7 @@ At least one port must be configured. Both can be enabled simultaneously.
 EXAMPLES:
   openproxy start -c config.yml
   openproxy start -c config.yml --enable-health-check
+  openproxy start -c config.yml -p /var/run/openproxy.pid
 
 NOTE: HTTP or HTTPS mode is determined by the config file, not command-line args.
   • Set 'https_port' in config for HTTPS (requires cert_file and private_key_file)
@@ -92,6 +94,16 @@ enum Command {
         /// the config file (default: 60 seconds).
         #[arg(long = "enable-health-check")]
         enable_health_check: bool,
+
+        /// Path to write the PID file
+        ///
+        /// When specified, the process ID is written to this file on startup.
+        /// This is useful for systemd integration with hot upgrades (SIGUSR2),
+        /// as systemd can track the new process PID through the PIDFile option.
+        /// The PID file is automatically updated when a new process is spawned
+        /// during hot upgrade.
+        #[arg(short, long, value_name = "FILE")]
+        pid_file: Option<PathBuf>,
     },
 }
 
@@ -101,9 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Command::Start {
         config,
         enable_health_check,
+        pid_file,
     }) = openproxy.command
     {
-        start(config, enable_health_check).await?
+        start(config, enable_health_check, pid_file).await?
     }
     Ok(())
 }
@@ -111,7 +124,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn start(
     config: PathBuf,
     enable_health_check: bool,
+    pid_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Write PID file if specified
+    if let Some(ref pid_path) = pid_file {
+        let pid = std::process::id();
+        fs::write(pid_path, pid.to_string())?;
+        log::info!(pid = pid, pid_file = pid_path.display().to_string(); "pid_file_written");
+    }
+
     openproxy::load_config(&config, true).await?;
     openproxy::serve(enable_health_check)
         .await
