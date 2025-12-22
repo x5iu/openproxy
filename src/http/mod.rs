@@ -83,6 +83,10 @@ impl<'a> Request<'a> {
         self.payload.auth_key()
     }
 
+    pub fn set_incoming_auth_type(&mut self, auth_type: Option<&'static str>) {
+        self.payload.set_incoming_auth_type(auth_type);
+    }
+
     pub fn is_websocket_upgrade(&self) -> bool {
         self.payload.is_websocket_upgrade
     }
@@ -145,6 +149,8 @@ pub(crate) struct Payload<'a> {
     path_range: Range<usize>,
     host_range: Option<Range<usize>>,
     auth_range: Option<Range<usize>>,
+    /// The auth type used in incoming request (e.g., "x-api-key" or "bearer")
+    incoming_auth_type: Option<&'static str>,
     pub(crate) body: Body<'a>,
     state: ReadState,
     /// Ranges of header chunks to output (gaps between filtered headers)
@@ -316,7 +322,11 @@ impl<'a> Payload<'a> {
                 // corresponding Authorization information from the Headers. If there is no
                 // Authorization information in the Headers, we will then try to match the key
                 // information from the Query.
-                if let Some(auth_header_key) = provider.auth_header_key() {
+                //
+                // For providers supporting multiple auth headers (e.g., Anthropic supports both
+                // X-API-Key and Authorization: Bearer), we iterate through all supported keys.
+                let auth_header_keys = provider.auth_header_keys();
+                'auth_search: for auth_header_key in &auth_header_keys {
                     let header_lines = HeaderLines::new(&crlfs, header);
                     for line in header_lines.skip(1) {
                         let Ok(header) = std::str::from_utf8(line) else {
@@ -330,6 +340,29 @@ impl<'a> Payload<'a> {
                             };
                             filtered_headers.push(start..start + line.len());
                             auth_range = Some(start..start + line.len());
+                            break 'auth_search;
+                        }
+                    }
+                }
+                // Also filter out any other auth headers that weren't matched
+                // (e.g., if client sent X-API-Key, we should also filter Authorization if present)
+                for auth_header_key in &auth_header_keys {
+                    let header_lines = HeaderLines::new(&crlfs, header);
+                    for line in header_lines.skip(1) {
+                        let Ok(header) = std::str::from_utf8(line) else {
+                            continue;
+                        };
+                        if is_header(header, auth_header_key) {
+                            let start = {
+                                let block_start = &block[0] as *const u8 as usize;
+                                let auth_start = &line[0] as *const u8 as usize;
+                                auth_start - block_start
+                            };
+                            let range = start..start + line.len();
+                            // Only add if not already in filtered_headers
+                            if !filtered_headers.contains(&range) {
+                                filtered_headers.push(range);
+                            }
                         }
                     }
                 }
@@ -432,6 +465,7 @@ impl<'a> Payload<'a> {
             path_range,
             host_range,
             auth_range,
+            incoming_auth_type: None, // Will be set after authenticate_with_type is called
             body,
             state: ReadState::Start,
             header_chunks: split_header_chunks(filtered_headers, header_length),
@@ -472,6 +506,10 @@ impl<'a> Payload<'a> {
         } else {
             None
         }
+    }
+
+    pub(crate) fn set_incoming_auth_type(&mut self, auth_type: Option<&'static str>) {
+        self.incoming_auth_type = auth_type;
     }
 
     pub(crate) fn block(&self) -> &[u8] {
@@ -541,19 +579,16 @@ impl<'a> Payload<'a> {
 
                     let mut result = Vec::new();
 
-                    // Get auth header (either static or dynamic)
-                    if provider.uses_dynamic_auth() {
-                        match provider.get_dynamic_auth_header() {
-                            Ok(auth_header) => {
-                                result.extend_from_slice(auth_header.as_bytes());
-                            }
-                            Err(e) => {
-                                log::error!(error = e.to_string(); "failed_to_get_dynamic_auth_header");
-                                return Err(Error::DynamicAuthFailed);
-                            }
+                    // Get auth header based on incoming auth type
+                    match provider.get_upstream_auth_header(self.incoming_auth_type) {
+                        Ok(Some(auth_header)) => {
+                            result.extend_from_slice(auth_header.as_bytes());
                         }
-                    } else if let Some(auth_header) = provider.auth_header() {
-                        result.extend_from_slice(auth_header.as_bytes());
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
+                            return Err(Error::DynamicAuthFailed);
+                        }
                     }
 
                     // Transform extra headers (e.g., add anthropic-beta for OAuth)

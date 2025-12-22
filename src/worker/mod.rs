@@ -146,29 +146,34 @@ where
                     Err(e) => return Err(ProxyError::Client(e)),
                 };
                 let p = crate::program();
-                let Some(host) = request.host() else {
+                let Some(host) = request.host().map(|h| h.to_string()) else {
                     is_bad_request = true;
                     err_msg = Some("missing Host header".into());
                     break;
                 };
                 let p = p.read().await;
-                let Some(provider) = p.select_provider(host, request.path()) else {
+                let Some(provider) = p.select_provider(&host, request.path()) else {
                     is_not_found = true;
                     err_msg = Some(Error::NoProviderFound.to_string().into());
                     break;
                 };
-                if provider.authenticate(request.auth_key()).is_err() {
-                    #[cfg(debug_assertions)]
-                    log::error!(provider = provider.kind().to_string(), header:serde = request.auth_key().map(|header| header.to_vec()); "authentication_failed");
-                    is_invalid_key = true;
-                    err_msg = Some("authentication failed".into());
-                    break;
+                match provider.authenticate_with_type(request.auth_key()) {
+                    Ok(auth_type) => {
+                        request.set_incoming_auth_type(auth_type);
+                    }
+                    Err(_) => {
+                        #[cfg(debug_assertions)]
+                        log::error!(provider = provider.kind().to_string(), header:serde = request.auth_key().map(|header| header.to_vec()); "authentication_failed");
+                        is_invalid_key = true;
+                        err_msg = Some("authentication failed".into());
+                        break;
+                    }
                 }
 
                 // Check if this is a WebSocket upgrade request
                 if request.is_websocket_upgrade() {
                     #[cfg(debug_assertions)]
-                    log::info!(host = host, path = request.path(); "websocket_upgrade_request");
+                    log::info!(host = &host, path = request.path(); "websocket_upgrade_request");
 
                     // Extract WebSocket upgrade info before dropping request and p
                     let raw_headers = request.header_bytes().to_vec();
@@ -347,27 +352,47 @@ where
                     else {
                         return invalid!(respond, 404, Error::NoProviderFound.to_string());
                     };
+                    // Authentication: find auth header and authenticate
+                    let mut incoming_auth_type: Option<&'static str> = None;
                     if provider.has_auth_keys() {
-                        let mut auth_key = None;
-                        if let Some(auth_header_key) = provider.auth_header_key() {
-                            auth_key = request
-                                .headers()
-                                .get(auth_header_key.trim_end_matches([' ', ':']))
-                                .and_then(|v| v.to_str().ok());
-                        }
-                        if auth_key.is_none() {
-                            if let Some(auth_query_key) = provider.auth_query_key() {
-                                auth_key = request.uri().query().and_then(|query| {
-                                    http::get_auth_query_range(query, auth_query_key)
-                                        .map(|range| &query[range])
-                                })
+                        let mut auth_header_bytes: Option<Vec<u8>> = None;
+                        // Try all supported auth header keys
+                        for auth_header_key in provider.auth_header_keys() {
+                            let key_name = auth_header_key.trim_end_matches([' ', ':']);
+                            if let Some(value) = request.headers().get(key_name) {
+                                if let Ok(v) = value.to_str() {
+                                    // Reconstruct the full header line for authenticate_with_type
+                                    let full_header = format!("{}{}", auth_header_key, v);
+                                    auth_header_bytes = Some(full_header.into_bytes());
+                                    break;
+                                }
                             }
                         }
-                        let Some(auth_key) = auth_key else {
+                        // Fallback to query parameter if no header found
+                        if auth_header_bytes.is_none() {
+                            if let Some(auth_query_key) = provider.auth_query_key() {
+                                if let Some(auth_key) = request.uri().query().and_then(|query| {
+                                    http::get_auth_query_range(query, auth_query_key)
+                                        .map(|range| &query[range])
+                                }) {
+                                    // For query auth, use the primary auth header key format
+                                    if let Some(auth_header_key) = provider.auth_header_key() {
+                                        let full_header = format!("{}{}", auth_header_key, auth_key);
+                                        auth_header_bytes = Some(full_header.into_bytes());
+                                    }
+                                }
+                            }
+                        }
+                        let Some(auth_bytes) = auth_header_bytes else {
                             return invalid!(respond, 401, "missing authentication");
                         };
-                        if provider.authenticate_key(auth_key).is_err() {
-                            return invalid!(respond, 401, "authentication failed");
+                        match provider.authenticate_with_type(Some(&auth_bytes)) {
+                            Ok(auth_type) => {
+                                incoming_auth_type = auth_type;
+                            }
+                            Err(_) => {
+                                return invalid!(respond, 401, "authentication failed");
+                            }
                         }
                     }
 
@@ -436,17 +461,13 @@ where
                     }
 
                     // Extract provider info into UpstreamInfo struct
-                    // For dynamic auth, get the auth header now
-                    let auth_header = if provider.uses_dynamic_auth() {
-                        match provider.get_dynamic_auth_header() {
-                            Ok(h) => Some(h),
-                            Err(e) => {
-                                log::error!(error = e.to_string(); "failed_to_get_dynamic_auth_header");
-                                return invalid!(respond, 502, "dynamic authentication failed");
-                            }
+                    // Get auth header based on incoming auth type
+                    let auth_header = match provider.get_upstream_auth_header(incoming_auth_type) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
+                            return invalid!(respond, 502, "upstream authentication failed");
                         }
-                    } else {
-                        provider.auth_header().map(|s| s.to_string())
                     };
 
                     // Get extra headers that need transformation
@@ -485,6 +506,13 @@ where
                         }
                     }
 
+                    // Collect all auth header keys to filter (lowercase, without ": ")
+                    let auth_header_keys: Vec<String> = provider
+                        .auth_header_keys()
+                        .iter()
+                        .map(|k| k.trim_end_matches([' ', ':']).to_lowercase())
+                        .collect();
+
                     let info = UpstreamInfo {
                         endpoint: provider.endpoint().to_string(),
                         sock_address: provider.sock_address().to_string(),
@@ -497,7 +525,7 @@ where
                                 .to_string()
                         },
                         auth_header,
-                        auth_header_key: provider.auth_header_key(),
+                        auth_header_keys,
                         path_prefix: provider.path_prefix().map(|s| s.to_string()),
                         api_key: provider.api_key().map(|s| s.to_string()),
                         auth_query_key: provider.auth_query_key(),
@@ -558,7 +586,8 @@ struct UpstreamInfo {
     use_tls: bool,
     host_header_value: String,
     auth_header: Option<String>,
-    auth_header_key: Option<&'static str>,
+    /// All auth header keys to filter from incoming request (lowercase, without ": ")
+    auth_header_keys: Vec<String>,
     path_prefix: Option<String>,
     api_key: Option<String>,
     auth_query_key: Option<&'static str>,
@@ -647,11 +676,13 @@ impl UpstreamInfo {
                 upstream_request = upstream_request.header("host", self.host_header_value.as_str());
                 continue;
             }
-            // Skip auth header - will be replaced by provider auth
-            if let Some(provider_auth_key) = self.auth_header_key {
-                if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
-                    continue; // Will add auth_header below
-                }
+            // Skip all auth headers - will be replaced by provider auth
+            if self
+                .auth_header_keys
+                .iter()
+                .any(|k| key_str.eq_ignore_ascii_case(k))
+            {
+                continue; // Will add auth_header below
             }
             // Skip extra headers that will be transformed
             let key_lower = key_str.to_lowercase();
@@ -844,7 +875,7 @@ impl UpstreamInfo {
         let req_headers = build_h1_request_headers(
             request.headers().iter(),
             &self.host_header_value,
-            self.auth_header_key,
+            &self.auth_header_keys,
             self.auth_header.as_deref(),
             has_content_length,
             &self.extra_header_keys,
@@ -1785,7 +1816,7 @@ fn build_upstream_path(
 fn build_h1_request_headers<'a, I>(
     headers: I,
     host_header_value: &str,
-    auth_header_key: Option<&str>,
+    auth_header_keys: &[String],
     auth_header: Option<&str>,
     has_content_length: bool,
     extra_header_keys: &[String],
@@ -1798,11 +1829,12 @@ where
 
     for (key, value) in headers {
         let key_str = key.as_str();
-        // Skip auth header - will be replaced by provider auth
-        if let Some(provider_auth_key) = auth_header_key {
-            if key_str.eq_ignore_ascii_case(provider_auth_key.trim_end_matches([' ', ':'])) {
-                continue;
-            }
+        // Skip all auth headers - will be replaced by provider auth
+        if auth_header_keys
+            .iter()
+            .any(|k| key_str.eq_ignore_ascii_case(k))
+        {
+            continue;
         }
         // Replace Host header
         if key_str.eq_ignore_ascii_case("host") {
@@ -2218,10 +2250,11 @@ mod tests {
         );
 
         // Test with auth header replacement and no content-length
+        let auth_keys = vec!["authorization".to_string()];
         let result = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
-            Some("Authorization: "),
+            &auth_keys,
             Some("Authorization: Bearer server_token\r\n"),
             false,
             &[],
@@ -2239,7 +2272,7 @@ mod tests {
         let result_with_cl = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
-            Some("Authorization: "),
+            &auth_keys,
             Some("Authorization: Bearer server_token\r\n"),
             true,
             &[],
@@ -2249,10 +2282,11 @@ mod tests {
         assert!(!result_with_cl.contains("Transfer-Encoding"));
 
         // Test without auth header replacement
+        let no_auth_keys: Vec<String> = vec![];
         let result_no_auth = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
-            None,
+            &no_auth_keys,
             None,
             true,
             &[],
@@ -2285,7 +2319,7 @@ mod tests {
         let result_with_extra = build_h1_request_headers(
             headers_with_extra.iter(),
             "upstream.example.com",
-            None,
+            &no_auth_keys,
             None,
             true,
             &extra_keys,
