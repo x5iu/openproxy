@@ -33,6 +33,7 @@ pub fn new_provider(
     auth_keys: Arc<Vec<String>>,
     provider_auth_keys: Option<Vec<String>>,
     health_check_config: Option<HealthCheckConfig>,
+    is_fallback: bool,
 ) -> Result<Box<dyn Provider>, Box<dyn std::error::Error>> {
     match kind {
         "openai" => Ok(Box::new(OpenAIProvider::new(
@@ -45,6 +46,7 @@ pub fn new_provider(
             auth_keys,
             provider_auth_keys,
             health_check_config,
+            is_fallback,
         )?)),
         "gemini" => Ok(Box::new(GeminiProvider::new(
             host,
@@ -56,6 +58,7 @@ pub fn new_provider(
             auth_keys,
             provider_auth_keys,
             health_check_config,
+            is_fallback,
         )?)),
         "anthropic" => Ok(Box::new(AnthropicProvider::new(
             host,
@@ -67,6 +70,7 @@ pub fn new_provider(
             auth_keys,
             provider_auth_keys,
             health_check_config,
+            is_fallback,
         )?)),
         _ => Err(format!("Unsupported provider type: {:?}", kind).into()),
     }
@@ -103,6 +107,7 @@ pub trait Provider: Send + Sync {
     fn authenticate(&self, auth: Option<&[u8]>) -> Result<(), AuthenticationError>;
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError>;
     fn weight(&self) -> f64;
+    fn is_fallback(&self) -> bool;
 
     /// Returns the path prefix that should be stripped from requests, if any.
     /// For example, if host is "localhost/openai", returns Some("/openai").
@@ -237,6 +242,7 @@ pub struct OpenAIProvider {
     provider_auth_keys: Option<Vec<String>>,
     is_healthy: AtomicBool,
     health_check_config: Option<HealthCheckConfig>,
+    is_fallback: bool,
 }
 
 impl OpenAIProvider {
@@ -251,6 +257,7 @@ impl OpenAIProvider {
         auth_keys: Arc<Vec<String>>,
         provider_auth_keys: Option<Vec<String>>,
         health_check_config: Option<HealthCheckConfig>,
+        is_fallback: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let host: Arc<str> = Arc::from(host);
         let endpoint: Arc<str> = Arc::from(endpoint);
@@ -279,6 +286,7 @@ impl OpenAIProvider {
             provider_auth_keys,
             is_healthy: AtomicBool::new(true),
             health_check_config,
+            is_fallback,
         })
     }
 }
@@ -330,6 +338,10 @@ impl Provider for OpenAIProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.is_fallback
     }
 
     fn authenticate(&self, header: Option<&[u8]>) -> Result<(), AuthenticationError> {
@@ -413,6 +425,7 @@ pub struct GeminiProvider {
     provider_auth_keys: Option<Vec<String>>,
     is_healthy: AtomicBool,
     health_check_config: Option<HealthCheckConfig>,
+    is_fallback: bool,
 }
 
 impl GeminiProvider {
@@ -427,6 +440,7 @@ impl GeminiProvider {
         auth_keys: Arc<Vec<String>>,
         provider_auth_keys: Option<Vec<String>>,
         health_check_config: Option<HealthCheckConfig>,
+        is_fallback: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let Some(api_key) = api_key else {
             return Err("gemini: missing `api_key`".into());
@@ -457,6 +471,7 @@ impl GeminiProvider {
             provider_auth_keys,
             is_healthy: AtomicBool::new(true),
             health_check_config,
+            is_fallback,
         })
     }
 }
@@ -508,6 +523,10 @@ impl Provider for GeminiProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.is_fallback
     }
 
     fn authenticate(&self, key: Option<&[u8]>) -> Result<(), AuthenticationError> {
@@ -613,6 +632,7 @@ pub struct AnthropicProvider {
     provider_auth_keys: Option<Vec<String>>,
     is_healthy: AtomicBool,
     health_check_config: Option<HealthCheckConfig>,
+    is_fallback: bool,
 }
 
 /// Check if the api_key is a command pattern like $(command)
@@ -659,6 +679,7 @@ impl AnthropicProvider {
         auth_keys: Arc<Vec<String>>,
         provider_auth_keys: Option<Vec<String>>,
         health_check_config: Option<HealthCheckConfig>,
+        is_fallback: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let Some(api_key) = api_key else {
             return Err("anthropic: missing `api_key`".into());
@@ -702,6 +723,7 @@ impl AnthropicProvider {
             provider_auth_keys,
             is_healthy: AtomicBool::new(true),
             health_check_config,
+            is_fallback,
         })
     }
 
@@ -769,6 +791,10 @@ impl Provider for AnthropicProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.is_fallback
     }
 
     fn authenticate(&self, header: Option<&[u8]>) -> Result<(), AuthenticationError> {
@@ -1094,6 +1120,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1127,6 +1154,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1148,6 +1176,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1183,6 +1212,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1206,6 +1236,7 @@ mod tests {
             auth_keys,
             provider_auth_keys,
             None,
+            false,
         )
         .unwrap();
 
@@ -1227,6 +1258,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1255,6 +1287,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1283,6 +1316,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         );
 
         assert!(result.is_err());
@@ -1301,6 +1335,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1328,6 +1363,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1353,6 +1389,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         );
 
         assert!(result.is_err());
@@ -1371,6 +1408,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1398,6 +1436,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1427,6 +1466,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1456,6 +1496,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1478,6 +1519,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1516,6 +1558,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1545,6 +1588,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(openai.kind(), Type::OpenAI));
@@ -1561,6 +1605,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(gemini.kind(), Type::Gemini));
@@ -1577,6 +1622,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(anthropic.kind(), Type::Anthropic));
@@ -1593,6 +1639,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         );
         assert!(unsupported.is_err());
     }
@@ -1612,6 +1659,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(provider_tls.sock_address(), "api.openai.com:443");
@@ -1627,6 +1675,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(provider_no_tls.sock_address(), "api.openai.com:80");
@@ -1642,6 +1691,7 @@ mod tests {
             Arc::clone(&auth_keys),
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(provider_custom.sock_address(), "api.openai.com:8443");
@@ -1660,6 +1710,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1682,6 +1733,7 @@ mod tests {
             auth_keys.clone(),
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1704,6 +1756,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1724,6 +1777,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1759,6 +1813,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1782,6 +1837,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1800,6 +1856,7 @@ mod tests {
             Arc::new(vec!["valid-key".to_string()]),
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1863,6 +1920,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1892,6 +1950,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1920,6 +1979,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1975,6 +2035,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -2005,6 +2066,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -2031,6 +2093,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -2058,6 +2121,7 @@ mod tests {
             auth_keys,
             None,
             None,
+            false,
         )
         .unwrap();
 
