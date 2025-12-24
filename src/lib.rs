@@ -153,6 +153,7 @@ impl Program {
                         Arc::clone(&auth_keys),
                         provider.provider_auth_keys.clone(),
                         health_check_config.clone(),
+                        provider.is_fallback,
                     )?);
                 }
             } else {
@@ -171,6 +172,7 @@ impl Program {
                     Arc::clone(&auth_keys),
                     provider.provider_auth_keys.clone(),
                     provider.health_check_config.take(),
+                    provider.is_fallback,
                 )?);
             }
         }
@@ -213,14 +215,26 @@ impl Program {
             })
             .collect();
 
-        match healthy_providers.len() {
+        // Separate non-fallback and fallback providers
+        let (non_fallback, fallback): (Vec<_>, Vec<_>) = healthy_providers
+            .into_iter()
+            .partition(|p| !p.is_fallback());
+
+        // Prefer non-fallback providers; only use fallback if no non-fallback providers exist
+        let candidates = if non_fallback.is_empty() {
+            fallback
+        } else {
+            non_fallback
+        };
+
+        match candidates.len() {
             0 => None,
-            1 => Some(healthy_providers[0]),
+            1 => Some(candidates[0]),
             _ => {
-                let dist = WeightedIndex::new(healthy_providers.iter().map(|p| p.weight()))
+                let dist = WeightedIndex::new(candidates.iter().map(|p| p.weight()))
                     .expect("Failed to create WeightedIndex: invalid weights detected");
                 let selected_idx = rng().sample(&dist);
-                Some(healthy_providers[selected_idx])
+                Some(candidates[selected_idx])
             }
         }
     }
@@ -264,6 +278,9 @@ struct ProviderConfig<'a> {
     provider_auth_keys: Option<Vec<String>>,
     #[serde(rename = "health_check")]
     health_check_config: Option<provider::HealthCheckConfig>,
+    /// If true, this provider is a fallback and will only be used when no other providers are available
+    #[serde(default)]
+    is_fallback: bool,
 }
 
 trait APIKeysTrait<'a> {
@@ -528,5 +545,163 @@ mod tests {
             Error::IO(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused),
             _ => panic!("Expected IO error"),
         }
+    }
+
+    #[test]
+    fn test_fallback_provider_not_selected_when_non_fallback_available() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "api.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-test"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false, // non-fallback
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "fallback.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-fallback"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                true, // fallback
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        // Run multiple times to ensure fallback is never selected
+        for _ in 0..100 {
+            let selected = program.select_provider("api.openai.com", "/v1/chat").unwrap();
+            assert_eq!(
+                selected.endpoint(),
+                "api.openai.com",
+                "Fallback provider should not be selected when non-fallback is available"
+            );
+            assert!(!selected.is_fallback());
+        }
+    }
+
+    #[test]
+    fn test_fallback_provider_selected_when_only_fallbacks_available() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "fallback1.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-fallback1"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                true, // fallback
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "fallback2.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-fallback2"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                true, // fallback
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        let selected = program.select_provider("api.openai.com", "/v1/chat");
+        assert!(selected.is_some(), "Should select a fallback when only fallbacks exist");
+        assert!(selected.unwrap().is_fallback());
+    }
+
+    #[test]
+    fn test_fallback_provider_selected_when_non_fallback_unhealthy() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "api.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-test"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false, // non-fallback
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "fallback.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-fallback"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                true, // fallback
+            )
+            .unwrap(),
+        ];
+
+        // Mark non-fallback as unhealthy
+        providers[0].set_healthy(false);
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        let selected = program.select_provider("api.openai.com", "/v1/chat");
+        assert!(selected.is_some(), "Should select fallback when non-fallback is unhealthy");
+        assert_eq!(selected.unwrap().endpoint(), "fallback.openai.com");
+        assert!(selected.unwrap().is_fallback());
     }
 }
