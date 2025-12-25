@@ -289,60 +289,44 @@ impl Program {
             return Err(provider::AuthenticationError);
         }
 
-        // Separate non-fallback and fallback providers
-        let (non_fallback, fallback): (Vec<_>, Vec<_>) = healthy_providers
+        // First, authenticate all providers and collect those that pass
+        let authenticated_providers: Vec<_> = healthy_providers
             .into_iter()
-            .partition(|p| !p.is_fallback());
-
-        // Try authentication on a list of providers with weighted random order
-        fn try_authenticate<'a, F>(
-            candidates: Vec<&'a dyn Provider>,
-            authenticate: &F,
-        ) -> Option<(&'a dyn Provider, Option<&'static str>)>
-        where
-            F: Fn(&dyn Provider) -> Result<Option<&'static str>, provider::AuthenticationError>,
-        {
-            if candidates.is_empty() {
-                return None;
-            }
-
-            // Create weighted random order for trying providers
-            let mut remaining: Vec<_> = candidates;
-
-            while !remaining.is_empty() {
-                // Select next provider based on weight
-                let selected_idx = if remaining.len() == 1 {
-                    0
-                } else {
-                    let dist = WeightedIndex::new(remaining.iter().map(|p| p.weight()))
-                        .expect("Failed to create WeightedIndex: invalid weights detected");
-                    rng().sample(&dist)
-                };
-
-                let provider = remaining.remove(selected_idx);
-
-                // Try to authenticate with this provider
+            .filter_map(|provider| {
                 match authenticate(provider) {
-                    Ok(auth_type) => return Some((provider, auth_type)),
-                    Err(_) => continue, // Try next provider
+                    Ok(auth_type) => Some((provider, auth_type)),
+                    Err(_) => None,
                 }
+            })
+            .collect();
+
+        if authenticated_providers.is_empty() {
+            return Err(provider::AuthenticationError);
+        }
+
+        // Separate authenticated providers into non-fallback and fallback
+        let (non_fallback, fallback): (Vec<_>, Vec<_>) = authenticated_providers
+            .into_iter()
+            .partition(|(p, _)| !p.is_fallback());
+
+        // Prefer non-fallback providers; only use fallback if no non-fallback providers authenticated
+        let candidates = if non_fallback.is_empty() {
+            fallback
+        } else {
+            non_fallback
+        };
+
+        // Select one provider based on weight
+        match candidates.len() {
+            0 => Err(provider::AuthenticationError),
+            1 => Ok(candidates.into_iter().next().unwrap()),
+            _ => {
+                let dist = WeightedIndex::new(candidates.iter().map(|(p, _)| p.weight()))
+                    .expect("Failed to create WeightedIndex: invalid weights detected");
+                let selected_idx = rng().sample(&dist);
+                Ok(candidates.into_iter().nth(selected_idx).unwrap())
             }
-
-            None
         }
-
-        // First, try non-fallback providers
-        if let Some(result) = try_authenticate(non_fallback, &authenticate) {
-            return Ok(result);
-        }
-
-        // If all non-fallback providers failed, try fallback providers
-        if let Some(result) = try_authenticate(fallback, &authenticate) {
-            return Ok(result);
-        }
-
-        // All providers failed authentication
-        Err(provider::AuthenticationError)
     }
 }
 
