@@ -184,50 +184,50 @@ jobs:
               endpoint: localhost
               port: 9002
               tls: false
-              api_key: dummy-key-1
+              api_key: sk-openproxy-1
               auth_keys:
-                - key-for-provider1
+                - sk-auth-provider1
             - type: openai
               host: auth-test.local:8443
               endpoint: localhost
               port: 9003
               tls: false
-              api_key: dummy-key-2
+              api_key: sk-openproxy-2
               auth_keys:
-                - key-for-provider2
+                - sk-auth-provider2
             - type: openai
               host: auth-test.local:8443
               endpoint: localhost
               port: 9004
               tls: false
-              api_key: dummy-key-fallback
+              api_key: sk-openproxy-fallback
               auth_keys:
-                - key-for-fallback
+                - sk-auth-fallback
               is_fallback: true
             - type: openai
               host: auth-test.local:8080
               endpoint: localhost
               port: 9002
               tls: false
-              api_key: dummy-key-1
+              api_key: sk-openproxy-1
               auth_keys:
-                - key-for-provider1
+                - sk-auth-provider1
             - type: openai
               host: auth-test.local:8080
               endpoint: localhost
               port: 9003
               tls: false
-              api_key: dummy-key-2
+              api_key: sk-openproxy-2
               auth_keys:
-                - key-for-provider2
+                - sk-auth-provider2
             - type: openai
               host: auth-test.local:8080
               endpoint: localhost
               port: 9004
               tls: false
-              api_key: dummy-key-fallback
+              api_key: sk-openproxy-fallback
               auth_keys:
-                - key-for-fallback
+                - sk-auth-fallback
               is_fallback: true
           YAML
 
