@@ -238,6 +238,112 @@ impl Program {
             }
         }
     }
+
+    /// Select a provider with authentication during selection.
+    /// This method tries to authenticate with each matching provider and returns
+    /// the first one that authenticates successfully.
+    ///
+    /// The authentication order is:
+    /// 1. Try all non-fallback providers first (with weighted random selection)
+    /// 2. If all non-fallback providers fail authentication, try fallback providers
+    /// 3. If all providers fail authentication, return None
+    ///
+    /// Returns a tuple of (provider, auth_type) where auth_type is the type returned
+    /// by authenticate_with_type (e.g., "x-api-key" or "bearer").
+    pub fn select_provider_with_auth<F>(
+        &self,
+        host: &str,
+        path: &str,
+        authenticate: F,
+    ) -> Result<(&dyn Provider, Option<&'static str>), provider::AuthenticationError>
+    where
+        F: Fn(&dyn Provider) -> Result<Option<&'static str>, provider::AuthenticationError>,
+    {
+        // Strip port from incoming host for comparison
+        let host_without_port = http::strip_port(host);
+        let healthy_providers: Vec<&dyn Provider> = self
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                if !provider.is_healthy() {
+                    return None;
+                }
+                let (provider_host, provider_path_prefix) = http::split_host_path(provider.host());
+                // Strip port from provider host for comparison
+                let provider_host_without_port = http::strip_port(provider_host);
+                let selected = if let Some(provider_path_prefix) = provider_path_prefix {
+                    (provider_host == host || provider_host_without_port == host_without_port)
+                        && path.starts_with(provider_path_prefix)
+                        && matches!(
+                            path.as_bytes().get(provider_path_prefix.len()),
+                            None | Some(b'/')
+                        )
+                } else {
+                    provider_host == host || provider_host_without_port == host_without_port
+                };
+                selected.then_some(&**provider)
+            })
+            .collect();
+
+        if healthy_providers.is_empty() {
+            return Err(provider::AuthenticationError);
+        }
+
+        // Separate non-fallback and fallback providers
+        let (non_fallback, fallback): (Vec<_>, Vec<_>) = healthy_providers
+            .into_iter()
+            .partition(|p| !p.is_fallback());
+
+        // Try authentication on a list of providers with weighted random order
+        fn try_authenticate<'a, F>(
+            candidates: Vec<&'a dyn Provider>,
+            authenticate: &F,
+        ) -> Option<(&'a dyn Provider, Option<&'static str>)>
+        where
+            F: Fn(&dyn Provider) -> Result<Option<&'static str>, provider::AuthenticationError>,
+        {
+            if candidates.is_empty() {
+                return None;
+            }
+
+            // Create weighted random order for trying providers
+            let mut remaining: Vec<_> = candidates;
+
+            while !remaining.is_empty() {
+                // Select next provider based on weight
+                let selected_idx = if remaining.len() == 1 {
+                    0
+                } else {
+                    let dist = WeightedIndex::new(remaining.iter().map(|p| p.weight()))
+                        .expect("Failed to create WeightedIndex: invalid weights detected");
+                    rng().sample(&dist)
+                };
+
+                let provider = remaining.remove(selected_idx);
+
+                // Try to authenticate with this provider
+                match authenticate(provider) {
+                    Ok(auth_type) => return Some((provider, auth_type)),
+                    Err(_) => continue, // Try next provider
+                }
+            }
+
+            None
+        }
+
+        // First, try non-fallback providers
+        if let Some(result) = try_authenticate(non_fallback, &authenticate) {
+            return Ok(result);
+        }
+
+        // If all non-fallback providers failed, try fallback providers
+        if let Some(result) = try_authenticate(fallback, &authenticate) {
+            return Ok(result);
+        }
+
+        // All providers failed authentication
+        Err(provider::AuthenticationError)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -703,5 +809,249 @@ mod tests {
         assert!(selected.is_some(), "Should select fallback when non-fallback is unhealthy");
         assert_eq!(selected.unwrap().endpoint(), "fallback.openai.com");
         assert!(selected.unwrap().is_fallback());
+    }
+
+    #[test]
+    fn test_select_provider_with_auth_selects_authenticated_provider() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "provider1.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-test1"),
+                Arc::clone(&auth_keys),
+                Some(vec!["key-for-provider1".to_string()]),
+                None,
+                false,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "provider2.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-test2"),
+                Arc::clone(&auth_keys),
+                Some(vec!["key-for-provider2".to_string()]),
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        // Test with key valid for provider1
+        let auth_header = b"Authorization: Bearer key-for-provider1";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_ok());
+        let (provider, _) = result.unwrap();
+        assert_eq!(provider.endpoint(), "provider1.openai.com");
+
+        // Test with key valid for provider2
+        let auth_header = b"Authorization: Bearer key-for-provider2";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_ok());
+        let (provider, _) = result.unwrap();
+        assert_eq!(provider.endpoint(), "provider2.openai.com");
+
+        // Test with key valid for both (global auth_keys)
+        let auth_header = b"Authorization: Bearer valid-key";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_ok());
+        // Should select one of the two providers
+        let (provider, _) = result.unwrap();
+        assert!(
+            provider.endpoint() == "provider1.openai.com"
+                || provider.endpoint() == "provider2.openai.com"
+        );
+
+        // Test with invalid key
+        let auth_header = b"Authorization: Bearer invalid-key";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_provider_with_auth_tries_fallback_after_non_fallback() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "primary.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-primary"),
+                Arc::clone(&auth_keys),
+                Some(vec!["key-for-primary".to_string()]),
+                None,
+                false, // non-fallback
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "fallback.openai.com",
+                None,
+                true,
+                1.0,
+                Some("sk-fallback"),
+                Arc::clone(&auth_keys),
+                Some(vec!["key-for-fallback".to_string()]),
+                None,
+                true, // fallback
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        // Test with key only valid for fallback
+        // Non-fallback should be tried first, fail, then fallback should be selected
+        let auth_header = b"Authorization: Bearer key-for-fallback";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_ok());
+        let (provider, _) = result.unwrap();
+        assert_eq!(provider.endpoint(), "fallback.openai.com");
+        assert!(provider.is_fallback());
+
+        // Test with key only valid for primary
+        // Primary should be selected first since it's non-fallback
+        let auth_header = b"Authorization: Bearer key-for-primary";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_ok());
+        let (provider, _) = result.unwrap();
+        assert_eq!(provider.endpoint(), "primary.openai.com");
+        assert!(!provider.is_fallback());
+    }
+
+    #[test]
+    fn test_select_provider_with_auth_no_matching_providers() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![provider::new_provider(
+            "openai",
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            Arc::clone(&auth_keys),
+            None,
+            None,
+            false,
+        )
+        .unwrap()];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        // Test with non-matching host
+        let auth_header = b"Authorization: Bearer valid-key";
+        let result = program.select_provider_with_auth(
+            "api.different.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_provider_with_auth_no_auth_keys_required() {
+        let auth_keys = Arc::new(vec![]); // No auth keys required
+        let providers: Vec<Box<dyn provider::Provider>> = vec![provider::new_provider(
+            "openai",
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("sk-test"),
+            Arc::clone(&auth_keys),
+            None, // No provider auth keys
+            None,
+            false,
+        )
+        .unwrap()];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            providers: Arc::new(providers),
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+        };
+
+        // Without auth keys, any authentication should pass
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(None)
+        });
+        assert!(result.is_ok());
+
+        // Even with invalid key, should pass since no auth is required
+        let auth_header = b"Authorization: Bearer any-key";
+        let result = program.select_provider_with_auth(
+            "api.openai.com",
+            "/v1/chat",
+            |provider| provider.authenticate_with_type(Some(auth_header)),
+        );
+        assert!(result.is_ok());
     }
 }

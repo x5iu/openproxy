@@ -152,23 +152,31 @@ where
                     break;
                 };
                 let p = p.read().await;
-                let Some(provider) = p.select_provider(&host, request.path()) else {
-                    is_not_found = true;
-                    err_msg = Some(Error::NoProviderFound.to_string().into());
-                    break;
-                };
-                match provider.authenticate_with_type(request.auth_key()) {
-                    Ok(auth_type) => {
-                        request.set_incoming_auth_type(auth_type);
-                    }
+                // Use auth-during-selection: try to find a provider that authenticates successfully
+                let auth_key = request.auth_key().map(|k| k.to_vec());
+                let (provider, auth_type) = match p.select_provider_with_auth(
+                    &host,
+                    request.path(),
+                    |provider| provider.authenticate_with_type(auth_key.as_deref()),
+                ) {
+                    Ok((provider, auth_type)) => (provider, auth_type),
                     Err(_) => {
-                        #[cfg(debug_assertions)]
-                        log::error!(provider = provider.kind().to_string(), header:serde = request.auth_key().map(|header| header.to_vec()); "authentication_failed");
-                        is_invalid_key = true;
-                        err_msg = Some("authentication failed".into());
+                        // Check if any provider matches the host/path (for proper error message)
+                        if p.select_provider(&host, request.path()).is_some() {
+                            // Providers exist but all failed authentication
+                            #[cfg(debug_assertions)]
+                            log::error!(host = &host, path = request.path(), header:serde = auth_key; "authentication_failed_all_providers");
+                            is_invalid_key = true;
+                            err_msg = Some("authentication failed".into());
+                        } else {
+                            // No providers match the host/path
+                            is_not_found = true;
+                            err_msg = Some(Error::NoProviderFound.to_string().into());
+                        }
                         break;
                     }
-                }
+                };
+                request.set_incoming_auth_type(auth_type);
 
                 // Check if this is a WebSocket upgrade request
                 if request.is_websocket_upgrade() {
@@ -348,53 +356,60 @@ where
                         return invalid!(respond, 400, "missing :authority");
                     };
                     let p = p.read().await;
-                    let Some(provider) = p.select_provider(authority.host(), request.uri().path())
-                    else {
-                        return invalid!(respond, 404, Error::NoProviderFound.to_string());
-                    };
-                    // Authentication: find auth header and authenticate
-                    let mut incoming_auth_type: Option<&'static str> = None;
-                    if provider.has_auth_keys() {
-                        let mut auth_header_bytes: Option<Vec<u8>> = None;
-                        // Try all supported auth header keys
-                        for auth_header_key in provider.auth_header_keys() {
-                            let key_name = auth_header_key.trim_end_matches([' ', ':']);
-                            if let Some(value) = request.headers().get(key_name) {
-                                if let Ok(v) = value.to_str() {
-                                    // Reconstruct the full header line for authenticate_with_type
-                                    let full_header = format!("{}{}", auth_header_key, v);
-                                    auth_header_bytes = Some(full_header.into_bytes());
-                                    break;
-                                }
-                            }
-                        }
-                        // Fallback to query parameter if no header found
-                        if auth_header_bytes.is_none() {
-                            if let Some(auth_query_key) = provider.auth_query_key() {
-                                if let Some(auth_key) = request.uri().query().and_then(|query| {
-                                    http::get_auth_query_range(query, auth_query_key)
-                                        .map(|range| &query[range])
-                                }) {
-                                    // For query auth, use the primary auth header key format
-                                    if let Some(auth_header_key) = provider.auth_header_key() {
-                                        let full_header = format!("{}{}", auth_header_key, auth_key);
+
+                    // Use auth-during-selection: try to find a provider that authenticates successfully
+                    // For HTTP/2, we need to extract auth info from headers and query params
+                    let (provider, incoming_auth_type) = match p.select_provider_with_auth(
+                        authority.host(),
+                        request.uri().path(),
+                        |provider| {
+                            // Extract auth header for this provider
+                            let mut auth_header_bytes: Option<Vec<u8>> = None;
+
+                            // Try all supported auth header keys
+                            for auth_header_key in provider.auth_header_keys() {
+                                let key_name = auth_header_key.trim_end_matches([' ', ':']);
+                                if let Some(value) = request.headers().get(key_name) {
+                                    if let Ok(v) = value.to_str() {
+                                        // Reconstruct the full header line for authenticate_with_type
+                                        let full_header = format!("{}{}", auth_header_key, v);
                                         auth_header_bytes = Some(full_header.into_bytes());
+                                        break;
                                     }
                                 }
                             }
-                        }
-                        let Some(auth_bytes) = auth_header_bytes else {
-                            return invalid!(respond, 401, "missing authentication");
-                        };
-                        match provider.authenticate_with_type(Some(&auth_bytes)) {
-                            Ok(auth_type) => {
-                                incoming_auth_type = auth_type;
+
+                            // Fallback to query parameter if no header found
+                            if auth_header_bytes.is_none() {
+                                if let Some(auth_query_key) = provider.auth_query_key() {
+                                    if let Some(auth_key) = request.uri().query().and_then(|query| {
+                                        http::get_auth_query_range(query, auth_query_key)
+                                            .map(|range| &query[range])
+                                    }) {
+                                        // For query auth, use the primary auth header key format
+                                        if let Some(auth_header_key) = provider.auth_header_key() {
+                                            let full_header = format!("{}{}", auth_header_key, auth_key);
+                                            auth_header_bytes = Some(full_header.into_bytes());
+                                        }
+                                    }
+                                }
                             }
-                            Err(_) => {
+
+                            provider.authenticate_with_type(auth_header_bytes.as_deref())
+                        },
+                    ) {
+                        Ok((provider, auth_type)) => (provider, auth_type),
+                        Err(_) => {
+                            // Check if any provider matches the host/path (for proper error message)
+                            if p.select_provider(authority.host(), request.uri().path()).is_some() {
+                                // Providers exist but all failed authentication
                                 return invalid!(respond, 401, "authentication failed");
+                            } else {
+                                // No providers match the host/path
+                                return invalid!(respond, 404, Error::NoProviderFound.to_string());
                             }
                         }
-                    }
+                    };
 
                     // Check for WebSocket over HTTP/2 (RFC 8441 Extended CONNECT)
                     // CONNECT method + :protocol = "websocket"
