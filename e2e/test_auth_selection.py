@@ -48,7 +48,7 @@ def test_auth_selects_correct_provider():
         f"https://localhost:{HTTPS_PORT}/v1/test",
         headers={
             "Host": f"auth-test.local:{HTTPS_PORT}",
-            "Authorization": "Bearer sk-auth-provider1",
+            "Authorization": "Bearer sk-auth-key-1",
         },
         ssl_context=ssl_context,
     )
@@ -62,7 +62,7 @@ def test_auth_selects_correct_provider():
         f"https://localhost:{HTTPS_PORT}/v1/test",
         headers={
             "Host": f"auth-test.local:{HTTPS_PORT}",
-            "Authorization": "Bearer sk-auth-provider2",
+            "Authorization": "Bearer sk-auth-key-2",
         },
         ssl_context=ssl_context,
     )
@@ -77,7 +77,7 @@ def test_auth_selects_correct_provider():
         f"https://localhost:{HTTPS_PORT}/v1/test",
         headers={
             "Host": f"auth-test.local:{HTTPS_PORT}",
-            "Authorization": "Bearer sk-auth-fallback",
+            "Authorization": "Bearer sk-auth-key-fallback",
         },
         ssl_context=ssl_context,
     )
@@ -104,7 +104,7 @@ def test_auth_selects_correct_provider():
         f"http://localhost:{HTTP_PORT}/v1/test",
         headers={
             "Host": f"auth-test.local:{HTTP_PORT}",
-            "Authorization": "Bearer sk-auth-provider1",
+            "Authorization": "Bearer sk-auth-key-1",
         },
     )
     assert status == 200, f"Expected 200, got {status}"
@@ -117,7 +117,7 @@ def test_auth_selects_correct_provider():
         f"http://localhost:{HTTP_PORT}/v1/test",
         headers={
             "Host": f"auth-test.local:{HTTP_PORT}",
-            "Authorization": "Bearer sk-auth-fallback",
+            "Authorization": "Bearer sk-auth-key-fallback",
         },
     )
     assert status == 200, f"Expected 200, got {status}"
