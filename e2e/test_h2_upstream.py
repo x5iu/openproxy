@@ -242,7 +242,7 @@ def test_h2_invalid_auth_key():
         print(f"  Response body: {resp.text}")
         assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
         assert resp.status_code == 401, f"Expected 401, got {resp.status_code}"
-        assert "missing authentication" in resp.text.lower(), f"Expected 'missing authentication' in body, got: {resp.text}"
+        assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
 
     print("\u2713 HTTP/2 invalid auth key test passed!")
 
