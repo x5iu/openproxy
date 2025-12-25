@@ -472,3 +472,12 @@ jobs:
           cd e2e
           python test_hot_upgrade.py
           echo "Hot upgrade E2E tests passed!"
+
+      - name: Run Auth Selection E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing auth-during-provider-selection..."
+          cd e2e
+          python test_auth_selection.py
+          echo "Auth selection E2E tests passed!"
