@@ -76,7 +76,9 @@ pub async fn graceful_shutdown() {
 struct Program {
     tls_server_config: Option<Arc<rustls::ServerConfig>>,
     https_port: Option<u16>,
+    https_bind_address: String,
     http_port: Option<u16>,
+    http_bind_address: String,
     providers: Arc<Vec<Box<dyn Provider>>>,
     health_check_interval: u64,
     graceful_shutdown_timeout: u64,
@@ -180,7 +182,9 @@ impl Program {
         Ok(Self {
             tls_server_config,
             https_port,
+            https_bind_address: config.https_bind_address.unwrap_or("0.0.0.0").to_string(),
             http_port,
+            http_bind_address: config.http_bind_address.unwrap_or("0.0.0.0").to_string(),
             providers: Arc::new(providers),
             health_check_interval: config.health_check_interval.unwrap_or(60),
             graceful_shutdown_timeout: config.graceful_shutdown_timeout.unwrap_or(5),
@@ -338,8 +342,12 @@ struct Config<'a> {
     private_key_file: Option<&'a str>,
     /// Port for HTTPS connections (requires cert_file and private_key_file)
     https_port: Option<u16>,
+    /// Bind address for HTTPS connections (default: 0.0.0.0)
+    https_bind_address: Option<&'a str>,
     /// Port for HTTP connections (HTTP/1.1 only, no TLS)
     http_port: Option<u16>,
+    /// Bind address for HTTP connections (default: 0.0.0.0)
+    http_bind_address: Option<&'a str>,
     providers: Vec<ProviderConfig<'a>>,
     #[serde(skip_serializing)]
     auth_keys: Option<Vec<String>>,
@@ -494,8 +502,8 @@ use worker::{Conn, Worker};
 
 /// Create a TCP listener with SO_REUSEPORT enabled for hot upgrade support
 #[cfg(unix)]
-fn create_reuse_port_listener(port: u16) -> Result<std::net::TcpListener, Error> {
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net::TcpListener, Error> {
+    let addr: SocketAddr = format!("{}:{}", bind_address, port).parse().unwrap();
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
@@ -507,8 +515,8 @@ fn create_reuse_port_listener(port: u16) -> Result<std::net::TcpListener, Error>
 
 /// Create a TCP listener for non-Unix platforms (without SO_REUSEPORT)
 #[cfg(not(unix))]
-fn create_reuse_port_listener(port: u16) -> Result<std::net::TcpListener, Error> {
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net::TcpListener, Error> {
+    let addr: SocketAddr = format!("{}:{}", bind_address, port).parse().unwrap();
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
@@ -529,12 +537,12 @@ fn create_reuse_port_listener(port: u16) -> Result<std::net::TcpListener, Error>
 #[must_use = "this `Result` must be handled to detect listener bind failures"]
 pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     let executor = Arc::new(Executor::new(Pool::new()));
-    let (https_port, http_port) = {
+    let (https_port, https_bind_address, http_port, http_bind_address) = {
         let p = program();
         let guard = p.read().await;
-        (guard.https_port, guard.http_port)
+        (guard.https_port, guard.https_bind_address.clone(), guard.http_port, guard.http_bind_address.clone())
     };
-    log::info!(https_port = https_port, http_port = http_port, debug = cfg!(debug_assertions); "start_openproxy");
+    log::info!(https_port = https_port, https_bind_address = https_bind_address, http_port = http_port, http_bind_address = http_bind_address, debug = cfg!(debug_assertions); "start_openproxy");
 
     if enable_health_check {
         executor.run_health_check::<Worker<Pool<Conn>>>();
@@ -543,7 +551,7 @@ pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     // Start HTTPS listener if configured
     if let Some(port) = https_port {
         let executor = Arc::clone(&executor);
-        let std_listener = create_reuse_port_listener(port)?;
+        let std_listener = create_reuse_port_listener(&https_bind_address, port)?;
         let listener = TcpListener::from_std(std_listener)?;
         tokio::spawn(async move {
             loop {
@@ -567,7 +575,7 @@ pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
     // Start HTTP listener if configured (HTTP/1.1 only)
     if let Some(port) = http_port {
         let executor = Arc::clone(&executor);
-        let std_listener = create_reuse_port_listener(port)?;
+        let std_listener = create_reuse_port_listener(&http_bind_address, port)?;
         let listener = TcpListener::from_std(std_listener)?;
         tokio::spawn(async move {
             loop {
@@ -675,6 +683,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
@@ -731,6 +741,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
@@ -783,6 +795,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
@@ -833,6 +847,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
@@ -924,6 +940,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
@@ -979,6 +997,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
@@ -1017,6 +1037,8 @@ mod tests {
             tls_server_config: None,
             https_port: None,
             http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,

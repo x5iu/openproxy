@@ -11,18 +11,17 @@ cargo build --release
 # Run all tests
 cargo test
 
-# Run unit tests only
-cargo test --lib
-
 # Run a specific test
 cargo test test_name
 
-# Run with verbose output
-cargo test --lib --verbose
+# Lint and format
+cargo clippy
+cargo fmt
 
 # Start the server
 ./target/release/openproxy start -c config.yml
 ./target/release/openproxy start -c config.yml --enable-health-check
+./target/release/openproxy start -c config.yml -p /var/run/openproxy.pid
 ```
 
 ## E2E Tests
@@ -102,9 +101,16 @@ Providers are matched by the `Host` header from the client request. When multipl
 
 YAML-based config with hot-reload via SIGHUP. Key fields:
 - `https_port` / `http_port`: At least one required
+- `https_bind_address` / `http_bind_address`: Bind address for each listener (default: 0.0.0.0)
 - `cert_file` / `private_key_file`: Required for HTTPS
 - `providers[]`: Type, host (for routing), endpoint (actual backend), api_key, weight, tls
 - `auth_keys`: Global authentication keys
+
+### Signal Handling
+
+- **SIGTERM/SIGINT**: Graceful shutdown
+- **SIGHUP**: Reload configuration without restart
+- **SIGUSR2**: Hot upgrade (spawn new process, then graceful shutdown)
 
 ### Error Handling
 
