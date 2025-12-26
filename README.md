@@ -78,7 +78,9 @@ private_key_file: "/certs/private-key.pem"
 # - http_port: Plain HTTP without TLS (HTTP/1.1 only, useful for internal networks)
 # At least one port must be configured. Both can be enabled simultaneously.
 https_port: 443
+# https_bind_address: "0.0.0.0"  # Bind address for HTTPS (default: 0.0.0.0)
 # http_port: 8080  # Uncomment to enable HTTP
+# http_bind_address: "127.0.0.1"  # Bind address for HTTP (default: 0.0.0.0)
 
 # Global Authentication Keys
 auth_keys:
