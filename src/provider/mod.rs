@@ -2167,7 +2167,7 @@ async fn health_check(
     }
     stream.write_all(b"\r\n").await?;
     stream.write_all(req).await?;
-    let response = http::Response::new(stream).await?;
+    let response = http::Response::new(stream, 4096).await?;
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parser = httparse::Response::new(&mut headers);
     parser.parse(response.payload.block())?;

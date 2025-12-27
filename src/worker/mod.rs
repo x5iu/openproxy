@@ -126,32 +126,33 @@ where
             let mut is_not_found = false;
             let mut err_msg: Option<Cow<str>> = None;
             loop {
-                let mut request = match http::Request::new(&mut incoming).await {
-                    Ok(request) => request,
-                    Err(e @ Error::HeaderTooLarge) => {
-                        is_bad_request = true;
-                        err_msg = Some(e.to_string().into());
-                        break;
-                    }
-                    Err(e @ Error::InvalidHeader) => {
-                        is_bad_request = true;
-                        err_msg = Some(e.to_string().into());
-                        break;
-                    }
-                    Err(e @ Error::NoProviderFound) => {
-                        is_not_found = true;
-                        err_msg = Some(e.to_string().into());
-                        break;
-                    }
-                    Err(e) => return Err(ProxyError::Client(e)),
-                };
                 let p = crate::program();
+                let p = p.read().await;
+                let mut request =
+                    match http::Request::new(&mut incoming, p.http_max_header_size).await {
+                        Ok(request) => request,
+                        Err(e @ Error::HeaderTooLarge) => {
+                            is_bad_request = true;
+                            err_msg = Some(e.to_string().into());
+                            break;
+                        }
+                        Err(e @ Error::InvalidHeader) => {
+                            is_bad_request = true;
+                            err_msg = Some(e.to_string().into());
+                            break;
+                        }
+                        Err(e @ Error::NoProviderFound) => {
+                            is_not_found = true;
+                            err_msg = Some(e.to_string().into());
+                            break;
+                        }
+                        Err(e) => return Err(ProxyError::Client(e)),
+                    };
                 let Some(host) = request.host().map(|h| h.to_string()) else {
                     is_bad_request = true;
                     err_msg = Some("missing Host header".into());
                     break;
                 };
-                let p = p.read().await;
                 // Use auth-during-selection: try to find a provider that authenticates successfully
                 let auth_key = request.auth_key().map(|k| k.to_vec());
                 let (provider, auth_type) = match p.select_provider_with_auth(
@@ -188,6 +189,7 @@ where
                     let endpoint = provider.endpoint().to_string();
                     let sock_address = provider.sock_address().to_string();
                     let provider_tls = provider.tls();
+                    let max_header_size = p.http_max_header_size;
                     let host_header = provider.host_header().to_string();
                     let auth_header = provider.auth_header().map(|s| s.to_string());
                     let path_prefix = provider.path_prefix().map(|s| s.to_string());
@@ -204,6 +206,7 @@ where
                             &endpoint,
                             &sock_address,
                             provider_tls,
+                            max_header_size,
                             &host_header,
                             auth_header.as_deref(),
                             path_prefix.as_deref(),
@@ -255,9 +258,9 @@ where
                 }
                 let incoming_conn_keep_alive = request.payload.conn_keep_alive;
                 drop(request);
-                let mut response = http::Response::new(&mut outgoing)
+                let mut response = http::Response::new(&mut outgoing, p.http_max_header_size)
                     .await
-                    .map_err(ProxyError::Abort)?;
+                    .map_err(ProxyError::Server)?;
                 response
                     .write_to(&mut incoming)
                     .await
@@ -382,13 +385,16 @@ where
                             // Fallback to query parameter if no header found
                             if auth_header_bytes.is_none() {
                                 if let Some(auth_query_key) = provider.auth_query_key() {
-                                    if let Some(auth_key) = request.uri().query().and_then(|query| {
-                                        http::get_auth_query_range(query, auth_query_key)
-                                            .map(|range| &query[range])
-                                    }) {
+                                    if let Some(auth_key) =
+                                        request.uri().query().and_then(|query| {
+                                            http::get_auth_query_range(query, auth_query_key)
+                                                .map(|range| &query[range])
+                                        })
+                                    {
                                         // For query auth, use the primary auth header key format
                                         if let Some(auth_header_key) = provider.auth_header_key() {
-                                            let full_header = format!("{}{}", auth_header_key, auth_key);
+                                            let full_header =
+                                                format!("{}{}", auth_header_key, auth_key);
                                             auth_header_bytes = Some(full_header.into_bytes());
                                         }
                                     }
@@ -401,7 +407,9 @@ where
                         Ok((provider, auth_type)) => (provider, auth_type),
                         Err(_) => {
                             // Check if any provider matches the host/path (for proper error message)
-                            if p.select_provider(authority.host(), request.uri().path()).is_some() {
+                            if p.select_provider(authority.host(), request.uri().path())
+                                .is_some()
+                            {
                                 // Providers exist but all failed authentication
                                 return invalid!(respond, 401, "authentication failed");
                             } else {
@@ -428,6 +436,7 @@ where
                         let endpoint = provider.endpoint().to_string();
                         let sock_address = provider.sock_address().to_string();
                         let provider_tls = provider.tls();
+                        let max_header_size = p.http_max_header_size;
                         let host_header = provider.host_header().to_string();
                         let auth_header = provider.auth_header().map(|s| s.to_string());
                         let path_prefix = provider.path_prefix();
@@ -463,6 +472,7 @@ where
                                 &endpoint,
                                 &sock_address,
                                 provider_tls,
+                                max_header_size,
                                 &host_header,
                                 auth_header.as_deref(),
                                 &path,
@@ -532,6 +542,7 @@ where
                         endpoint: provider.endpoint().to_string(),
                         sock_address: provider.sock_address().to_string(),
                         use_tls: provider.tls(),
+                        max_header_size: p.http_max_header_size,
                         host_header_value: {
                             let h = provider.host_header();
                             // Extract just the host value from "Host: example.com\r\n"
@@ -599,6 +610,7 @@ struct UpstreamInfo {
     endpoint: String,
     sock_address: String,
     use_tls: bool,
+    max_header_size: usize,
     host_header_value: String,
     auth_header: Option<String>,
     /// All auth header keys to filter from incoming request (lowercase, without ": ")
@@ -925,7 +937,7 @@ impl UpstreamInfo {
         };
         let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
 
-        let mut req = match http::Request::new(req_reader).await {
+        let mut req = match http::Request::new(req_reader, self.max_header_size).await {
             Ok(req) => req,
             Err(e @ Error::NoProviderFound) => {
                 invalid!(respond, 404, e.to_string());
@@ -953,7 +965,7 @@ impl UpstreamInfo {
             return;
         };
 
-        let mut response = match http::Response::new(&mut outgoing).await {
+        let mut response = match http::Response::new(&mut outgoing, self.max_header_size).await {
             Ok(resp) => resp,
             Err(e) => {
                 invalid!(respond, 502, format!("upstream: {}", e));
@@ -1148,6 +1160,163 @@ where
         }
     }
 
+    /// Handle WebSocket upgrade request with pre-extracted data
+    /// This method:
+    /// 1. Establishes a new connection to the upstream server (not from pool, since WebSocket is long-lived)
+    /// 2. Forwards the WebSocket upgrade request with rewritten Host header
+    /// 3. Reads the upgrade response
+    /// 4. If successful (101), forwards the response and starts bidirectional proxying
+    #[allow(clippy::too_many_arguments)]
+    async fn proxy_websocket_with_data<S>(
+        &mut self,
+        incoming: &mut S,
+        raw_headers: &[u8],
+        endpoint: &str,
+        sock_address: &str,
+        provider_tls: bool,
+        max_header_size: usize,
+        host_header: &str,
+        auth_header: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> Result<(), Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+        <P as PoolTrait>::Item: Unpin + Send + Sync,
+    {
+        // Create a new connection to upstream (don't use pool for WebSocket)
+        let stream = TcpStream::connect(sock_address).await?;
+        let mut outgoing: <P as PoolTrait>::Item = if provider_tls {
+            let connector = new_tls_connector();
+            <P as PoolTrait>::Item::new_tls(endpoint, stream, connector).await?
+        } else {
+            <P as PoolTrait>::Item::new(endpoint, stream)
+        };
+
+        // Build the WebSocket upgrade request with rewritten headers
+        let header_str = std::str::from_utf8(raw_headers).map_err(|_| Error::InvalidHeader)?;
+
+        // Rewrite Host header and Authentication header
+        let mut modified_request = String::with_capacity(raw_headers.len() + 256);
+        let mut first_line = true;
+        let mut auth_written = false;
+
+        for line in header_str.split("\r\n") {
+            if line.is_empty() {
+                break;
+            }
+
+            if first_line {
+                // Request line - strip path prefix if present
+                if let Some(prefix) = path_prefix {
+                    let path_range = http::get_req_path(line);
+                    let path = &line[path_range.clone()];
+                    if let Some(remaining) = path.strip_prefix(prefix) {
+                        // Rewrite the request line with the path prefix removed
+                        let new_path = if remaining.is_empty() { "/" } else { remaining };
+                        modified_request.push_str(&line[..path_range.start]);
+                        modified_request.push_str(new_path);
+                        modified_request.push_str(&line[path_range.end..]);
+                        modified_request.push_str("\r\n");
+                        first_line = false;
+                        continue;
+                    }
+                }
+                // No prefix to strip, keep as is
+                modified_request.push_str(line);
+                modified_request.push_str("\r\n");
+                first_line = false;
+                continue;
+            }
+
+            // Check if this is a header we want to rewrite
+            if http::is_header(line, http::HEADER_HOST) {
+                // Rewrite Host header to provider's endpoint
+                // Note: host_header already includes trailing \r\n
+                modified_request.push_str(host_header);
+            } else if http::is_header(line, http::HEADER_AUTHORIZATION)
+                || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
+                || http::is_header(line, http::HEADER_X_API_KEY)
+            {
+                // Replace authentication header with provider's auth
+                // Note: auth already includes trailing \r\n
+                if !auth_written {
+                    if let Some(auth) = auth_header {
+                        modified_request.push_str(auth);
+                        auth_written = true;
+                    }
+                }
+            } else {
+                // Keep other headers as is
+                modified_request.push_str(line);
+                modified_request.push_str("\r\n");
+            }
+        }
+        modified_request.push_str("\r\n");
+
+        // Send the modified request to upstream
+        outgoing.write_all(modified_request.as_bytes()).await?;
+        outgoing.flush().await?;
+
+        #[cfg(debug_assertions)]
+        log::info!(request = modified_request; "websocket_upgrade_request_sent");
+
+        // Read the response from upstream
+        let mut response_buf = vec![0u8; max_header_size];
+        let mut total_read = 0;
+
+        // Read until we find \r\n\r\n (end of headers)
+        loop {
+            let n = outgoing.read(&mut response_buf[total_read..]).await?;
+            if n == 0 {
+                return Err(Error::InvalidHeader);
+            }
+            total_read += n;
+
+            // Check for end of headers
+            if let Some(pos) = find_header_end(&response_buf[..total_read]) {
+                // Parse the response status line
+                let response_str = std::str::from_utf8(&response_buf[..pos + 4])
+                    .map_err(|_| Error::InvalidHeader)?;
+
+                let first_line = response_str.lines().next().unwrap_or("");
+                let (status, is_upgrade) = websocket::check_websocket_response(first_line);
+
+                #[cfg(debug_assertions)]
+                log::info!(status = status, is_upgrade = is_upgrade, response = response_str; "websocket_upgrade_response");
+
+                if !is_upgrade {
+                    // Not a successful upgrade, forward the error response
+                    incoming.write_all(&response_buf[..total_read]).await?;
+                    incoming.flush().await?;
+                    return Err(Error::IO(io::Error::other(format!(
+                        "WebSocket upgrade rejected with status {}",
+                        status
+                    ))));
+                }
+
+                // Forward the 101 response to the client
+                incoming.write_all(&response_buf[..total_read]).await?;
+                incoming.flush().await?;
+
+                #[cfg(debug_assertions)]
+                log::info!("websocket_connection_established");
+
+                // Now start bidirectional proxying
+                #[allow(unused_variables)]
+                if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
+                    #[cfg(debug_assertions)]
+                    log::info!(error = e.to_string(); "websocket_connection_closed");
+                }
+
+                return Ok(());
+            }
+
+            if total_read >= response_buf.len() {
+                return Err(Error::HeaderTooLarge);
+            }
+        }
+    }
+
     /// Handle WebSocket over HTTP/2 (RFC 8441 Extended CONNECT)
     /// This method:
     /// 1. Establishes a new connection to the upstream server
@@ -1163,6 +1332,7 @@ where
         endpoint: &str,
         sock_address: &str,
         provider_tls: bool,
+        max_header_size: usize,
         host_header: &str,
         auth_header: Option<&str>,
         path: &str,
@@ -1211,7 +1381,7 @@ where
         log::info!(request = upgrade_request; "h2_websocket_upgrade_request_sent");
 
         // Read response from upstream
-        let mut response_buf = vec![0u8; 4096];
+        let mut response_buf = vec![0u8; max_header_size];
         let mut total_read = 0;
 
         loop {
@@ -1341,162 +1511,6 @@ where
             }
         }
     }
-
-    /// Handle WebSocket upgrade request with pre-extracted data
-    /// This method:
-    /// 1. Establishes a new connection to the upstream server (not from pool, since WebSocket is long-lived)
-    /// 2. Forwards the WebSocket upgrade request with rewritten Host header
-    /// 3. Reads the upgrade response
-    /// 4. If successful (101), forwards the response and starts bidirectional proxying
-    #[allow(clippy::too_many_arguments)]
-    async fn proxy_websocket_with_data<S>(
-        &mut self,
-        incoming: &mut S,
-        raw_headers: &[u8],
-        endpoint: &str,
-        sock_address: &str,
-        provider_tls: bool,
-        host_header: &str,
-        auth_header: Option<&str>,
-        path_prefix: Option<&str>,
-    ) -> Result<(), Error>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
-        <P as PoolTrait>::Item: Unpin + Send + Sync,
-    {
-        // Create a new connection to upstream (don't use pool for WebSocket)
-        let stream = TcpStream::connect(sock_address).await?;
-        let mut outgoing: <P as PoolTrait>::Item = if provider_tls {
-            let connector = new_tls_connector();
-            <P as PoolTrait>::Item::new_tls(endpoint, stream, connector).await?
-        } else {
-            <P as PoolTrait>::Item::new(endpoint, stream)
-        };
-
-        // Build the WebSocket upgrade request with rewritten headers
-        let header_str = std::str::from_utf8(raw_headers).map_err(|_| Error::InvalidHeader)?;
-
-        // Rewrite Host header and Authentication header
-        let mut modified_request = String::with_capacity(raw_headers.len() + 256);
-        let mut first_line = true;
-        let mut auth_written = false;
-
-        for line in header_str.split("\r\n") {
-            if line.is_empty() {
-                break;
-            }
-
-            if first_line {
-                // Request line - strip path prefix if present
-                if let Some(prefix) = path_prefix {
-                    let path_range = http::get_req_path(line);
-                    let path = &line[path_range.clone()];
-                    if let Some(remaining) = path.strip_prefix(prefix) {
-                        // Rewrite the request line with the path prefix removed
-                        let new_path = if remaining.is_empty() { "/" } else { remaining };
-                        modified_request.push_str(&line[..path_range.start]);
-                        modified_request.push_str(new_path);
-                        modified_request.push_str(&line[path_range.end..]);
-                        modified_request.push_str("\r\n");
-                        first_line = false;
-                        continue;
-                    }
-                }
-                // No prefix to strip, keep as is
-                modified_request.push_str(line);
-                modified_request.push_str("\r\n");
-                first_line = false;
-                continue;
-            }
-
-            // Check if this is a header we want to rewrite
-            if http::is_header(line, http::HEADER_HOST) {
-                // Rewrite Host header to provider's endpoint
-                // Note: host_header already includes trailing \r\n
-                modified_request.push_str(host_header);
-            } else if http::is_header(line, http::HEADER_AUTHORIZATION)
-                || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
-                || http::is_header(line, http::HEADER_X_API_KEY)
-            {
-                // Replace authentication header with provider's auth
-                // Note: auth already includes trailing \r\n
-                if !auth_written {
-                    if let Some(auth) = auth_header {
-                        modified_request.push_str(auth);
-                        auth_written = true;
-                    }
-                }
-            } else {
-                // Keep other headers as is
-                modified_request.push_str(line);
-                modified_request.push_str("\r\n");
-            }
-        }
-        modified_request.push_str("\r\n");
-
-        // Send the modified request to upstream
-        outgoing.write_all(modified_request.as_bytes()).await?;
-        outgoing.flush().await?;
-
-        #[cfg(debug_assertions)]
-        log::info!(request = modified_request; "websocket_upgrade_request_sent");
-
-        // Read the response from upstream
-        let mut response_buf = vec![0u8; 4096];
-        let mut total_read = 0;
-
-        // Read until we find \r\n\r\n (end of headers)
-        loop {
-            let n = outgoing.read(&mut response_buf[total_read..]).await?;
-            if n == 0 {
-                return Err(Error::InvalidHeader);
-            }
-            total_read += n;
-
-            // Check for end of headers
-            if let Some(pos) = find_header_end(&response_buf[..total_read]) {
-                // Parse the response status line
-                let response_str = std::str::from_utf8(&response_buf[..pos + 4])
-                    .map_err(|_| Error::InvalidHeader)?;
-
-                let first_line = response_str.lines().next().unwrap_or("");
-                let (status, is_upgrade) = websocket::check_websocket_response(first_line);
-
-                #[cfg(debug_assertions)]
-                log::info!(status = status, is_upgrade = is_upgrade, response = response_str; "websocket_upgrade_response");
-
-                if !is_upgrade {
-                    // Not a successful upgrade, forward the error response
-                    incoming.write_all(&response_buf[..total_read]).await?;
-                    incoming.flush().await?;
-                    return Err(Error::IO(io::Error::other(format!(
-                        "WebSocket upgrade rejected with status {}",
-                        status
-                    ))));
-                }
-
-                // Forward the 101 response to the client
-                incoming.write_all(&response_buf[..total_read]).await?;
-                incoming.flush().await?;
-
-                #[cfg(debug_assertions)]
-                log::info!("websocket_connection_established");
-
-                // Now start bidirectional proxying
-                #[allow(unused_variables)]
-                if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
-                    #[cfg(debug_assertions)]
-                    log::info!(error = e.to_string(); "websocket_connection_closed");
-                }
-
-                return Ok(());
-            }
-
-            if total_read >= response_buf.len() {
-                return Err(Error::HeaderTooLarge);
-            }
-        }
-    }
 }
 
 /// Find the end of HTTP headers (double CRLF)
@@ -1568,7 +1582,7 @@ impl ConnTrait for Conn {
                 .write_all(b"Connection: keep-alive\r\n\r\n")
                 .await?;
             self.stream.flush().await?;
-            let mut response = http::Response::new(&mut self.stream).await?;
+            let mut response = http::Response::new(&mut self.stream, 4096).await?;
             response.write_to(&mut io::empty()).await?;
             let conn_keep_alive = response.payload.conn_keep_alive;
             drop(response);

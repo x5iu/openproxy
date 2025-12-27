@@ -79,11 +79,12 @@ struct Program {
     https_bind_address: String,
     http_port: Option<u16>,
     http_bind_address: String,
-    providers: Arc<Vec<Box<dyn Provider>>>,
+    http_max_header_size: usize,
     enable_health_check: bool,
     health_check_interval: u64,
     graceful_shutdown_timeout: u64,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    providers: Arc<Vec<Box<dyn Provider>>>,
 }
 
 impl Program {
@@ -201,11 +202,15 @@ impl Program {
             https_bind_address: config.https_bind_address.unwrap_or("0.0.0.0").to_string(),
             http_port,
             http_bind_address: config.http_bind_address.unwrap_or("0.0.0.0").to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: config
+                .http_max_header_size
+                .map(|size| size.max(1024).min(1024 * 1024))
+                .unwrap_or(4096),
             enable_health_check,
             health_check_interval,
             graceful_shutdown_timeout: config.graceful_shutdown_timeout.unwrap_or(5),
             shutdown_tx,
+            providers: Arc::new(providers),
         })
     }
 
@@ -369,7 +374,8 @@ struct Config<'a> {
     http_port: Option<u16>,
     /// Bind address for HTTP connections (default: 0.0.0.0)
     http_bind_address: Option<&'a str>,
-    providers: Vec<ProviderConfig<'a>>,
+    /// Maximum header size for HTTP connections (default: 4096)
+    http_max_header_size: Option<usize>,
     #[serde(skip_serializing)]
     auth_keys: Option<Vec<String>>,
     /// Global health check configuration
@@ -378,6 +384,8 @@ struct Config<'a> {
     health_check_interval: Option<u64>,
     /// Graceful shutdown timeout in seconds (default: 5)
     graceful_shutdown_timeout: Option<u64>,
+    /// Providers configuration
+    providers: Vec<ProviderConfig<'a>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -737,11 +745,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         // Run multiple times to ensure fallback is never selected
@@ -798,11 +807,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         let selected = program.select_provider("api.openai.com", "/v1/chat");
@@ -856,11 +866,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         let selected = program.select_provider("api.openai.com", "/v1/chat");
@@ -912,11 +923,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         // Test with key valid for provider1
@@ -998,11 +1010,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         // Test with key only valid for fallback
@@ -1052,11 +1065,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         // Test with non-matching host
@@ -1092,11 +1106,12 @@ mod tests {
             http_port: Some(8080),
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
-            providers: Arc::new(providers),
+            http_max_header_size: 4096,
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
         };
 
         // Without auth keys, any authentication should pass
@@ -1111,5 +1126,117 @@ mod tests {
             provider.authenticate_with_type(Some(auth_header))
         });
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_http_max_header_size_default_value() {
+        let yaml = r#"
+http_port: 8080
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        assert_eq!(program.http_max_header_size, 4096);
+    }
+
+    #[test]
+    fn test_http_max_header_size_custom_value() {
+        let yaml = r#"
+http_port: 8080
+http_max_header_size: 8192
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        assert_eq!(program.http_max_header_size, 8192);
+    }
+
+    #[test]
+    fn test_http_max_header_size_large_value() {
+        let yaml = r#"
+http_port: 8080
+http_max_header_size: 65536
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        assert_eq!(program.http_max_header_size, 65536);
+    }
+
+    #[test]
+    fn test_http_max_header_size_clamped_to_minimum() {
+        let yaml = r#"
+http_port: 8080
+http_max_header_size: 512
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        // Should be clamped to minimum 1024
+        assert_eq!(program.http_max_header_size, 1024);
+    }
+
+    #[test]
+    fn test_http_max_header_size_clamped_to_maximum() {
+        let yaml = r#"
+http_port: 8080
+http_max_header_size: 2097152
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        // Should be clamped to maximum 1MB (1024 * 1024 = 1048576)
+        assert_eq!(program.http_max_header_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_http_max_header_size_at_boundaries() {
+        // Test at minimum boundary (1024)
+        let yaml = r#"
+http_port: 8080
+http_max_header_size: 1024
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        assert_eq!(program.http_max_header_size, 1024);
+
+        // Test at maximum boundary (1MB)
+        let yaml = r#"
+http_port: 8080
+http_max_header_size: 1048576
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let program = Program::from_config(config).unwrap();
+        assert_eq!(program.http_max_header_size, 1048576);
     }
 }

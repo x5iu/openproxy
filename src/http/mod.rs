@@ -11,8 +11,6 @@ use crate::Error;
 
 use reader::{ChunkedReader, LimitedReader};
 
-const DEFAULT_BUFFER_SIZE: usize = 4096;
-
 const CRLF: &[u8] = b"\r\n";
 
 pub(crate) const QUERY_KEY_KEY: &str = "key";
@@ -45,9 +43,10 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
     pub async fn new<S: AsyncRead + Unpin + Send + Sync + 'a>(
         stream: S,
+        buffer_size: usize,
     ) -> Result<Request<'a>, Error> {
         Ok(Request {
-            payload: Payload::read_from(stream, DEFAULT_BUFFER_SIZE).await?,
+            payload: Payload::read_from(stream, buffer_size).await?,
         })
     }
 
@@ -104,9 +103,10 @@ pub struct Response<'a> {
 impl<'a> Response<'a> {
     pub async fn new<S: AsyncRead + Unpin + Send + Sync + 'a>(
         stream: S,
+        buffer_size: usize,
     ) -> Result<Response<'a>, Error> {
         Ok(Response {
-            payload: Payload::read_from(stream, DEFAULT_BUFFER_SIZE).await?,
+            payload: Payload::read_from(stream, buffer_size).await?,
         })
     }
 

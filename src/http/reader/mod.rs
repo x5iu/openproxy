@@ -158,7 +158,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             data_only: false,
-            reader: BufReader::new(reader, super::DEFAULT_BUFFER_SIZE),
+            reader: BufReader::new(reader, 4096),
             unread_chunk_length: 0,
             cleaning: false,
             finished: false,
@@ -790,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_reader_errors_when_header_too_long_without_crlf() {
-        let size = super::super::DEFAULT_BUFFER_SIZE;
+        let size = 4096;
         let data = vec![b'a'; size];
         let r = MemReader::new(data);
         let mut rdr = ChunkedReader::data_only(r);
