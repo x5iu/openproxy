@@ -7,6 +7,8 @@ use signal_hook::consts::signal;
 use signal_hook::iterator::exfiltrator::SignalOnly;
 use signal_hook::iterator::SignalsInfo;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const LONG_ABOUT: &str = "\
 OpenProxy is a high-performance LLM (Large Language Model) proxy server written \
 in Rust, designed to intelligently route requests between multiple LLM providers.
@@ -86,13 +88,11 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
 
-        /// Enable automatic health checks for providers
+        /// [DEPRECATED] Enable automatic health checks for providers
         ///
-        /// When enabled, the proxy periodically checks each provider's health
-        /// endpoint and excludes unhealthy providers from load balancing.
-        /// The check interval is configured via 'health_check_interval' in
-        /// the config file (default: 60 seconds).
-        #[arg(long = "enable-health-check")]
+        /// This option is deprecated and will be removed in a future version.
+        /// Use 'health_check.enabled: true' in the config file instead.
+        #[arg(long = "enable-health-check", hide = true)]
         enable_health_check: bool,
 
         /// Path to write the PID file
@@ -126,6 +126,11 @@ async fn start(
     enable_health_check: bool,
     pid_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Warn about deprecated option
+    if enable_health_check {
+        log::warn!(version = VERSION; "--enable-health-check is deprecated and will be removed in a future version, use 'health_check.enabled: true' in config file instead");
+    }
+
     // Write PID file if specified
     if let Some(ref pid_path) = pid_file {
         let pid = std::process::id();
@@ -134,7 +139,7 @@ async fn start(
     }
 
     openproxy::load_config(&config, true).await?;
-    openproxy::serve(enable_health_check)
+    openproxy::serve(VERSION, enable_health_check)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
     let mut signals = SignalsInfo::<SignalOnly>::new([
@@ -148,7 +153,6 @@ async fn start(
             signal::SIGTERM | signal::SIGINT => break,
             signal::SIGHUP => openproxy::force_update_config(&config).await?,
             signal::SIGUSR2 => {
-                const VERSION: &str = env!("CARGO_PKG_VERSION");
                 log::info!(version = VERSION; "hot_upgrade_start");
                 // Spawn new process with the same arguments
                 // On Linux, if the executable is deleted while running, /proc/self/exe

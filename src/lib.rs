@@ -80,6 +80,7 @@ struct Program {
     http_port: Option<u16>,
     http_bind_address: String,
     providers: Arc<Vec<Box<dyn Provider>>>,
+    enable_health_check: bool,
     health_check_interval: u64,
     graceful_shutdown_timeout: u64,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -179,6 +180,21 @@ impl Program {
             }
         }
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+
+        // Determine health check settings: new config takes precedence over deprecated fields
+        let (enable_health_check, health_check_interval) = match &config.health_check {
+            Some(hc) => (
+                hc.enabled.unwrap_or(false),
+                hc.interval
+                    .unwrap_or(config.health_check_interval.unwrap_or(60)),
+            ),
+            // Only enable if health_check_interval is explicitly set (backwards compatibility)
+            None => (
+                config.health_check_interval.is_some(),
+                config.health_check_interval.unwrap_or(60),
+            ),
+        };
+
         Ok(Self {
             tls_server_config,
             https_port,
@@ -186,7 +202,8 @@ impl Program {
             http_port,
             http_bind_address: config.http_bind_address.unwrap_or("0.0.0.0").to_string(),
             providers: Arc::new(providers),
-            health_check_interval: config.health_check_interval.unwrap_or(60),
+            enable_health_check,
+            health_check_interval,
             graceful_shutdown_timeout: config.graceful_shutdown_timeout.unwrap_or(5),
             shutdown_tx,
         })
@@ -296,11 +313,9 @@ impl Program {
         // First, authenticate all providers and collect those that pass
         let authenticated_providers: Vec<_> = healthy_providers
             .into_iter()
-            .filter_map(|provider| {
-                match authenticate(provider) {
-                    Ok(auth_type) => Some((provider, auth_type)),
-                    Err(_) => None,
-                }
+            .filter_map(|provider| match authenticate(provider) {
+                Ok(auth_type) => Some((provider, auth_type)),
+                Err(_) => None,
             })
             .collect();
 
@@ -334,6 +349,12 @@ impl Program {
     }
 }
 
+#[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
+struct HealthCheckGlobalConfig {
+    enabled: Option<bool>,
+    interval: Option<u64>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Config<'a> {
     #[serde(skip_serializing)]
@@ -351,6 +372,9 @@ struct Config<'a> {
     providers: Vec<ProviderConfig<'a>>,
     #[serde(skip_serializing)]
     auth_keys: Option<Vec<String>>,
+    /// Global health check configuration
+    health_check: Option<HealthCheckGlobalConfig>,
+    /// [DEPRECATED] Use health_check.interval instead
     health_check_interval: Option<u64>,
     /// Graceful shutdown timeout in seconds (default: 5)
     graceful_shutdown_timeout: Option<u64>,
@@ -502,7 +526,10 @@ use worker::{Conn, Worker};
 
 /// Create a TCP listener with SO_REUSEPORT enabled for hot upgrade support
 #[cfg(unix)]
-fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net::TcpListener, Error> {
+fn create_reuse_port_listener(
+    bind_address: &str,
+    port: u16,
+) -> Result<std::net::TcpListener, Error> {
     let addr: SocketAddr = format!("{}:{}", bind_address, port).parse().unwrap();
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -515,7 +542,10 @@ fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net:
 
 /// Create a TCP listener for non-Unix platforms (without SO_REUSEPORT)
 #[cfg(not(unix))]
-fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net::TcpListener, Error> {
+fn create_reuse_port_listener(
+    bind_address: &str,
+    port: u16,
+) -> Result<std::net::TcpListener, Error> {
     let addr: SocketAddr = format!("{}:{}", bind_address, port).parse().unwrap();
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -527,6 +557,11 @@ fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net:
 
 /// Start the proxy server with the configured listeners
 ///
+/// # Arguments
+///
+/// * `cli_enable_health_check` - If true, enables health check via command line flag (deprecated).
+///   This overrides the config file setting. Use `health_check.enabled: true` in config instead.
+///
 /// # Errors
 ///
 /// Returns an error if the listener fails to bind to the configured port.
@@ -535,15 +570,32 @@ fn create_reuse_port_listener(bind_address: &str, port: u16) -> Result<std::net:
 /// - The process lacks permission to bind to the port
 /// - The address is invalid
 #[must_use = "this `Result` must be handled to detect listener bind failures"]
-pub async fn serve(enable_health_check: bool) -> Result<(), Error> {
+pub async fn serve(version: &str, cli_enable_health_check: bool) -> Result<(), Error> {
     let executor = Arc::new(Executor::new(Pool::new()));
-    let (https_port, https_bind_address, http_port, http_bind_address) = {
+    let (https_port, https_bind_address, http_port, http_bind_address, config_enable_health_check) = {
         let p = program();
         let guard = p.read().await;
-        (guard.https_port, guard.https_bind_address.clone(), guard.http_port, guard.http_bind_address.clone())
+        (
+            guard.https_port,
+            guard.https_bind_address.clone(),
+            guard.http_port,
+            guard.http_bind_address.clone(),
+            guard.enable_health_check,
+        )
     };
-    log::info!(https_port = https_port, https_bind_address = https_bind_address, http_port = http_port, http_bind_address = http_bind_address, debug = cfg!(debug_assertions); "start_openproxy");
 
+    log::info!(
+        version = version,
+        https_port = https_port,
+        https_bind_address = https_bind_address,
+        http_port = http_port,
+        http_bind_address = http_bind_address,
+        debug = cfg!(debug_assertions);
+        "start_openproxy",
+    );
+
+    // CLI flag takes precedence for backwards compatibility (deprecated)
+    let enable_health_check = cli_enable_health_check || config_enable_health_check;
     if enable_health_check {
         executor.run_health_check::<Worker<Pool<Conn>>>();
     }
@@ -686,6 +738,7 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
@@ -693,7 +746,9 @@ mod tests {
 
         // Run multiple times to ensure fallback is never selected
         for _ in 0..100 {
-            let selected = program.select_provider("api.openai.com", "/v1/chat").unwrap();
+            let selected = program
+                .select_provider("api.openai.com", "/v1/chat")
+                .unwrap();
             assert_eq!(
                 selected.endpoint(),
                 "api.openai.com",
@@ -744,13 +799,17 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
         };
 
         let selected = program.select_provider("api.openai.com", "/v1/chat");
-        assert!(selected.is_some(), "Should select a fallback when only fallbacks exist");
+        assert!(
+            selected.is_some(),
+            "Should select a fallback when only fallbacks exist"
+        );
         assert!(selected.unwrap().is_fallback());
     }
 
@@ -798,13 +857,17 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
         };
 
         let selected = program.select_provider("api.openai.com", "/v1/chat");
-        assert!(selected.is_some(), "Should select fallback when non-fallback is unhealthy");
+        assert!(
+            selected.is_some(),
+            "Should select fallback when non-fallback is unhealthy"
+        );
         assert_eq!(selected.unwrap().endpoint(), "fallback.openai.com");
         assert!(selected.unwrap().is_fallback());
     }
@@ -850,6 +913,7 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
@@ -857,33 +921,27 @@ mod tests {
 
         // Test with key valid for provider1
         let auth_header = b"Authorization: Bearer key-for-provider1";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_ok());
         let (provider, _) = result.unwrap();
         assert_eq!(provider.endpoint(), "provider1.openai.com");
 
         // Test with key valid for provider2
         let auth_header = b"Authorization: Bearer key-for-provider2";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_ok());
         let (provider, _) = result.unwrap();
         assert_eq!(provider.endpoint(), "provider2.openai.com");
 
         // Test with key valid for both (global auth_keys)
         let auth_header = b"Authorization: Bearer valid-key";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_ok());
         // Should select one of the two providers
         let (provider, _) = result.unwrap();
@@ -894,11 +952,9 @@ mod tests {
 
         // Test with invalid key
         let auth_header = b"Authorization: Bearer invalid-key";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_err());
     }
 
@@ -943,6 +999,7 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
@@ -951,11 +1008,9 @@ mod tests {
         // Test with key only valid for fallback
         // Non-fallback should be tried first, fail, then fallback should be selected
         let auth_header = b"Authorization: Bearer key-for-fallback";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_ok());
         let (provider, _) = result.unwrap();
         assert_eq!(provider.endpoint(), "fallback.openai.com");
@@ -964,11 +1019,9 @@ mod tests {
         // Test with key only valid for primary
         // Primary should be selected first since it's non-fallback
         let auth_header = b"Authorization: Bearer key-for-primary";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_ok());
         let (provider, _) = result.unwrap();
         assert_eq!(provider.endpoint(), "primary.openai.com");
@@ -1000,6 +1053,7 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
@@ -1007,11 +1061,10 @@ mod tests {
 
         // Test with non-matching host
         let auth_header = b"Authorization: Bearer valid-key";
-        let result = program.select_provider_with_auth(
-            "api.different.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result =
+            program.select_provider_with_auth("api.different.com", "/v1/chat", |provider| {
+                provider.authenticate_with_type(Some(auth_header))
+            });
         assert!(result.is_err());
     }
 
@@ -1040,6 +1093,7 @@ mod tests {
             https_bind_address: "0.0.0.0".to_string(),
             http_bind_address: "0.0.0.0".to_string(),
             providers: Arc::new(providers),
+            enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
@@ -1053,11 +1107,9 @@ mod tests {
 
         // Even with invalid key, should pass since no auth is required
         let auth_header = b"Authorization: Bearer any-key";
-        let result = program.select_provider_with_auth(
-            "api.openai.com",
-            "/v1/chat",
-            |provider| provider.authenticate_with_type(Some(auth_header)),
-        );
+        let result = program.select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+            provider.authenticate_with_type(Some(auth_header))
+        });
         assert!(result.is_ok());
     }
 }
