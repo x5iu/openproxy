@@ -87,8 +87,10 @@ auth_keys:
   - "client-api-key-1"
   - "client-api-key-2"
 
-# Health Check Interval (seconds)
-health_check_interval: 60
+# Health Check Configuration
+health_check:
+  enabled: true
+  interval: 60  # seconds
 
 # Provider Configuration
 providers:
@@ -162,9 +164,6 @@ providers:
 ```bash
 # Basic usage (HTTPS on configured port)
 ./openproxy start -c config.yml
-
-# With health checks enabled
-./openproxy start -c config.yml --enable-health-check
 
 # With PID file (useful for systemd integration)
 ./openproxy start -c config.yml -p /var/run/openproxy.pid
@@ -284,7 +283,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/openproxy start -c /etc/openproxy/config.yml -p /var/run/openproxy.pid --enable-health-check
+ExecStart=/usr/local/bin/openproxy start -c /etc/openproxy/config.yml -p /var/run/openproxy.pid
 ExecReload=/bin/kill -HUP $MAINPID
 PIDFile=/var/run/openproxy.pid
 Restart=on-failure

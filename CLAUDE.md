@@ -20,7 +20,6 @@ cargo fmt
 
 # Start the server
 ./target/release/openproxy start -c config.yml
-./target/release/openproxy start -c config.yml --enable-health-check
 ./target/release/openproxy start -c config.yml -p /var/run/openproxy.pid
 ```
 
@@ -105,6 +104,7 @@ YAML-based config with hot-reload via SIGHUP. Key fields:
 - `cert_file` / `private_key_file`: Required for HTTPS
 - `providers[]`: Type, host (for routing), endpoint (actual backend), api_key, weight, tls
 - `auth_keys`: Global authentication keys
+- `health_check.enabled` / `health_check.interval`: Enable health checks and set interval (default: 60s)
 
 ### Signal Handling
 
