@@ -8,6 +8,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 
 - **Multi-Provider Support**: Seamlessly proxy requests to OpenAI, Gemini, and Anthropic APIs
 - **Intelligent Load Balancing**: Weighted provider selection algorithm for optimal resource utilization
+- **Fallback Providers**: Automatic failover to backup providers when primary providers are unavailable
 - **Health Monitoring**: Automatic health checks with configurable intervals and failure recovery
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
 - **Authentication & Authorization**: Flexible API key management with per-provider and global authentication
@@ -92,6 +93,9 @@ health_check:
   enabled: true
   interval: 60  # seconds
 
+# HTTP Configuration
+# http_max_header_size: 8192  # Maximum HTTP header size in bytes (default: 4096, min: 1024, max: 1MB)
+
 # Provider Configuration
 providers:
   # OpenAI Configuration
@@ -155,6 +159,15 @@ providers:
         weight: 2.0
     auth_keys:
       - "provider-specific-auth-key"
+
+  # Fallback Provider
+  # Fallback providers are only used when no non-fallback providers are available (healthy).
+  # Useful for backup/failover scenarios.
+  - type: "openai"
+    host: "openai.example.com"         # Same host as primary provider
+    endpoint: "api.openai.com"
+    api_key: "sk-backup-key"
+    is_fallback: true                  # Mark as fallback provider
 ```
 
 ## Usage

@@ -47,6 +47,7 @@ OpenProxy is a high-performance LLM proxy server that routes requests to multipl
 - **`src/worker/mod.rs`** - Request handling for HTTP/1.1 and HTTP/2, WebSocket proxying, `UpstreamInfo` struct for provider details
 - **`src/provider/mod.rs`** - Provider trait and implementations (OpenAI, Gemini, Anthropic), authentication handling
 - **`src/http/mod.rs`** - HTTP parsing, header manipulation, `Payload` struct with `next_block()` state machine for streaming
+- **`src/http/reader/mod.rs`** - Streaming helpers: `LimitedReader` (Content-Length), `ChunkedReader`/`ChunkedWriter` (Transfer-Encoding: chunked)
 - **`src/executor/mod.rs`** - Connection pooling (`Pool<K, V>`) and health check execution
 - **`src/h2client/mod.rs`** - HTTP/2 client connections to upstream, TLS connector, connection pooling for H2
 - **`src/websocket/mod.rs`** - WebSocket upgrade detection and bidirectional proxying
@@ -102,9 +103,10 @@ YAML-based config with hot-reload via SIGHUP. Key fields:
 - `https_port` / `http_port`: At least one required
 - `https_bind_address` / `http_bind_address`: Bind address for each listener (default: 0.0.0.0)
 - `cert_file` / `private_key_file`: Required for HTTPS
-- `providers[]`: Type, host (for routing), endpoint (actual backend), api_key, weight, tls
+- `providers[]`: Type, host (for routing), endpoint (actual backend), api_key, weight, tls, is_fallback
 - `auth_keys`: Global authentication keys
 - `health_check.enabled` / `health_check.interval`: Enable health checks and set interval (default: 60s)
+- `http_max_header_size`: Maximum HTTP header size in bytes (default: 8KB)
 
 ### Signal Handling
 
