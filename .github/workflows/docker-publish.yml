@@ -35,21 +35,17 @@ jobs:
       - name: Determine version
         id: version
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -n "$INPUT_TAG" ]; then
-              echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
-            else
-              LATEST_TAG=$(git describe --tags --abbrev=0)
-              echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-            fi
-          elif [ "$EVENT_NAME" = "workflow_call" ]; then
+          # Priority: inputs.tag > release.tag_name > latest git tag
+          if [ -n "$INPUT_TAG" ]; then
             echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
-          else
+          elif [ -n "$RELEASE_TAG" ]; then
             echo "tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          else
+            LATEST_TAG=$(git describe --tags --abbrev=0)
+            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           fi
 
       - name: Checkout tag
