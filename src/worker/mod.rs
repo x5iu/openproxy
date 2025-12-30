@@ -930,23 +930,10 @@ impl UpstreamInfo {
         );
 
         let h2stream_reader = H2StreamReader::new(request.into_body());
-        let req_body: Box<dyn AsyncRead + Unpin + Send + Sync> = if has_content_length {
+        let mut req_body: Box<dyn AsyncRead + Unpin + Send + Sync> = if has_content_length {
             Box::new(h2stream_reader)
         } else {
             Box::new(http::reader::ChunkedWriter::new(h2stream_reader))
-        };
-        let req_reader = AsyncReadExt::chain(req_str.as_bytes(), req_body);
-
-        let mut req = match http::Request::new(req_reader, self.max_header_size).await {
-            Ok(req) => req,
-            Err(e @ Error::NoProviderFound) => {
-                invalid!(respond, 404, e.to_string());
-                return;
-            }
-            Err(e) => {
-                invalid!(respond, 400, e.to_string());
-                return;
-            }
         };
 
         let mut outgoing = match worker
@@ -960,10 +947,22 @@ impl UpstreamInfo {
             }
         };
 
-        if let Err(e) = req.write_to(&mut outgoing).await {
+        if let Err(e) = outgoing.write_all(req_str.as_bytes()).await {
+            invalid!(respond, 502, format!("upstream: {}", e));
+            return;
+        }
+        if let Err(e) = tokio::io::copy(&mut req_body, &mut outgoing).await {
+            invalid!(respond, 502, format!("upstream: {}", e));
+            return;
+        }
+        if let Err(e) = outgoing.flush().await {
             invalid!(respond, 502, format!("upstream: {}", e));
             return;
         };
+
+        // NOTE: we intentionally avoid re-parsing the constructed HTTP/1.1 request via `http::Request::new`.
+        // The fallback path already selected a provider based on the incoming :authority/Host; re-parsing would
+        // select again based on the upstream Host header (endpoint), which can differ from routing host.
 
         let mut response = match http::Response::new(&mut outgoing, self.max_header_size).await {
             Ok(resp) => resp,
@@ -1019,6 +1018,24 @@ impl UpstreamInfo {
                 return;
             }
         };
+
+        // Consume the serialized HTTP/1.1 response headers produced by `Payload::next_block()`.
+        // We already converted upstream headers into HTTP/2 response headers above.
+        loop {
+            let block = match response.payload.next_block().await {
+                Ok(block) => block,
+                Err(e) => {
+                    log::error!(alpn = "h2", error = e.to_string(); "read_block_error");
+                    return;
+                }
+            };
+            let Some(block) = block else {
+                break;
+            };
+            if block.as_ref() == b"\r\n" {
+                break;
+            }
+        }
 
         loop {
             let block = match response
@@ -2361,5 +2378,169 @@ mod tests {
         assert!(result_with_extra.contains("anthropic-beta: existing-value,oauth-2025-04-20\r\n"));
         // Should NOT contain the original value alone
         assert!(!result_with_extra.contains("anthropic-beta: existing-value\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_h2_fallback_to_h1_does_not_reselect_provider_by_upstream_host() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        // Upstream HTTP/1.1 server (no TLS, no h2) to simulate FallbackToH1.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let mut n = 0usize;
+            loop {
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                n += read;
+                if find_header_end(&buf[..n]).is_some() {
+                    break;
+                }
+                if n >= buf.len() {
+                    break;
+                }
+            }
+
+            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = req_tx.send(req_str);
+
+            let body = "OK";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        // Initialize PROGRAM (required by the old buggy path that re-parses as http::Request).
+        // Provider host != endpoint to trigger NoProviderFound during the second selection.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut config_path = std::env::temp_dir();
+        config_path.push(format!("openproxy-test-{}.yml", now));
+        let _cleanup = Cleanup(config_path.clone());
+
+        let config = format!(
+            r#"http_port: 8080
+providers:
+  - type: openai
+    host: route.example.com
+    endpoint: localhost
+    port: {}
+    tls: false
+"#,
+            upstream_port
+        );
+        std::fs::write(&config_path, config).unwrap();
+        crate::load_config(&config_path, true).await.unwrap();
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        // Create an in-memory HTTP/2 connection.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        // Drive the server connection in the background (matching production behavior where the
+        // accept loop keeps running while per-stream handlers run in spawned tasks).
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond, "route.example.com")
+                        .await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::GET)
+            .uri("https://route.example.com/test")
+            .header("content-length", "0")
+            .body(())
+            .unwrap();
+        let (response_fut, _send_stream) = client.send_request(request, true).unwrap();
+
+        // Wait for the response below.
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "fallback-to-h1 should succeed even when provider host != upstream endpoint"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("http/1.1")
+        );
+
+        let mut body = response.into_body();
+        let collected = timeout(Duration::from_secs(2), async {
+            let mut collected = Vec::new();
+            while let Some(chunk) = body.data().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            collected
+        })
+        .await
+        .expect("timeout reading h2 body");
+        assert_eq!(collected, b"OK");
+
+        let req_str = timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("upstream was not contacted")
+            .unwrap();
+        assert!(req_str.starts_with("GET /test HTTP/1.1\r\n"));
+        assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
     }
 }

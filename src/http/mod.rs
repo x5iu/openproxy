@@ -699,6 +699,13 @@ pub(crate) fn strip_port(host: &str) -> &str {
         }
         return host;
     }
+
+    // If there are multiple ':' and no brackets, treat it as an IPv6 literal without a port.
+    // (IPv6 with a port must be bracketed: "[::1]:8080")
+    if host.bytes().filter(|&b| b == b':').count() != 1 {
+        return host;
+    }
+
     // Handle regular host:port
     if let Some(colon_idx) = host.rfind(':') {
         return &host[..colon_idx];
@@ -859,6 +866,11 @@ mod tests {
         assert_eq!(strip_port("[::1]"), "[::1]");
         assert_eq!(strip_port("[2001:db8::1]:443"), "[2001:db8::1]");
         assert_eq!(strip_port("[fe80::1%eth0]:8080"), "[fe80::1%eth0]");
+
+        // Test IPv6 without brackets (should NOT strip)
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+        assert_eq!(strip_port("fe80::1%eth0"), "fe80::1%eth0");
+        assert_eq!(strip_port("2001:db8::1:443"), "2001:db8::1:443");
 
         // Test IPv6 without port
         assert_eq!(strip_port("[::1]"), "[::1]");

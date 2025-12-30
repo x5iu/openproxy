@@ -374,41 +374,8 @@ jobs:
           PROXY_AUTH_KEY: ${{ env.AUTH_KEY }}
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
-          echo "Testing H2 client -> proxy -> H1 upstream fallback..."
-
-          # First verify the echo server is working directly
-          echo "Verifying echo server directly..."
-          curl -s http://127.0.0.1:9001/test | head -c 200
-          echo ""
-
-          # Client connects via HTTPS/H2, but upstream is plain HTTP
-          # Proxy should fallback to HTTP/1.1 for upstream connection
-          curl -s -D /tmp/fallback_headers.txt -o /tmp/fallback_response.json \
-            --cacert $SSL_CERT_FILE \
-            --http2 \
-            -H "Host: h1-fallback.localhost:8443" \
-            -H "Authorization: Bearer ${PROXY_AUTH_KEY}" \
-            "https://localhost:8443/test-fallback"
-
-          echo "Response headers:"
-          cat /tmp/fallback_headers.txt
-          echo "Response body:"
-          cat /tmp/fallback_response.json
-
-          # Verify response contains fallback success marker
-          if ! grep -q "fallback" /tmp/fallback_response.json; then
-            echo "::error::H2 fallback response does not contain success marker"
-            exit 1
-          fi
-
-          # Verify upstream protocol is HTTP/1.1 (fallback)
-          if ! grep -qi "x-upstream-protocol: http/1.1" /tmp/fallback_headers.txt; then
-            echo "::error::Expected x-upstream-protocol: http/1.1 header but not found"
-            cat /tmp/fallback_headers.txt
-            exit 1
-          fi
-
-          echo "H2 to H1 fallback test passed! (verified upstream protocol is HTTP/1.1)"
+          cd e2e
+          python test_h2_h1_fallback.py
 
       - name: Run Gemini E2E tests (HTTPS with curl)
         env:
