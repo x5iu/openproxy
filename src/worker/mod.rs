@@ -1021,6 +1021,11 @@ impl UpstreamInfo {
 
         // Consume the serialized HTTP/1.1 response headers produced by `Payload::next_block()`.
         // We already converted upstream headers into HTTP/2 response headers above.
+        //
+        // Important: `Payload::next_block()` emits a standalone CRLF (b"\r\n") when it transitions
+        // from `ReadState::FinishHeader` to `ReadState::ReadBody` (see `http/mod.rs`). We treat this
+        // CRLF as the header/body boundary and drain everything up to it, so we don't accidentally
+        // send the serialized HTTP/1.1 headers as HTTP/2 DATA frames.
         loop {
             let block = match response.payload.next_block().await {
                 Ok(block) => block,
@@ -1036,6 +1041,7 @@ impl UpstreamInfo {
                 break;
             }
         }
+
 
         loop {
             let block = match response
