@@ -2382,18 +2382,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_fallback_to_h1_does_not_reselect_provider_by_upstream_host() {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::io::Write;
 
+        use tempfile::NamedTempFile;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::time::{timeout, Duration};
-
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
 
         // Upstream HTTP/1.1 server (no TLS, no h2) to simulate FallbackToH1.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2434,14 +2428,6 @@ mod tests {
 
         // Initialize PROGRAM (required by the old buggy path that re-parses as http::Request).
         // Provider host != endpoint to trigger NoProviderFound during the second selection.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut config_path = std::env::temp_dir();
-        config_path.push(format!("openproxy-test-{}.yml", now));
-        let _cleanup = Cleanup(config_path.clone());
-
         let config = format!(
             r#"http_port: 8080
 providers:
@@ -2453,8 +2439,11 @@ providers:
 "#,
             upstream_port
         );
-        std::fs::write(&config_path, config).unwrap();
-        crate::load_config(&config_path, true).await.unwrap();
+
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file.write_all(config.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+        crate::load_config(config_file.path(), true).await.unwrap();
 
         let pool = Arc::new(crate::executor::Pool::<Conn>::new());
         let h2pool = Arc::new(crate::h2client::H2Pool::new());
