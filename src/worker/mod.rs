@@ -1735,18 +1735,41 @@ impl AsyncRead for H2StreamReader {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Some(cursor) = &mut self.bytes {
-            if cursor.has_remaining() {
-                return pin!(cursor).poll_read(cx, buf);
+        // If we still have buffered bytes from the last DATA frame, read from them first.
+        //
+        // Important: we must release inbound HTTP/2 flow-control as the application consumes bytes.
+        // Otherwise, large request bodies can stall once the client's flow-control window is exhausted.
+        if self
+            .bytes
+            .as_ref()
+            .map(|cursor| cursor.has_remaining())
+            .unwrap_or(false)
+        {
+            let filled_before = buf.filled().len();
+            let poll = {
+                let cursor = self.bytes.as_mut().expect("cursor checked above");
+                pin!(cursor).poll_read(cx, buf)
+            };
+            let n = buf.filled().len().saturating_sub(filled_before);
+            match poll {
+                Poll::Ready(Ok(())) => {
+                    if n > 0 {
+                        let _ = self.stream.flow_control().release_capacity(n);
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
-        let stream = match self.stream.poll_data(cx) {
-            Poll::Ready(Some(Ok(stream))) => stream,
+
+        let bytes = match self.stream.poll_data(cx) {
+            Poll::Ready(Some(Ok(bytes))) => bytes,
             Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(None) => return Poll::Ready(Ok(())),
             Poll::Pending => return Poll::Pending,
         };
-        self.bytes = Some(Cursor::new(stream));
+        self.bytes = Some(Cursor::new(bytes));
         self.poll_read(cx, buf)
     }
 }
