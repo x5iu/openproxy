@@ -33,7 +33,7 @@ def test_h2_upstream_basic():
     # Use HTTP/2 client
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
         resp = client.get(
-            "/v1/models",
+            "/models",
             headers={
                 "Authorization": f"Bearer {api_key}",
             },
@@ -105,7 +105,7 @@ def test_h2_upstream_multiplexing():
             tasks = []
             for i in range(5):
                 task = client.get(
-                    "/v1/models",
+                    "/models",
                     headers={"Authorization": f"Bearer {api_key}"},
                 )
                 tasks.append(task)
@@ -136,7 +136,7 @@ def test_h2_upstream_large_request():
 
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=120) as client:
         resp = client.post(
-            "/v1/chat/completions",
+            "/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -179,7 +179,7 @@ def test_h2_upstream_connection_reuse():
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=30) as client:
         for i in range(5):
             resp = client.get(
-                "/v1/models",
+                "/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             print(f"  Request {i+1}: Status {resp.status_code}")
@@ -202,7 +202,7 @@ def test_h2_upstream_error_handling():
     # Test with invalid endpoint - should get 404 from upstream
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
         resp = client.get(
-            "/v1/nonexistent-endpoint",
+            "/nonexistent-endpoint",
             headers={"Authorization": f"Bearer {api_key}"},
         )
         print(f"Invalid endpoint: Status {resp.status_code}")
@@ -225,7 +225,7 @@ def test_h2_invalid_auth_key():
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=10) as client:
         # Test with completely invalid key
         resp = client.get(
-            "/v1/models",
+            "/models",
             headers={"Authorization": "Bearer invalid-key-12345"},
         )
         print(f"  Invalid key: Status {resp.status_code}")
@@ -236,7 +236,7 @@ def test_h2_invalid_auth_key():
         assert "authentication failed" in resp.text.lower(), f"Expected 'authentication failed' in body, got: {resp.text}"
 
         # Test with missing auth header
-        resp = client.get("/v1/models")
+        resp = client.get("/models")
         print(f"  Missing auth: Status {resp.status_code}")
         print(f"  HTTP Version: {resp.http_version}")
         print(f"  Response body: {resp.text}")
@@ -260,7 +260,7 @@ def test_h2_upstream_concurrent_streams():
     def make_request(i):
         with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=60) as client:
             resp = client.get(
-                "/v1/models",
+                "/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             return i, resp.status_code, resp.http_version
@@ -292,7 +292,7 @@ def test_h2_upstream_headers_preservation():
     # Add custom headers and verify the request succeeds
     with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
         resp = client.get(
-            "/v1/models",
+            "/models",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "X-Custom-Header": "test-value",
