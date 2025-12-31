@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """E2E regression test for large HTTP/2 request bodies.
 
 This reproduces a hang where:
