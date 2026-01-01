@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """E2E test for: HTTP/2 client -> openproxy -> HTTP/1.1 upstream fallback.
 
 This specifically guards against a regression where the fallback path re-parses

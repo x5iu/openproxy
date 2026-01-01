@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 End-to-end test for WebSocket proxy using OpenAI Realtime API.
 
