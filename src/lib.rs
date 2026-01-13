@@ -34,7 +34,12 @@ pub async fn load_config(
     first_load: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_str = fs::read_to_string(&path)?;
-    let config: Config = serde_yaml::from_str(&config_str)?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
+    // Parse YAML and apply merge anchors (<<: *alias) before deserializing to Config.
+    // See: https://github.com/dtolnay/serde-yaml/issues/317
+    value.apply_merge()?;
+    let merged_yaml = serde_yaml::to_string(&value)?;
+    let config: Config = serde_yaml::from_str(&merged_yaml)?;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         structured_logger::Builder::with_level("INFO")
@@ -1238,5 +1243,36 @@ providers:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let program = Program::from_config(config).unwrap();
         assert_eq!(program.http_max_header_size, 1048576);
+    }
+
+    #[test]
+    fn test_yaml_merge_anchor() {
+        // Test that YAML merge anchors work correctly
+        let yaml = r#"
+defaults: &defaults
+  tls: true
+  port: 443
+  weight: 1.0
+
+http_port: 8080
+
+providers:
+  - type: "openai"
+    host: "api.openai.com"
+    endpoint: "api.openai.com"
+    api_key: "sk-test"
+    <<: *defaults
+"#;
+
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        value.apply_merge().unwrap();
+        let merged_yaml = serde_yaml::to_string(&value).unwrap();
+        let config: Config = serde_yaml::from_str(&merged_yaml).unwrap();
+
+        assert_eq!(config.http_port, Some(8080));
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].tls, Some(true));
+        assert_eq!(config.providers[0].port, Some(443));
+        assert_eq!(config.providers[0].weight, Some(1.0));
     }
 }
