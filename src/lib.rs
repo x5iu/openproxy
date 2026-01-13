@@ -5,6 +5,7 @@ pub mod provider;
 pub mod websocket;
 pub mod worker;
 
+use std::borrow::Cow;
 use std::fmt::Formatter;
 use std::fs;
 use std::io;
@@ -122,14 +123,15 @@ impl Program {
                 .private_key_file
                 .ok_or("private_key_file is required for HTTPS")?;
 
-            if !Path::new(cert_file).exists() {
+            if !Path::new(cert_file.as_ref()).exists() {
                 return Err(format!("Certificate file not found: {}", cert_file).into());
             }
-            if !Path::new(private_key_file).exists() {
+            if !Path::new(private_key_file.as_ref()).exists() {
                 return Err(format!("Private key file not found: {}", private_key_file).into());
             }
-            let certs = CertificateDer::pem_file_iter(cert_file)?.collect::<Result<Vec<_>, _>>()?;
-            let private_key = PrivateKeyDer::from_pem_file(private_key_file)?;
+            let certs = CertificateDer::pem_file_iter(cert_file.as_ref())?
+                .collect::<Result<Vec<_>, _>>()?;
+            let private_key = PrivateKeyDer::from_pem_file(private_key_file.as_ref())?;
             let mut tls_config = rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(certs, private_key)?;
@@ -141,7 +143,7 @@ impl Program {
 
         let auth_keys = Arc::new(config.auth_keys.unwrap_or_default());
         let mut providers = Vec::new();
-        config.providers.sort_by_key(|provider| provider.host);
+        config.providers.sort_by(|a, b| a.host.cmp(&b.host));
         for mut provider in config.providers {
             let mut api_keys = provider.api_keys;
             api_keys.append(provider.api_key);
@@ -150,15 +152,15 @@ impl Program {
                 let health_check_config = provider.health_check_config.take();
                 for api_key_config in api_key_configs {
                     providers.push(new_provider(
-                        provider.kind,
-                        provider.host,
-                        provider.endpoint,
+                        &provider.kind,
+                        &provider.host,
+                        &provider.endpoint,
                         provider.port,
                         provider.tls.unwrap_or(true),
                         api_key_config
                             .weight
                             .unwrap_or(provider.weight.unwrap_or(1.0)),
-                        Some(api_key_config.key),
+                        Some(&api_key_config.key),
                         Arc::clone(&auth_keys),
                         provider.provider_auth_keys.clone(),
                         health_check_config.clone(),
@@ -168,16 +170,16 @@ impl Program {
             } else {
                 let api_key_config = api_keys.pop();
                 providers.push(new_provider(
-                    provider.kind,
-                    provider.host,
-                    provider.endpoint,
+                    &provider.kind,
+                    &provider.host,
+                    &provider.endpoint,
                     provider.port,
                     provider.tls.unwrap_or(true),
                     api_key_config
                         .as_ref()
                         .and_then(|cfg| cfg.weight)
                         .unwrap_or(provider.weight.unwrap_or(1.0)),
-                    api_key_config.as_ref().map(|cfg| cfg.key),
+                    api_key_config.as_ref().map(|cfg| cfg.key.as_ref()),
                     Arc::clone(&auth_keys),
                     provider.provider_auth_keys.clone(),
                     provider.health_check_config.take(),
@@ -204,9 +206,15 @@ impl Program {
         Ok(Self {
             tls_server_config,
             https_port,
-            https_bind_address: config.https_bind_address.unwrap_or("0.0.0.0").to_string(),
+            https_bind_address: config
+                .https_bind_address
+                .map(Cow::into_owned)
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             http_port,
-            http_bind_address: config.http_bind_address.unwrap_or("0.0.0.0").to_string(),
+            http_bind_address: config
+                .http_bind_address
+                .map(Cow::into_owned)
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             http_max_header_size: config
                 .http_max_header_size
                 .map(|size| size.max(1024).min(1024 * 1024))
@@ -368,17 +376,21 @@ struct HealthCheckGlobalConfig {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Config<'a> {
     #[serde(skip_serializing)]
-    cert_file: Option<&'a str>,
+    #[serde(borrow)]
+    cert_file: Option<Cow<'a, str>>,
     #[serde(skip_serializing)]
-    private_key_file: Option<&'a str>,
+    #[serde(borrow)]
+    private_key_file: Option<Cow<'a, str>>,
     /// Port for HTTPS connections (requires cert_file and private_key_file)
     https_port: Option<u16>,
     /// Bind address for HTTPS connections (default: 0.0.0.0)
-    https_bind_address: Option<&'a str>,
+    #[serde(borrow)]
+    https_bind_address: Option<Cow<'a, str>>,
     /// Port for HTTP connections (HTTP/1.1 only, no TLS)
     http_port: Option<u16>,
     /// Bind address for HTTP connections (default: 0.0.0.0)
-    http_bind_address: Option<&'a str>,
+    #[serde(borrow)]
+    http_bind_address: Option<Cow<'a, str>>,
     /// Maximum header size for HTTP connections (default: 4096)
     http_max_header_size: Option<usize>,
     #[serde(skip_serializing)]
@@ -390,15 +402,19 @@ struct Config<'a> {
     /// Graceful shutdown timeout in seconds (default: 5)
     graceful_shutdown_timeout: Option<u64>,
     /// Providers configuration
+    #[serde(borrow)]
     providers: Vec<ProviderConfig<'a>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProviderConfig<'a> {
     #[serde(rename = "type")]
-    kind: &'a str,
-    host: &'a str,
-    endpoint: &'a str,
+    #[serde(borrow)]
+    kind: Cow<'a, str>,
+    #[serde(borrow)]
+    host: Cow<'a, str>,
+    #[serde(borrow)]
+    endpoint: Cow<'a, str>,
     port: Option<u16>,
     tls: Option<bool>,
     weight: Option<f64>,
@@ -427,7 +443,8 @@ trait APIKeysTrait<'a> {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct APIKeyConfig<'a> {
     #[serde(skip_serializing)]
-    key: &'a str,
+    #[serde(borrow)]
+    key: Cow<'a, str>,
     weight: Option<f64>,
 }
 
@@ -448,10 +465,10 @@ impl<'a> APIKeysTrait<'a> for Option<Vec<APIKeyConfig<'a>>> {
     }
 }
 
-struct APIKeys<'a>(Vec<&'a str>);
+struct APIKeys<'a>(Vec<Cow<'a, str>>);
 
 impl<'a> Deref for APIKeys<'a> {
-    type Target = [&'a str];
+    type Target = [Cow<'a, str>];
 
     fn deref(&self) -> &Self::Target {
         self.0.as_slice()
@@ -476,7 +493,21 @@ impl<'de: 'a, 'a> serde::Deserialize<'de> for APIKeys<'a> {
             where
                 E: serde::de::Error,
             {
-                Ok(APIKeys(vec![v]))
+                Ok(APIKeys(vec![Cow::Borrowed(v)]))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(APIKeys(vec![Cow::Owned(v.to_owned())]))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(APIKeys(vec![Cow::Owned(v)]))
             }
 
             fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
@@ -1274,5 +1305,75 @@ providers:
         assert_eq!(config.providers[0].tls, Some(true));
         assert_eq!(config.providers[0].port, Some(443));
         assert_eq!(config.providers[0].weight, Some(1.0));
+    }
+
+    #[test]
+    fn test_yaml_merge_anchor_with_dynamic_auth_key() {
+        // Test that YAML merge anchors work with dynamic auth keys (quoted strings)
+        // This tests the case where serde_yaml::to_string() changes the quote style
+        let yaml = r#"
+defaults: &defaults
+  tls: true
+  port: 443
+
+http_port: 8080
+
+providers:
+  - type: "anthropic"
+    host: "claude.ai"
+    endpoint: "claude.ai"
+    api_key: "$(/usr/bin/jq -r '.claudeAiOauth.accessToken' /root/.claude/.credentials.json # x)"
+    <<: *defaults
+"#;
+
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        value.apply_merge().unwrap();
+        let merged_yaml = serde_yaml::to_string(&value).unwrap();
+        let config: Config = serde_yaml::from_str(&merged_yaml).unwrap();
+
+        assert_eq!(config.http_port, Some(8080));
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].tls, Some(true));
+        assert_eq!(config.providers[0].port, Some(443));
+        // Verify the dynamic auth key is preserved correctly
+        let api_keys = config.providers[0].api_key.as_ref().unwrap();
+        assert_eq!(
+            api_keys[0],
+            "$(/usr/bin/jq -r '.claudeAiOauth.accessToken' /root/.claude/.credentials.json # x)"
+        )
+    }
+
+    #[test]
+    fn test_yaml_merge_anchor_with_api_keys_array() {
+        // Test YAML merge anchors with api_keys array containing dynamic auth
+        let yaml = r#"
+defaults: &defaults
+  tls: true
+  port: 443
+
+http_port: 8080
+
+providers:
+  - type: "anthropic"
+    host: "claude.ai"
+    endpoint: "claude.ai"
+    api_keys:
+      - key: "$(/usr/bin/jq -r '.accessToken' /path/to/creds.json)"
+        weight: 1.0
+    <<: *defaults
+"#;
+
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        value.apply_merge().unwrap();
+        let merged_yaml = serde_yaml::to_string(&value).unwrap();
+        let config: Config = serde_yaml::from_str(&merged_yaml).unwrap();
+
+        assert_eq!(config.http_port, Some(8080));
+        assert_eq!(config.providers.len(), 1);
+        let api_keys = config.providers[0].api_keys.as_ref().unwrap();
+        assert_eq!(
+            api_keys[0].key,
+            "$(/usr/bin/jq -r '.accessToken' /path/to/creds.json)"
+        )
     }
 }
