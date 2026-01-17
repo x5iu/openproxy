@@ -135,6 +135,11 @@ pub trait Provider: Send + Sync {
         true
     }
 
+    /// Extract port from sock_address (e.g., "api.openai.com:443" -> 443)
+    fn port(&self) -> u16 {
+        http::extract_port(self.sock_address()).unwrap_or(443)
+    }
+
     fn is_healthy(&self) -> bool;
     fn set_healthy(&self, healthy: bool);
 

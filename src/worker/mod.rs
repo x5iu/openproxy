@@ -124,6 +124,7 @@ where
             let mut is_invalid_key = false;
             let mut is_bad_request = false;
             let mut is_not_found = false;
+            let mut is_connect_disabled = false;
             let mut err_msg: Option<Cow<str>> = None;
             loop {
                 let p = crate::program();
@@ -178,6 +179,62 @@ where
                     }
                 };
                 request.set_incoming_auth_type(auth_type);
+
+                // Check if this is a CONNECT tunnel request
+                if request.method() == "CONNECT" {
+                    // Check if CONNECT tunnel is enabled
+                    if !p.connect_tunnel_enabled {
+                        is_connect_disabled = true;
+                        err_msg = Some("CONNECT tunnel not enabled".into());
+                        break;
+                    }
+
+                    // Validate that CONNECT target port matches provider's port.
+                    // For CONNECT requests, the Host header contains "host:port" (e.g., "api.openai.com:443").
+                    // We extract the port from the Host header and verify it matches the provider's port.
+                    // This prevents "CONNECT A:443" from silently connecting to B:8080.
+                    // If Host doesn't include a port, we skip validation (client accepts provider's port).
+                    if let Some(requested_port) = http::extract_port(&host) {
+                        if requested_port != provider.port() {
+                            is_bad_request = true;
+                            err_msg = Some(
+                                format!(
+                                    "CONNECT port {} does not match provider port {}",
+                                    requested_port,
+                                    provider.port()
+                                )
+                                .into(),
+                            );
+                            break;
+                        }
+                    }
+
+                    // Get connection parameters from provider
+                    let endpoint = provider.endpoint().to_string();
+                    let sock_address = provider.sock_address().to_string();
+                    let use_tls = provider.tls();
+
+                    // Get any pre-read data (bytes read after headers, e.g., TLS ClientHello)
+                    let preread_data = request.take_preread_data().to_vec();
+
+                    #[cfg(debug_assertions)]
+                    log::info!(
+                        host = &host,
+                        endpoint = &endpoint,
+                        sock_address = &sock_address,
+                        use_tls = use_tls,
+                        preread_bytes = preread_data.len();
+                        "connect_tunnel_request"
+                    );
+
+                    // Drop locks before establishing tunnel
+                    drop(p);
+                    drop(request);
+
+                    return self
+                        .handle_connect_tunnel(incoming, &endpoint, &sock_address, use_tls, &preread_data)
+                        .await;
+                }
 
                 // Check if this is a WebSocket upgrade request
                 if request.is_websocket_upgrade() {
@@ -303,6 +360,17 @@ where
                 let msg = err_msg.as_deref().unwrap_or("bad request");
                 let resp = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.len(),
+                    msg
+                );
+                incoming
+                    .write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| ProxyError::Client(e.into()))?;
+            } else if is_connect_disabled {
+                let msg = err_msg.as_deref().unwrap_or("CONNECT not enabled");
+                let resp = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     msg.len(),
                     msg
                 );
@@ -1042,7 +1110,6 @@ impl UpstreamInfo {
             }
         }
 
-
         loop {
             let block = match response
                 .payload
@@ -1181,6 +1248,113 @@ where
             };
             Ok(conn)
         }
+    }
+
+    /// Handle HTTP CONNECT tunnel request
+    /// This method:
+    /// 1. Establishes a connection to the target server (TCP or TLS, reusing get_or_create_h1)
+    /// 2. Sends 200 Connection Established response to client
+    /// 3. Forwards any pre-read data to upstream
+    /// 4. Performs bidirectional TCP proxying
+    async fn handle_connect_tunnel<S>(
+        &mut self,
+        incoming: &mut S,
+        endpoint: &str,
+        sock_address: &str,
+        use_tls: bool,
+        preread_data: &[u8],
+    ) -> Result<(), ProxyError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+        <P as PoolTrait>::Item: Send + Unpin,
+    {
+        // 1. Connect to target server (reuse get_or_create_h1 for connection pooling and TLS)
+        let mut outgoing = match self.get_or_create_h1(endpoint, sock_address, use_tls).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Log the error with full context for debugging
+                log::error!(
+                    endpoint = endpoint,
+                    sock_address = sock_address,
+                    use_tls = use_tls,
+                    error = e.to_string();
+                    "connect_tunnel_upstream_connect_failed"
+                );
+                // Send a generic error to client (don't leak internal details)
+                let msg = "upstream connection failed";
+                let resp = format!(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.len(),
+                    msg
+                );
+                incoming
+                    .write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| ProxyError::Client(e.into()))?;
+                return Ok(());
+            }
+        };
+
+        // 2. Send 200 Connection Established response
+        incoming
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .map_err(|e| ProxyError::Client(e.into()))?;
+        incoming
+            .flush()
+            .await
+            .map_err(|e| ProxyError::Client(e.into()))?;
+
+        #[cfg(debug_assertions)]
+        log::info!(endpoint = endpoint, sock_address = sock_address; "connect_tunnel_established");
+
+        // 3. Forward any pre-read data to upstream
+        // (Client may have sent TLS ClientHello immediately after CONNECT request)
+        //
+        // IMPORTANT: After sending "200 Connection Established", we MUST NOT return
+        // ProxyError::Server or ProxyError::Client. The executor would write an HTTP
+        // error response into the tunnel, corrupting the client's TLS handshake.
+        // All errors after this point should be logged and handled by closing connections.
+        if !preread_data.is_empty() {
+            if let Err(e) = outgoing.write_all(preread_data).await {
+                log::error!(
+                    endpoint = endpoint,
+                    preread_bytes = preread_data.len(),
+                    error = e.to_string();
+                    "connect_tunnel_preread_forward_failed"
+                );
+                ConnTrait::shutdown(&mut outgoing).await;
+                return Ok(());
+            }
+            if let Err(e) = outgoing.flush().await {
+                log::error!(
+                    endpoint = endpoint,
+                    error = e.to_string();
+                    "connect_tunnel_preread_flush_failed"
+                );
+                ConnTrait::shutdown(&mut outgoing).await;
+                return Ok(());
+            }
+            #[cfg(debug_assertions)]
+            log::info!(
+                endpoint = endpoint,
+                bytes = preread_data.len();
+                "connect_tunnel_preread_forwarded"
+            );
+        }
+
+        // 4. Bidirectional TCP proxying
+        if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
+            // Log tunnel errors for observability, but don't propagate as ProxyError
+            // since we've already sent "200 Connection Established"
+            log::warn!(
+                endpoint = endpoint,
+                error = e.to_string();
+                "connect_tunnel_copy_error"
+            );
+        }
+
+        Ok(())
     }
 
     /// Handle WebSocket upgrade request with pre-extracted data

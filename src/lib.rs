@@ -89,6 +89,7 @@ struct Program {
     enable_health_check: bool,
     health_check_interval: u64,
     graceful_shutdown_timeout: u64,
+    connect_tunnel_enabled: bool,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     providers: Arc<Vec<Box<dyn Provider>>>,
 }
@@ -222,6 +223,7 @@ impl Program {
             enable_health_check,
             health_check_interval,
             graceful_shutdown_timeout: config.graceful_shutdown_timeout.unwrap_or(5),
+            connect_tunnel_enabled: config.connect_tunnel_enabled,
             shutdown_tx,
             providers: Arc::new(providers),
         })
@@ -401,6 +403,9 @@ struct Config<'a> {
     health_check_interval: Option<u64>,
     /// Graceful shutdown timeout in seconds (default: 5)
     graceful_shutdown_timeout: Option<u64>,
+    /// Enable CONNECT tunnel support (default: false)
+    #[serde(default)]
+    connect_tunnel_enabled: bool,
     /// Providers configuration
     #[serde(borrow)]
     providers: Vec<ProviderConfig<'a>>,
@@ -785,6 +790,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -847,6 +853,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -906,6 +913,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -963,6 +971,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -1050,6 +1059,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -1105,6 +1115,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -1146,6 +1157,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
