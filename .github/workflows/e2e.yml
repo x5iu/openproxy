@@ -600,6 +600,7 @@ jobs:
             - type: openai
               host: ${OPENAI_ENDPOINT}
               endpoint: ${OPENAI_ENDPOINT}
+              port: 443
               api_key: ${OPENAI_API_KEY}
               tls: false
             # Echo server provider for data transfer test
