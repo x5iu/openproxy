@@ -551,3 +551,12 @@ jobs:
           cd e2e
           python test_auth_selection.py
           echo "Auth selection E2E tests passed!"
+
+      - name: Run Health Check Auth E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing health check auth error handling..."
+          cd e2e
+          python test_health_check_auth.py
+          echo "Health check auth E2E tests passed!"

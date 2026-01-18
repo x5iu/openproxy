@@ -163,15 +163,24 @@ where
                 ) {
                     Ok((provider, auth_type)) => (provider, auth_type),
                     Err(_) => {
-                        // Check if any provider matches the host/path (for proper error message)
-                        if p.select_provider(&host, request.path()).is_some() {
-                            // Providers exist but all failed authentication
+                        // Check if any provider (ignoring health) can authenticate
+                        // This handles the case where the matching provider exists but is unhealthy
+                        if p.select_provider_with_auth_ignoring_health(
+                            &host,
+                            request.path(),
+                            |provider| provider.authenticate_with_type(auth_key.as_deref()),
+                        ) {
+                            // Provider exists for this key but is unhealthy -> 404
+                            is_not_found = true;
+                            err_msg = Some(Error::NoProviderFound.to_string().into());
+                        } else if p.select_provider(&host, request.path()).is_some() {
+                            // Healthy providers exist but all failed authentication -> 401
                             #[cfg(debug_assertions)]
                             log::error!(host = &host, path = request.path(), header:serde = auth_key; "authentication_failed_all_providers");
                             is_invalid_key = true;
                             err_msg = Some("authentication failed".into());
                         } else {
-                            // No providers match the host/path
+                            // No providers match the host/path -> 404
                             is_not_found = true;
                             err_msg = Some(Error::NoProviderFound.to_string().into());
                         }
@@ -428,15 +437,9 @@ where
                     };
                     let p = p.read().await;
 
-                    // Use auth-during-selection: try to find a provider that authenticates successfully
-                    // For HTTP/2, we need to extract auth info from headers and query params
-                    let (provider, incoming_auth_type) = match p.select_provider_with_auth(
-                        authority.host(),
-                        request.uri().path(),
-                        |provider| {
-                            // Extract auth header for this provider
-                            let mut auth_header_bytes: Option<Vec<u8>> = None;
-
+                    // Helper closure to extract auth header bytes from request for a given provider
+                    let extract_auth_header =
+                        |provider: &dyn Provider| -> Option<Vec<u8>> {
                             // Try all supported auth header keys
                             for auth_header_key in provider.auth_header_keys() {
                                 let key_name = auth_header_key.trim_end_matches([' ', ':']);
@@ -444,44 +447,59 @@ where
                                     if let Ok(v) = value.to_str() {
                                         // Reconstruct the full header line for authenticate_with_type
                                         let full_header = format!("{}{}", auth_header_key, v);
-                                        auth_header_bytes = Some(full_header.into_bytes());
-                                        break;
+                                        return Some(full_header.into_bytes());
                                     }
                                 }
                             }
 
                             // Fallback to query parameter if no header found
-                            if auth_header_bytes.is_none() {
-                                if let Some(auth_query_key) = provider.auth_query_key() {
-                                    if let Some(auth_key) =
-                                        request.uri().query().and_then(|query| {
-                                            http::get_auth_query_range(query, auth_query_key)
-                                                .map(|range| &query[range])
-                                        })
-                                    {
-                                        // For query auth, use the primary auth header key format
-                                        if let Some(auth_header_key) = provider.auth_header_key() {
-                                            let full_header =
-                                                format!("{}{}", auth_header_key, auth_key);
-                                            auth_header_bytes = Some(full_header.into_bytes());
-                                        }
+                            if let Some(auth_query_key) = provider.auth_query_key() {
+                                if let Some(auth_key) = request.uri().query().and_then(|query| {
+                                    http::get_auth_query_range(query, auth_query_key)
+                                        .map(|range| &query[range])
+                                }) {
+                                    // For query auth, use the primary auth header key format
+                                    if let Some(auth_header_key) = provider.auth_header_key() {
+                                        let full_header = format!("{}{}", auth_header_key, auth_key);
+                                        return Some(full_header.into_bytes());
                                     }
                                 }
                             }
 
+                            None
+                        };
+
+                    // Use auth-during-selection: try to find a provider that authenticates successfully
+                    // For HTTP/2, we need to extract auth info from headers and query params
+                    let (provider, incoming_auth_type) = match p.select_provider_with_auth(
+                        authority.host(),
+                        request.uri().path(),
+                        |provider| {
+                            let auth_header_bytes = extract_auth_header(provider);
                             provider.authenticate_with_type(auth_header_bytes.as_deref())
                         },
                     ) {
                         Ok((provider, auth_type)) => (provider, auth_type),
                         Err(_) => {
-                            // Check if any provider matches the host/path (for proper error message)
-                            if p.select_provider(authority.host(), request.uri().path())
+                            // Check if any provider (ignoring health) can authenticate
+                            // This handles the case where the matching provider exists but is unhealthy
+                            if p.select_provider_with_auth_ignoring_health(
+                                authority.host(),
+                                request.uri().path(),
+                                |provider| {
+                                    let auth_header_bytes = extract_auth_header(provider);
+                                    provider.authenticate_with_type(auth_header_bytes.as_deref())
+                                },
+                            ) {
+                                // Provider exists for this key but is unhealthy -> 404
+                                return invalid!(respond, 404, Error::NoProviderFound.to_string());
+                            } else if p.select_provider(authority.host(), request.uri().path())
                                 .is_some()
                             {
-                                // Providers exist but all failed authentication
+                                // Healthy providers exist but all failed authentication -> 401
                                 return invalid!(respond, 401, "authentication failed");
                             } else {
-                                // No providers match the host/path
+                                // No providers match the host/path -> 404
                                 return invalid!(respond, 404, Error::NoProviderFound.to_string());
                             }
                         }

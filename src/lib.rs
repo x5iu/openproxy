@@ -367,6 +367,51 @@ impl Program {
             }
         }
     }
+
+    /// Check if any provider (ignoring health status) can authenticate with the given key.
+    /// This is used to distinguish between:
+    /// - A provider exists for this key but is unhealthy -> 404
+    /// - No provider matches this key -> 401 (if healthy providers exist for host)
+    ///
+    /// Returns true if any provider (healthy or not) can authenticate with the given key.
+    pub fn select_provider_with_auth_ignoring_health<F>(
+        &self,
+        host: &str,
+        path: &str,
+        authenticate: F,
+    ) -> bool
+    where
+        F: Fn(&dyn Provider) -> Result<Option<&'static str>, provider::AuthenticationError>,
+    {
+        // Strip port from incoming host for comparison
+        let host_without_port = http::strip_port(host);
+        let all_providers: Vec<&dyn Provider> = self
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                // Note: We intentionally skip the is_healthy() check here
+                let (provider_host, provider_path_prefix) = http::split_host_path(provider.host());
+                // Strip port from provider host for comparison
+                let provider_host_without_port = http::strip_port(provider_host);
+                let selected = if let Some(provider_path_prefix) = provider_path_prefix {
+                    (provider_host == host || provider_host_without_port == host_without_port)
+                        && path.starts_with(provider_path_prefix)
+                        && matches!(
+                            path.as_bytes().get(provider_path_prefix.len()),
+                            None | Some(b'/')
+                        )
+                } else {
+                    provider_host == host || provider_host_without_port == host_without_port
+                };
+                selected.then_some(&**provider)
+            })
+            .collect();
+
+        // Check if any provider can authenticate (regardless of health status)
+        all_providers
+            .into_iter()
+            .any(|provider| authenticate(provider).is_ok())
+    }
 }
 
 #[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
