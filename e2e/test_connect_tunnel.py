@@ -15,6 +15,15 @@ import threading
 import time
 
 
+def strip_url_scheme(host: str) -> str:
+    """Strip https:// or http:// prefix and trailing slash from host."""
+    if host.startswith("https://"):
+        host = host[8:]
+    elif host.startswith("http://"):
+        host = host[7:]
+    return host.rstrip("/")
+
+
 def test_connect_tunnel_disabled():
     """Test that CONNECT requests return 403 when tunnel is disabled."""
     print(f"\n{'='*50}")
@@ -24,6 +33,9 @@ def test_connect_tunnel_disabled():
     proxy_host = os.environ.get("PROXY_HOST", "localhost")
     proxy_port = int(os.environ.get("PROXY_PORT", "8080"))
     api_key = os.environ.get("OPENAI_API_KEY", "test-key")
+    # Use TARGET_HOST to match CI provider config; strip URL scheme if present
+    target_host = strip_url_scheme(os.environ.get("TARGET_HOST", "api.openai.com"))
+    target_port = int(os.environ.get("TARGET_PORT", "443"))
 
     # Create a raw socket connection to send CONNECT request
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -34,8 +46,8 @@ def test_connect_tunnel_disabled():
 
         # Send CONNECT request
         request = (
-            f"CONNECT api.openai.com:443 HTTP/1.1\r\n"
-            f"Host: api.openai.com:443\r\n"
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
             f"Authorization: Bearer {api_key}\r\n"
             f"\r\n"
         )
@@ -61,15 +73,6 @@ def test_connect_tunnel_disabled():
 
     finally:
         sock.close()
-
-
-def strip_url_scheme(host: str) -> str:
-    """Strip https:// or http:// prefix and trailing slash from host."""
-    if host.startswith("https://"):
-        host = host[8:]
-    elif host.startswith("http://"):
-        host = host[7:]
-    return host.rstrip("/")
 
 
 def test_connect_tunnel_enabled():
@@ -159,6 +162,9 @@ def test_connect_tunnel_auth_failure():
 
     proxy_host = os.environ.get("PROXY_HOST", "localhost")
     proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
+    # Use TARGET_HOST to match CI provider config
+    target_host = strip_url_scheme(os.environ.get("TARGET_HOST", "api.openai.com"))
+    target_port = int(os.environ.get("TARGET_PORT", "443"))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
@@ -168,8 +174,8 @@ def test_connect_tunnel_auth_failure():
 
         # Send CONNECT request with invalid auth
         request = (
-            f"CONNECT api.openai.com:443 HTTP/1.1\r\n"
-            f"Host: api.openai.com:443\r\n"
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
             f"Authorization: Bearer invalid-key-12345\r\n"
             f"\r\n"
         )
@@ -296,7 +302,8 @@ def test_connect_tunnel_data_transfer():
     echo_thread.start()
 
     # Wait for server to be ready
-    ready_event.wait(timeout=5)
+    if not ready_event.wait(timeout=5):
+        raise RuntimeError("Echo server failed to start within timeout")
     time.sleep(0.1)  # Give it a moment
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -332,8 +339,14 @@ def test_connect_tunnel_data_transfer():
         test_data = b"Hello, CONNECT tunnel!"
         sock.sendall(test_data)
 
-        # Receive echoed data
-        echoed = sock.recv(4096)
+        # Receive echoed data - loop until we have all expected bytes (TCP may fragment)
+        echoed = b""
+        while len(echoed) < len(test_data):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            echoed += chunk
+
         print(f"Sent: {test_data}")
         print(f"Received: {echoed}")
 
@@ -380,7 +393,8 @@ def test_connect_tunnel_preread():
     echo_thread.start()
 
     # Wait for server to be ready
-    ready_event.wait(timeout=5)
+    if not ready_event.wait(timeout=5):
+        raise RuntimeError("Echo server failed to start within timeout")
     time.sleep(0.1)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -443,6 +457,116 @@ def test_connect_tunnel_preread():
         echo_thread.join(timeout=1)
 
 
+def test_connect_tunnel_port_mismatch():
+    """Test that CONNECT requests with mismatched port return 400.
+
+    When client requests CONNECT to host:port but the provider is configured
+    for a different port, the proxy should return 400 Bad Request.
+    """
+    print(f"\n{'='*50}")
+    print("Testing CONNECT tunnel port mismatch (400)")
+    print('='*50)
+
+    proxy_host = os.environ.get("PROXY_HOST", "localhost")
+    proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
+    api_key = os.environ.get("OPENAI_API_KEY", "test-key")
+    # Use TARGET_HOST but with a WRONG port (provider is configured for 443)
+    target_host = strip_url_scheme(os.environ.get("TARGET_HOST", "api.openai.com"))
+    wrong_port = 8080  # Provider is configured for 443, not 8080
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+
+    try:
+        sock.connect((proxy_host, proxy_port))
+
+        # Send CONNECT request with wrong port
+        request = (
+            f"CONNECT {target_host}:{wrong_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{wrong_port}\r\n"
+            f"Authorization: Bearer {api_key}\r\n"
+            f"\r\n"
+        )
+        sock.sendall(request.encode())
+
+        # Read response
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        response_str = response.decode('utf-8', errors='replace')
+        print(f"Response:\n{response_str}")
+
+        # Should get 400 Bad Request with port mismatch message
+        assert "400" in response_str, f"Expected 400, got: {response_str}"
+        assert "does not match provider port" in response_str.lower(), \
+            f"Expected 'does not match provider port' message, got: {response_str}"
+
+        print("\u2713 CONNECT tunnel port mismatch test passed!")
+
+    finally:
+        sock.close()
+
+
+def test_connect_tunnel_upstream_unreachable():
+    """Test that CONNECT returns 502 when upstream is unreachable.
+
+    When the provider's endpoint is unreachable (connection refused),
+    the proxy should return 502 Bad Gateway.
+    """
+    print(f"\n{'='*50}")
+    print("Testing CONNECT tunnel upstream unreachable (502)")
+    print('='*50)
+
+    proxy_host = os.environ.get("PROXY_HOST", "localhost")
+    proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
+    api_key = os.environ.get("OPENAI_API_KEY", "test-key")
+    # Use the echo server host but with a port where nothing is listening
+    # The provider for local-service is configured for port 19999
+    # We'll use port 19998 which should be closed
+    target_host = os.environ.get("UNREACHABLE_TARGET_HOST", "local-service")
+    unreachable_port = int(os.environ.get("UNREACHABLE_TARGET_PORT", "19999"))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+
+    try:
+        sock.connect((proxy_host, proxy_port))
+
+        # Send CONNECT request to unreachable endpoint
+        request = (
+            f"CONNECT {target_host}:{unreachable_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{unreachable_port}\r\n"
+            f"Authorization: Bearer {api_key}\r\n"
+            f"\r\n"
+        )
+        sock.sendall(request.encode())
+
+        # Read response
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        response_str = response.decode('utf-8', errors='replace')
+        print(f"Response:\n{response_str}")
+
+        # Should get 502 Bad Gateway
+        assert "502" in response_str, f"Expected 502, got: {response_str}"
+        assert "upstream" in response_str.lower() or "connection failed" in response_str.lower(), \
+            f"Expected upstream connection failure message, got: {response_str}"
+
+        print("\u2713 CONNECT tunnel upstream unreachable test passed!")
+
+    finally:
+        sock.close()
+
+
 if __name__ == "__main__":
     import sys
 
@@ -479,6 +603,16 @@ if __name__ == "__main__":
         test_connect_tunnel_preread()
         tests_run += 1
 
+    # Test port mismatch (returns 400)
+    if os.environ.get("TEST_CONNECT_PORT_MISMATCH", "false").lower() == "true":
+        test_connect_tunnel_port_mismatch()
+        tests_run += 1
+
+    # Test upstream unreachable (returns 502)
+    if os.environ.get("TEST_CONNECT_UPSTREAM_UNREACHABLE", "false").lower() == "true":
+        test_connect_tunnel_upstream_unreachable()
+        tests_run += 1
+
     if tests_run == 0:
         print("\n" + "="*50)
         print("ERROR: No tests were run!")
@@ -489,6 +623,8 @@ if __name__ == "__main__":
         print("  TEST_CONNECT_NO_PROVIDER")
         print("  TEST_CONNECT_DATA_TRANSFER")
         print("  TEST_CONNECT_PREREAD")
+        print("  TEST_CONNECT_PORT_MISMATCH")
+        print("  TEST_CONNECT_UPSTREAM_UNREACHABLE")
         print("="*50)
         sys.exit(1)
 

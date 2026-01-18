@@ -135,6 +135,11 @@ jobs:
               host: api.openai.com
               endpoint: ${OPENAI_ENDPOINT}
               api_key: ${OPENAI_API_KEY}
+            # Provider with OPENAI_ENDPOINT as host for CONNECT disabled test
+            - type: openai
+              host: ${OPENAI_ENDPOINT}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             - type: openai
               host: echo.localhost:8443
               endpoint: localhost
@@ -566,6 +571,8 @@ jobs:
           PROXY_HOST: localhost
           PROXY_PORT: 8080
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          TARGET_HOST: ${{ secrets.OPENAI_HOST }}
+          TARGET_PORT: "443"
           TEST_CONNECT_DISABLED: "true"
         run: |
           echo "Testing CONNECT tunnel when disabled..."
@@ -609,6 +616,12 @@ jobs:
               endpoint: localhost
               port: 19999
               tls: false
+            # Unreachable provider for 502 test (port 19998 has no server)
+            - type: openai
+              host: unreachable-service
+              endpoint: localhost
+              port: 19998
+              tls: false
           YAML
 
           cat config_connect.yml
@@ -629,6 +642,7 @@ jobs:
           TEST_CONNECT_ENABLED: "true"
           TEST_CONNECT_AUTH_FAILURE: "true"
           TEST_CONNECT_NO_PROVIDER: "true"
+          TEST_CONNECT_PORT_MISMATCH: "true"
         run: |
           echo "Testing CONNECT tunnel when enabled..."
           cd e2e
@@ -649,3 +663,17 @@ jobs:
           cd e2e
           python test_connect_tunnel.py
           echo "CONNECT tunnel data transfer and preread tests passed!"
+
+      - name: Run CONNECT tunnel upstream unreachable test
+        env:
+          PROXY_HOST: localhost
+          PROXY_PORT_CONNECT: 18080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          UNREACHABLE_TARGET_HOST: unreachable-service
+          UNREACHABLE_TARGET_PORT: "19998"
+          TEST_CONNECT_UPSTREAM_UNREACHABLE: "true"
+        run: |
+          echo "Testing CONNECT tunnel upstream unreachable..."
+          cd e2e
+          python test_connect_tunnel.py
+          echo "CONNECT tunnel upstream unreachable test passed!"
