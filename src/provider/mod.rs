@@ -363,10 +363,15 @@ impl Provider for OpenAIProvider {
         };
         #[cfg(debug_assertions)]
         log::info!(provider = "openai", header = header_str; "authentication");
-        if !http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            return Err(AuthenticationError);
+        // Accept both Authorization and Proxy-Authorization headers
+        // Proxy-Authorization is commonly used by HTTP proxy clients (e.g., CONNECT tunnel)
+        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
+            self.authenticate_key(&header_str[http::HEADER_AUTHORIZATION.len()..])
+        } else if http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION) {
+            self.authenticate_key(&header_str[http::HEADER_PROXY_AUTHORIZATION.len()..])
+        } else {
+            Err(AuthenticationError)
         }
-        self.authenticate_key(&header_str[http::HEADER_AUTHORIZATION.len()..])
     }
 
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError> {
@@ -550,6 +555,14 @@ impl Provider for GeminiProvider {
         log::info!(provider = "gemini", key = key_str; "authentication");
         if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
             key_str = &key_str[http::HEADER_X_GOOG_API_KEY.len()..];
+        } else if http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION) {
+            // Support Proxy-Authorization for HTTP proxy clients (e.g., CONNECT tunnel)
+            let value = key_str[http::HEADER_PROXY_AUTHORIZATION.len()..].trim();
+            if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
+                key_str = value[7..].trim();
+            } else {
+                key_str = value;
+            }
         }
         self.authenticate_key(key_str)
     }
@@ -951,6 +964,16 @@ impl Provider for AnthropicProvider {
         if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
             let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
             // RFC 7235 specifies that auth-scheme is case-insensitive
+            if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
+                let token = value[7..].trim();
+                self.authenticate_key(token)?;
+                return Ok(Some("bearer"));
+            }
+        }
+
+        // Check Proxy-Authorization: Bearer (for HTTP proxy clients like CONNECT tunnel)
+        if http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION) {
+            let value = header_str[http::HEADER_PROXY_AUTHORIZATION.len()..].trim();
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
                 self.authenticate_key(token)?;
