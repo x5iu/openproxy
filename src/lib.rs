@@ -89,6 +89,7 @@ struct Program {
     enable_health_check: bool,
     health_check_interval: u64,
     graceful_shutdown_timeout: u64,
+    connect_tunnel_enabled: bool,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     providers: Arc<Vec<Box<dyn Provider>>>,
 }
@@ -222,6 +223,7 @@ impl Program {
             enable_health_check,
             health_check_interval,
             graceful_shutdown_timeout: config.graceful_shutdown_timeout.unwrap_or(5),
+            connect_tunnel_enabled: config.connect_tunnel_enabled,
             shutdown_tx,
             providers: Arc::new(providers),
         })
@@ -365,6 +367,51 @@ impl Program {
             }
         }
     }
+
+    /// Check if any provider (ignoring health status) can authenticate with the given key.
+    /// This is used to distinguish between:
+    /// - A provider exists for this key but is unhealthy -> 404
+    /// - No provider matches this key -> 401 (if healthy providers exist for host)
+    ///
+    /// Returns true if any provider (healthy or not) can authenticate with the given key.
+    pub fn select_provider_with_auth_ignoring_health<F>(
+        &self,
+        host: &str,
+        path: &str,
+        authenticate: F,
+    ) -> bool
+    where
+        F: Fn(&dyn Provider) -> Result<Option<&'static str>, provider::AuthenticationError>,
+    {
+        // Strip port from incoming host for comparison
+        let host_without_port = http::strip_port(host);
+        let all_providers: Vec<&dyn Provider> = self
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                // Note: We intentionally skip the is_healthy() check here
+                let (provider_host, provider_path_prefix) = http::split_host_path(provider.host());
+                // Strip port from provider host for comparison
+                let provider_host_without_port = http::strip_port(provider_host);
+                let selected = if let Some(provider_path_prefix) = provider_path_prefix {
+                    (provider_host == host || provider_host_without_port == host_without_port)
+                        && path.starts_with(provider_path_prefix)
+                        && matches!(
+                            path.as_bytes().get(provider_path_prefix.len()),
+                            None | Some(b'/')
+                        )
+                } else {
+                    provider_host == host || provider_host_without_port == host_without_port
+                };
+                selected.then_some(&**provider)
+            })
+            .collect();
+
+        // Check if any provider can authenticate (regardless of health status)
+        all_providers
+            .into_iter()
+            .any(|provider| authenticate(provider).is_ok())
+    }
 }
 
 #[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
@@ -401,6 +448,9 @@ struct Config<'a> {
     health_check_interval: Option<u64>,
     /// Graceful shutdown timeout in seconds (default: 5)
     graceful_shutdown_timeout: Option<u64>,
+    /// Enable CONNECT tunnel support (default: false)
+    #[serde(default)]
+    connect_tunnel_enabled: bool,
     /// Providers configuration
     #[serde(borrow)]
     providers: Vec<ProviderConfig<'a>>,
@@ -785,6 +835,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -847,6 +898,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -906,6 +958,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -963,6 +1016,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -1050,6 +1104,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -1105,6 +1160,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
@@ -1146,6 +1202,7 @@ mod tests {
             enable_health_check: false,
             health_check_interval: 0,
             graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
             shutdown_tx: tokio::sync::broadcast::channel(1).0,
             providers: Arc::new(providers),
         };
