@@ -402,7 +402,7 @@ impl<'a> Payload<'a> {
                         }
                     }
                 }
-                // Always filter Proxy-Authorization to prevent leaking it to upstream,
+                // Always filter ALL Proxy-Authorization headers to prevent leaking to upstream,
                 // even if another auth header was used for authentication.
                 {
                     let header_lines = HeaderLines::new(&crlfs, header);
@@ -420,7 +420,7 @@ impl<'a> Payload<'a> {
                             if !filtered_headers.contains(&range) {
                                 filtered_headers.push(range);
                             }
-                            break;
+                            // Don't break - filter ALL occurrences
                         }
                     }
                 }
@@ -1485,6 +1485,23 @@ mod tests {
         // Test Debug trait
         let debug_str = format!("{:?}", upgrade);
         assert!(debug_str.contains("WebSocketUpgrade"));
+    }
+
+    #[test]
+    fn test_proxy_authorization_always_filtered() {
+        // Verify HEADER_PROXY_AUTHORIZATION constant is correct
+        assert_eq!(HEADER_PROXY_AUTHORIZATION, "Proxy-Authorization: ");
+
+        // The actual filtering logic is tested through integration tests,
+        // but we verify that the constant matches what HTTP clients send.
+        // When both Authorization and Proxy-Authorization are present,
+        // Proxy-Authorization must be filtered to prevent upstream leakage.
+        let sample_header = "Proxy-Authorization: Bearer sk-test-key";
+        assert!(is_header(sample_header, HEADER_PROXY_AUTHORIZATION));
+
+        // Verify case-insensitive matching works
+        let lowercase_header = "proxy-authorization: Bearer sk-test-key";
+        assert!(is_header(lowercase_header, HEADER_PROXY_AUTHORIZATION));
     }
 }
 
