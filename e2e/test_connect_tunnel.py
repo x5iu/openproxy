@@ -470,9 +470,11 @@ def test_connect_tunnel_port_mismatch():
     proxy_host = os.environ.get("PROXY_HOST", "localhost")
     proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
     api_key = os.environ.get("OPENAI_API_KEY", "test-key")
-    # Use TARGET_HOST but with a WRONG port (provider is configured for 443)
+    # Use TARGET_HOST but with a WRONG port
     target_host = strip_url_scheme(os.environ.get("TARGET_HOST", "api.openai.com"))
-    wrong_port = 8080  # Provider is configured for 443, not 8080
+    target_port = int(os.environ.get("TARGET_PORT", "443"))
+    # Pick a port that's definitely different from the configured one
+    wrong_port = 8080 if target_port != 8080 else 8081
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
@@ -524,11 +526,10 @@ def test_connect_tunnel_upstream_unreachable():
     proxy_host = os.environ.get("PROXY_HOST", "localhost")
     proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
     api_key = os.environ.get("OPENAI_API_KEY", "test-key")
-    # Use the echo server host but with a port where nothing is listening
-    # The provider for local-service is configured for port 19999
-    # We'll use port 19998 which should be closed
-    target_host = os.environ.get("UNREACHABLE_TARGET_HOST", "local-service")
-    unreachable_port = int(os.environ.get("UNREACHABLE_TARGET_PORT", "19999"))
+    # Use the unreachable-service host configured for a closed port
+    # Default port 19998 matches the CI provider config
+    target_host = os.environ.get("UNREACHABLE_TARGET_HOST", "unreachable-service")
+    unreachable_port = int(os.environ.get("UNREACHABLE_TARGET_PORT", "19998"))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
