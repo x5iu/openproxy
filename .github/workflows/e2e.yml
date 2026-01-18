@@ -135,6 +135,11 @@ jobs:
               host: api.openai.com
               endpoint: ${OPENAI_ENDPOINT}
               api_key: ${OPENAI_API_KEY}
+            # Provider with OPENAI_ENDPOINT as host for CONNECT disabled test
+            - type: openai
+              host: ${OPENAI_ENDPOINT}
+              endpoint: ${OPENAI_ENDPOINT}
+              api_key: ${OPENAI_API_KEY}
             - type: openai
               host: echo.localhost:8443
               endpoint: localhost
@@ -551,3 +556,124 @@ jobs:
           cd e2e
           python test_auth_selection.py
           echo "Auth selection E2E tests passed!"
+
+      - name: Run Health Check Auth E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing health check auth error handling..."
+          cd e2e
+          python test_health_check_auth.py
+          echo "Health check auth E2E tests passed!"
+
+      - name: Run CONNECT tunnel disabled test
+        env:
+          PROXY_HOST: localhost
+          PROXY_PORT: 8080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          TARGET_HOST: ${{ secrets.OPENAI_HOST }}
+          TARGET_PORT: "443"
+          TEST_CONNECT_DISABLED: "true"
+        run: |
+          echo "Testing CONNECT tunnel when disabled..."
+          cd e2e
+          python test_connect_tunnel.py
+          echo "CONNECT tunnel disabled test passed!"
+
+      - name: Create CONNECT-enabled config and start second proxy
+        env:
+          OPENAI_HOST: ${{ secrets.OPENAI_HOST }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Process OpenAI config
+          OPENAI_ENDPOINT="${OPENAI_HOST#https://}"
+          OPENAI_ENDPOINT="${OPENAI_ENDPOINT#http://}"
+          OPENAI_ENDPOINT="${OPENAI_ENDPOINT%/}"
+
+          # Create config with connect_tunnel_enabled
+          cat > config_connect.yml << YAML
+          cert_file: fullchain.pem
+          private_key_file: privkey.pem
+          https_port: 18443
+          http_port: 18080
+          connect_tunnel_enabled: true
+
+          auth_keys:
+            - ${AUTH_KEY}
+
+          providers:
+            # CONNECT tunnel always uses transparent TCP (ignores tls setting).
+            # Client handles TLS directly with upstream after receiving "200 Connection Established".
+            - type: openai
+              host: ${OPENAI_ENDPOINT}
+              endpoint: ${OPENAI_ENDPOINT}
+              port: 443
+              api_key: ${OPENAI_API_KEY}
+              tls: false
+            # Echo server provider for data transfer test
+            - type: openai
+              host: local-service
+              endpoint: localhost
+              port: 19999
+              tls: false
+            # Unreachable provider for 502 test (port 19998 has no server)
+            - type: openai
+              host: unreachable-service
+              endpoint: localhost
+              port: 19998
+              tls: false
+          YAML
+
+          cat config_connect.yml
+
+          # Start second openproxy instance with CONNECT enabled
+          ./target/release/openproxy start -c config_connect.yml &
+          sleep 3
+          curl http://localhost:18080 || true
+          echo "CONNECT-enabled proxy started on port 18080"
+
+      - name: Run CONNECT tunnel enabled tests
+        env:
+          PROXY_HOST: localhost
+          PROXY_PORT_CONNECT: 18080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          TARGET_HOST: ${{ secrets.OPENAI_HOST }}
+          TARGET_PORT: "443"
+          TEST_CONNECT_ENABLED: "true"
+          TEST_CONNECT_AUTH_FAILURE: "true"
+          TEST_CONNECT_NO_PROVIDER: "true"
+          TEST_CONNECT_PORT_MISMATCH: "true"
+        run: |
+          echo "Testing CONNECT tunnel when enabled..."
+          cd e2e
+          python test_connect_tunnel.py
+          echo "CONNECT tunnel enabled tests passed!"
+
+      - name: Run CONNECT tunnel data transfer and preread tests
+        env:
+          PROXY_HOST: localhost
+          PROXY_PORT_CONNECT: 18080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          ECHO_TARGET_HOST: local-service
+          ECHO_TARGET_PORT: "19999"
+          TEST_CONNECT_DATA_TRANSFER: "true"
+          TEST_CONNECT_PREREAD: "true"
+        run: |
+          echo "Testing CONNECT tunnel data transfer and preread..."
+          cd e2e
+          python test_connect_tunnel.py
+          echo "CONNECT tunnel data transfer and preread tests passed!"
+
+      - name: Run CONNECT tunnel upstream unreachable test
+        env:
+          PROXY_HOST: localhost
+          PROXY_PORT_CONNECT: 18080
+          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
+          UNREACHABLE_TARGET_HOST: unreachable-service
+          UNREACHABLE_TARGET_PORT: "19998"
+          TEST_CONNECT_UPSTREAM_UNREACHABLE: "true"
+        run: |
+          echo "Testing CONNECT tunnel upstream unreachable..."
+          cd e2e
+          python test_connect_tunnel.py
+          echo "CONNECT tunnel upstream unreachable test passed!"

@@ -19,6 +19,7 @@ const HEADER_CONTENT_LENGTH: &str = "Content-Length: ";
 const HEADER_TRANSFER_ENCODING: &str = "Transfer-Encoding: ";
 pub(crate) const HEADER_HOST: &str = "Host: ";
 pub(crate) const HEADER_AUTHORIZATION: &str = "Authorization: ";
+pub(crate) const HEADER_PROXY_AUTHORIZATION: &str = "Proxy-Authorization: ";
 pub(crate) const HEADER_X_GOOG_API_KEY: &str = "x-goog-api-key: ";
 pub(crate) const HEADER_X_API_KEY: &str = "X-API-Key: ";
 const HEADER_CONNECTION: &str = "Connection: ";
@@ -90,9 +91,19 @@ impl<'a> Request<'a> {
         self.payload.is_websocket_upgrade
     }
 
+    pub fn method(&self) -> &str {
+        self.payload.method()
+    }
+
     /// Get the raw header bytes for forwarding (used for WebSocket upgrade)
     pub fn header_bytes(&self) -> &[u8] {
         &self.payload.internal_buffer[..self.payload.header_length + 2] // +2 for final CRLF
+    }
+
+    /// Get any bytes that were pre-read after the header (for CONNECT tunnel)
+    /// This returns data that was read during header parsing but belongs to the tunnel payload
+    pub fn preread_data(&self) -> &[u8] {
+        self.payload.preread_data()
     }
 }
 
@@ -145,7 +156,11 @@ pub(crate) struct WebSocketUpgrade {
 pub(crate) struct Payload<'a> {
     internal_buffer: Box<[u8]>,
     first_block_length: usize,
+    /// Original number of bytes read (before any adjustments for body processing)
+    /// Used to track pre-read data after headers for CONNECT tunnel
+    original_advanced: usize,
     header_length: usize,
+    method_range: Range<usize>,
     path_range: Range<usize>,
     host_range: Option<Range<usize>>,
     auth_range: Option<Range<usize>>,
@@ -309,6 +324,7 @@ impl<'a> Payload<'a> {
         let Ok(req_line_str) = std::str::from_utf8(req_line) else {
             return Err(Error::InvalidHeader);
         };
+        let method_range = get_req_method(req_line_str);
         let path_range = get_req_path(req_line_str);
         let path = &req_line_str[path_range.start..path_range.end];
         if let Some(host) = get_host(
@@ -366,6 +382,48 @@ impl<'a> Payload<'a> {
                         }
                     }
                 }
+                // Fallback: check Proxy-Authorization for HTTP proxy clients (e.g., CONNECT tunnel)
+                // This allows standard HTTP proxy clients to authenticate without custom headers.
+                if auth_range.is_none() {
+                    let header_lines = HeaderLines::new(&crlfs, header);
+                    for line in header_lines.skip(1) {
+                        let Ok(header) = std::str::from_utf8(line) else {
+                            continue;
+                        };
+                        if is_header(header, HEADER_PROXY_AUTHORIZATION) {
+                            let start = {
+                                let block_start = &block[0] as *const u8 as usize;
+                                let auth_start = &line[0] as *const u8 as usize;
+                                auth_start - block_start
+                            };
+                            filtered_headers.push(start..start + line.len());
+                            auth_range = Some(start..start + line.len());
+                            break;
+                        }
+                    }
+                }
+                // Always filter ALL Proxy-Authorization headers to prevent leaking to upstream,
+                // even if another auth header was used for authentication.
+                {
+                    let header_lines = HeaderLines::new(&crlfs, header);
+                    for line in header_lines.skip(1) {
+                        let Ok(header) = std::str::from_utf8(line) else {
+                            continue;
+                        };
+                        if is_header(header, HEADER_PROXY_AUTHORIZATION) {
+                            let start = {
+                                let block_start = &block[0] as *const u8 as usize;
+                                let header_start = &line[0] as *const u8 as usize;
+                                header_start - block_start
+                            };
+                            let range = start..start + line.len();
+                            if !filtered_headers.contains(&range) {
+                                filtered_headers.push(range);
+                            }
+                            // Don't break - filter ALL occurrences
+                        }
+                    }
+                }
                 if auth_range.is_none() {
                     if let Some(auth_query_key) = provider.auth_query_key() {
                         let Some(request_line) = HeaderLines::new(&crlfs, header).next() else {
@@ -404,6 +462,7 @@ impl<'a> Payload<'a> {
         if content_length.is_some() && transfer_encoding_chunked {
             return Err(Error::InvalidHeader);
         }
+        let original_advanced = advanced;
         let mut first_block_length = advanced;
         let header_length = header.len();
         let body = if let Some(real_content_length) = content_length {
@@ -461,7 +520,9 @@ impl<'a> Payload<'a> {
         Ok(Payload {
             internal_buffer: block,
             first_block_length,
+            original_advanced,
             header_length,
+            method_range,
             path_range,
             host_range,
             auth_range,
@@ -485,6 +546,29 @@ impl<'a> Payload<'a> {
                     &self.internal_buffer[self.path_range.start..self.path_range.end],
                 )
             }
+        }
+    }
+
+    fn method(&self) -> &str {
+        if self.method_range.start == self.method_range.end {
+            ""
+        } else {
+            unsafe {
+                std::str::from_utf8_unchecked(
+                    &self.internal_buffer[self.method_range.start..self.method_range.end],
+                )
+            }
+        }
+    }
+
+    /// Get any bytes that were pre-read after the header
+    /// This is useful for CONNECT tunnel where client may send data immediately after headers
+    fn preread_data(&self) -> &[u8] {
+        let header_end = self.header_length + CRLF.len();
+        if self.original_advanced > header_end {
+            &self.internal_buffer[header_end..self.original_advanced]
+        } else {
+            &[]
         }
     }
 
@@ -689,28 +773,91 @@ pub(crate) fn split_host_path(host: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Strip port from host string (e.g., "localhost:8443" -> "localhost")
+/// Split host string into (host, port) parts.
+/// Handles IPv6 addresses correctly: "[::1]:8080" -> ("[::1]", Some(8080))
+/// Returns (host, None) if no port is present.
 #[inline]
-pub(crate) fn strip_port(host: &str) -> &str {
+pub(crate) fn split_host_port(host: &str) -> (&str, Option<u16>) {
     // Handle IPv6 addresses like [::1]:8080
     if let Some(bracket_idx) = host.rfind(']') {
         if let Some(colon_idx) = host[bracket_idx..].find(':') {
-            return &host[..bracket_idx + colon_idx];
+            let port_start = bracket_idx + colon_idx + 1;
+            let port = host[port_start..].parse().ok();
+            return (&host[..bracket_idx + colon_idx], port);
         }
-        return host;
+        return (host, None);
     }
 
     // If there are multiple ':' and no brackets, treat it as an IPv6 literal without a port.
     // (IPv6 with a port must be bracketed: "[::1]:8080")
     if host.bytes().filter(|&b| b == b':').count() != 1 {
-        return host;
+        return (host, None);
     }
 
     // Handle regular host:port
     if let Some(colon_idx) = host.rfind(':') {
-        return &host[..colon_idx];
+        let port = host[colon_idx + 1..].parse().ok();
+        return (&host[..colon_idx], port);
     }
-    host
+    (host, None)
+}
+
+/// Strip port from host string (e.g., "localhost:8443" -> "localhost")
+#[inline]
+pub(crate) fn strip_port(host: &str) -> &str {
+    split_host_port(host).0
+}
+
+/// Extract port from host string (e.g., "localhost:8443" -> Some(8443))
+/// Returns None if no port is present or if parsing fails.
+#[inline]
+pub(crate) fn extract_port(host: &str) -> Option<u16> {
+    split_host_port(host).1
+}
+
+/// Parse port from host string with detailed error handling.
+/// Returns:
+/// - `Ok(None)` if no port is specified (e.g., "example.com")
+/// - `Ok(Some(port))` if valid port (e.g., "example.com:443" -> Ok(Some(443)))
+/// - `Err(())` if port string is present but invalid (e.g., "example.com:abc")
+#[inline]
+pub(crate) fn parse_port(host: &str) -> Result<Option<u16>, ()> {
+    // Handle IPv6 addresses like [::1]:8080
+    if let Some(bracket_idx) = host.rfind(']') {
+        if let Some(colon_idx) = host[bracket_idx..].find(':') {
+            let port_start = bracket_idx + colon_idx + 1;
+            let port_str = &host[port_start..];
+            if port_str.is_empty() {
+                return Err(()); // "host:" with empty port
+            }
+            return port_str.parse().map(Some).map_err(|_| ());
+        }
+        return Ok(None); // No port after bracket
+    }
+
+    // If there are multiple ':' and no brackets, treat it as an IPv6 literal without a port.
+    if host.bytes().filter(|&b| b == b':').count() != 1 {
+        return Ok(None);
+    }
+
+    // Handle regular host:port
+    if let Some(colon_idx) = host.rfind(':') {
+        let port_str = &host[colon_idx + 1..];
+        if port_str.is_empty() {
+            return Err(()); // "host:" with empty port
+        }
+        return port_str.parse().map(Some).map_err(|_| ());
+    }
+    Ok(None)
+}
+
+/// Extract the HTTP method from the request line (e.g., "GET", "POST", "CONNECT")
+fn get_req_method(header: &str) -> Range<usize> {
+    if let Some(space_idx) = header.find(' ') {
+        0..space_idx
+    } else {
+        0..0
+    }
 }
 
 pub(crate) fn get_req_path(header: &str) -> Range<usize> {
@@ -803,6 +950,34 @@ mod tests {
     }
 
     #[test]
+    fn test_get_req_method() {
+        // Test GET request
+        let header = "GET /v1/completions HTTP/1.1";
+        let range = get_req_method(header);
+        assert_eq!(&header[range], "GET");
+
+        // Test POST request
+        let header = "POST /api/users HTTP/1.1";
+        let range = get_req_method(header);
+        assert_eq!(&header[range], "POST");
+
+        // Test CONNECT request
+        let header = "CONNECT api.openai.com:443 HTTP/1.1";
+        let range = get_req_method(header);
+        assert_eq!(&header[range], "CONNECT");
+
+        // Test empty header
+        let header = "";
+        let range = get_req_method(header);
+        assert_eq!(range, 0..0);
+
+        // Test header without space
+        let header = "INVALID";
+        let range = get_req_method(header);
+        assert_eq!(range, 0..0);
+    }
+
+    #[test]
     fn test_get_req_path() {
         // Test basic GET request
         let header = "GET /v1/completions HTTP/1.1";
@@ -851,6 +1026,51 @@ mod tests {
     }
 
     #[test]
+    fn test_split_host_port() {
+        // Test with port
+        assert_eq!(split_host_port("localhost:8080"), ("localhost", Some(8080)));
+        assert_eq!(
+            split_host_port("api.openai.com:443"),
+            ("api.openai.com", Some(443))
+        );
+        assert_eq!(
+            split_host_port("example.com:8443"),
+            ("example.com", Some(8443))
+        );
+
+        // Test without port
+        assert_eq!(split_host_port("localhost"), ("localhost", None));
+        assert_eq!(split_host_port("api.openai.com"), ("api.openai.com", None));
+
+        // Test IPv6 addresses with port
+        assert_eq!(split_host_port("[::1]:8080"), ("[::1]", Some(8080)));
+        assert_eq!(
+            split_host_port("[2001:db8::1]:443"),
+            ("[2001:db8::1]", Some(443))
+        );
+        assert_eq!(
+            split_host_port("[fe80::1%eth0]:8080"),
+            ("[fe80::1%eth0]", Some(8080))
+        );
+
+        // Test IPv6 without port
+        assert_eq!(split_host_port("[::1]"), ("[::1]", None));
+        assert_eq!(split_host_port("[2001:db8::1]"), ("[2001:db8::1]", None));
+
+        // Test IPv6 without brackets (ambiguous, treated as no port)
+        assert_eq!(split_host_port("2001:db8::1"), ("2001:db8::1", None));
+        assert_eq!(split_host_port("fe80::1%eth0"), ("fe80::1%eth0", None));
+        assert_eq!(
+            split_host_port("2001:db8::1:443"),
+            ("2001:db8::1:443", None)
+        );
+
+        // Test invalid port
+        assert_eq!(split_host_port("localhost:invalid"), ("localhost", None));
+        assert_eq!(split_host_port("localhost:99999"), ("localhost", None));
+    }
+
+    #[test]
     fn test_strip_port() {
         // Test with port
         assert_eq!(strip_port("localhost:8080"), "localhost");
@@ -875,6 +1095,68 @@ mod tests {
         // Test IPv6 without port
         assert_eq!(strip_port("[::1]"), "[::1]");
         assert_eq!(strip_port("[2001:db8::1]"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn test_extract_port() {
+        // Test with port
+        assert_eq!(extract_port("localhost:8080"), Some(8080));
+        assert_eq!(extract_port("api.openai.com:443"), Some(443));
+        assert_eq!(extract_port("example.com:8443"), Some(8443));
+
+        // Test without port
+        assert_eq!(extract_port("localhost"), None);
+        assert_eq!(extract_port("api.openai.com"), None);
+
+        // Test IPv6 addresses with port
+        assert_eq!(extract_port("[::1]:8080"), Some(8080));
+        assert_eq!(extract_port("[2001:db8::1]:443"), Some(443));
+        assert_eq!(extract_port("[fe80::1%eth0]:8080"), Some(8080));
+
+        // Test IPv6 without port
+        assert_eq!(extract_port("[::1]"), None);
+        assert_eq!(extract_port("[2001:db8::1]"), None);
+
+        // Test IPv6 without brackets (should return None, ambiguous)
+        assert_eq!(extract_port("2001:db8::1"), None);
+        assert_eq!(extract_port("fe80::1%eth0"), None);
+        assert_eq!(extract_port("2001:db8::1:443"), None);
+
+        // Test invalid port
+        assert_eq!(extract_port("localhost:invalid"), None);
+        assert_eq!(extract_port("localhost:99999"), None);
+    }
+
+    #[test]
+    fn test_parse_port() {
+        // Test with valid port
+        assert_eq!(parse_port("localhost:8080"), Ok(Some(8080)));
+        assert_eq!(parse_port("api.openai.com:443"), Ok(Some(443)));
+        assert_eq!(parse_port("example.com:8443"), Ok(Some(8443)));
+
+        // Test without port (Ok(None))
+        assert_eq!(parse_port("localhost"), Ok(None));
+        assert_eq!(parse_port("api.openai.com"), Ok(None));
+
+        // Test IPv6 addresses with port
+        assert_eq!(parse_port("[::1]:8080"), Ok(Some(8080)));
+        assert_eq!(parse_port("[2001:db8::1]:443"), Ok(Some(443)));
+
+        // Test IPv6 without port
+        assert_eq!(parse_port("[::1]"), Ok(None));
+        assert_eq!(parse_port("[2001:db8::1]"), Ok(None));
+
+        // Test IPv6 without brackets (should return Ok(None), ambiguous)
+        assert_eq!(parse_port("2001:db8::1"), Ok(None));
+        assert_eq!(parse_port("fe80::1%eth0"), Ok(None));
+
+        // Test invalid port string (Err)
+        assert_eq!(parse_port("localhost:invalid"), Err(()));
+        assert_eq!(parse_port("localhost:abc"), Err(()));
+        assert_eq!(parse_port("localhost:"), Err(()));
+        assert_eq!(parse_port("[::1]:"), Err(()));
+        assert_eq!(parse_port("[::1]:abc"), Err(()));
+        assert_eq!(parse_port("localhost:99999"), Err(())); // Out of u16 range
     }
 
     #[test]
@@ -1203,6 +1485,23 @@ mod tests {
         // Test Debug trait
         let debug_str = format!("{:?}", upgrade);
         assert!(debug_str.contains("WebSocketUpgrade"));
+    }
+
+    #[test]
+    fn test_proxy_authorization_always_filtered() {
+        // Verify HEADER_PROXY_AUTHORIZATION constant is correct
+        assert_eq!(HEADER_PROXY_AUTHORIZATION, "Proxy-Authorization: ");
+
+        // The actual filtering logic is tested through integration tests,
+        // but we verify that the constant matches what HTTP clients send.
+        // When both Authorization and Proxy-Authorization are present,
+        // Proxy-Authorization must be filtered to prevent upstream leakage.
+        let sample_header = "Proxy-Authorization: Bearer sk-test-key";
+        assert!(is_header(sample_header, HEADER_PROXY_AUTHORIZATION));
+
+        // Verify case-insensitive matching works
+        let lowercase_header = "proxy-authorization: Bearer sk-test-key";
+        assert!(is_header(lowercase_header, HEADER_PROXY_AUTHORIZATION));
     }
 }
 

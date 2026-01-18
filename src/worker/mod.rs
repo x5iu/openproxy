@@ -124,6 +124,7 @@ where
             let mut is_invalid_key = false;
             let mut is_bad_request = false;
             let mut is_not_found = false;
+            let mut is_connect_disabled = false;
             let mut err_msg: Option<Cow<str>> = None;
             loop {
                 let p = crate::program();
@@ -162,15 +163,24 @@ where
                 ) {
                     Ok((provider, auth_type)) => (provider, auth_type),
                     Err(_) => {
-                        // Check if any provider matches the host/path (for proper error message)
-                        if p.select_provider(&host, request.path()).is_some() {
-                            // Providers exist but all failed authentication
+                        // Check if any provider (ignoring health) can authenticate
+                        // This handles the case where the matching provider exists but is unhealthy
+                        if p.select_provider_with_auth_ignoring_health(
+                            &host,
+                            request.path(),
+                            |provider| provider.authenticate_with_type(auth_key.as_deref()),
+                        ) {
+                            // Provider exists for this key but is unhealthy -> 404
+                            is_not_found = true;
+                            err_msg = Some(Error::NoProviderFound.to_string().into());
+                        } else if p.select_provider(&host, request.path()).is_some() {
+                            // Healthy providers exist but all failed authentication -> 401
                             #[cfg(debug_assertions)]
                             log::error!(host = &host, path = request.path(), header:serde = auth_key; "authentication_failed_all_providers");
                             is_invalid_key = true;
                             err_msg = Some("authentication failed".into());
                         } else {
-                            // No providers match the host/path
+                            // No providers match the host/path -> 404
                             is_not_found = true;
                             err_msg = Some(Error::NoProviderFound.to_string().into());
                         }
@@ -178,6 +188,75 @@ where
                     }
                 };
                 request.set_incoming_auth_type(auth_type);
+
+                // Check if this is a CONNECT tunnel request
+                if request.method() == "CONNECT" {
+                    // Check if CONNECT tunnel is enabled
+                    if !p.connect_tunnel_enabled {
+                        is_connect_disabled = true;
+                        err_msg = Some("CONNECT tunnel not enabled".into());
+                        break;
+                    }
+
+                    // Validate that CONNECT target port matches provider's port.
+                    // For CONNECT requests, the Host header contains "host:port" (e.g., "api.openai.com:443").
+                    // We extract the port from the Host header and verify it matches the provider's port.
+                    // This prevents "CONNECT A:443" from silently connecting to B:8080.
+                    // If Host doesn't include a port, we skip validation (client accepts provider's port).
+                    // If port string is invalid, return 400.
+                    match http::parse_port(&host) {
+                        Ok(Some(requested_port)) => {
+                            if requested_port != provider.port() {
+                                is_bad_request = true;
+                                err_msg = Some(
+                                    format!(
+                                        "CONNECT port {} does not match provider port {}",
+                                        requested_port,
+                                        provider.port()
+                                    )
+                                    .into(),
+                                );
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            // No port specified, skip validation
+                        }
+                        Err(()) => {
+                            // Invalid port string (e.g., "host:abc")
+                            is_bad_request = true;
+                            err_msg = Some("invalid port in CONNECT target".into());
+                            break;
+                        }
+                    }
+
+                    // Get connection parameters from provider
+                    let endpoint = provider.endpoint().to_string();
+                    let sock_address = provider.sock_address().to_string();
+                    // CONNECT tunnel always uses transparent TCP (tls=false).
+                    // The client handles TLS after receiving "200 Connection Established".
+                    // Using provider.tls() would cause "TLS inside TLS" and break handshake.
+
+                    // Get any pre-read data (bytes read after headers, e.g., TLS ClientHello)
+                    let preread_data = request.preread_data().to_vec();
+
+                    #[cfg(debug_assertions)]
+                    log::info!(
+                        host = &host,
+                        endpoint = &endpoint,
+                        sock_address = &sock_address,
+                        preread_bytes = preread_data.len();
+                        "connect_tunnel_request"
+                    );
+
+                    // Drop locks before establishing tunnel
+                    drop(p);
+                    drop(request);
+
+                    return self
+                        .handle_connect_tunnel(incoming, &endpoint, &sock_address, &preread_data)
+                        .await;
+                }
 
                 // Check if this is a WebSocket upgrade request
                 if request.is_websocket_upgrade() {
@@ -310,6 +389,17 @@ where
                     .write_all(resp.as_bytes())
                     .await
                     .map_err(|e| ProxyError::Client(e.into()))?;
+            } else if is_connect_disabled {
+                let msg = err_msg.as_deref().unwrap_or("CONNECT not enabled");
+                let resp = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.len(),
+                    msg
+                );
+                incoming
+                    .write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| ProxyError::Client(e.into()))?;
             }
             Ok(())
         })
@@ -360,60 +450,69 @@ where
                     };
                     let p = p.read().await;
 
+                    // Helper closure to extract auth header bytes from request for a given provider
+                    let extract_auth_header = |provider: &dyn Provider| -> Option<Vec<u8>> {
+                        // Try all supported auth header keys
+                        for auth_header_key in provider.auth_header_keys() {
+                            let key_name = auth_header_key.trim_end_matches([' ', ':']);
+                            if let Some(value) = request.headers().get(key_name) {
+                                if let Ok(v) = value.to_str() {
+                                    // Reconstruct the full header line for authenticate_with_type
+                                    let full_header = format!("{}{}", auth_header_key, v);
+                                    return Some(full_header.into_bytes());
+                                }
+                            }
+                        }
+
+                        // Fallback to query parameter if no header found
+                        if let Some(auth_query_key) = provider.auth_query_key() {
+                            if let Some(auth_key) = request.uri().query().and_then(|query| {
+                                http::get_auth_query_range(query, auth_query_key)
+                                    .map(|range| &query[range])
+                            }) {
+                                // For query auth, use the primary auth header key format
+                                if let Some(auth_header_key) = provider.auth_header_key() {
+                                    let full_header = format!("{}{}", auth_header_key, auth_key);
+                                    return Some(full_header.into_bytes());
+                                }
+                            }
+                        }
+
+                        None
+                    };
+
                     // Use auth-during-selection: try to find a provider that authenticates successfully
                     // For HTTP/2, we need to extract auth info from headers and query params
                     let (provider, incoming_auth_type) = match p.select_provider_with_auth(
                         authority.host(),
                         request.uri().path(),
                         |provider| {
-                            // Extract auth header for this provider
-                            let mut auth_header_bytes: Option<Vec<u8>> = None;
-
-                            // Try all supported auth header keys
-                            for auth_header_key in provider.auth_header_keys() {
-                                let key_name = auth_header_key.trim_end_matches([' ', ':']);
-                                if let Some(value) = request.headers().get(key_name) {
-                                    if let Ok(v) = value.to_str() {
-                                        // Reconstruct the full header line for authenticate_with_type
-                                        let full_header = format!("{}{}", auth_header_key, v);
-                                        auth_header_bytes = Some(full_header.into_bytes());
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Fallback to query parameter if no header found
-                            if auth_header_bytes.is_none() {
-                                if let Some(auth_query_key) = provider.auth_query_key() {
-                                    if let Some(auth_key) =
-                                        request.uri().query().and_then(|query| {
-                                            http::get_auth_query_range(query, auth_query_key)
-                                                .map(|range| &query[range])
-                                        })
-                                    {
-                                        // For query auth, use the primary auth header key format
-                                        if let Some(auth_header_key) = provider.auth_header_key() {
-                                            let full_header =
-                                                format!("{}{}", auth_header_key, auth_key);
-                                            auth_header_bytes = Some(full_header.into_bytes());
-                                        }
-                                    }
-                                }
-                            }
-
+                            let auth_header_bytes = extract_auth_header(provider);
                             provider.authenticate_with_type(auth_header_bytes.as_deref())
                         },
                     ) {
                         Ok((provider, auth_type)) => (provider, auth_type),
                         Err(_) => {
-                            // Check if any provider matches the host/path (for proper error message)
-                            if p.select_provider(authority.host(), request.uri().path())
+                            // Check if any provider (ignoring health) can authenticate
+                            // This handles the case where the matching provider exists but is unhealthy
+                            if p.select_provider_with_auth_ignoring_health(
+                                authority.host(),
+                                request.uri().path(),
+                                |provider| {
+                                    let auth_header_bytes = extract_auth_header(provider);
+                                    provider.authenticate_with_type(auth_header_bytes.as_deref())
+                                },
+                            ) {
+                                // Provider exists for this key but is unhealthy -> 404
+                                return invalid!(respond, 404, Error::NoProviderFound.to_string());
+                            } else if p
+                                .select_provider(authority.host(), request.uri().path())
                                 .is_some()
                             {
-                                // Providers exist but all failed authentication
+                                // Healthy providers exist but all failed authentication -> 401
                                 return invalid!(respond, 401, "authentication failed");
                             } else {
-                                // No providers match the host/path
+                                // No providers match the host/path -> 404
                                 return invalid!(respond, 404, Error::NoProviderFound.to_string());
                             }
                         }
@@ -1042,7 +1141,6 @@ impl UpstreamInfo {
             }
         }
 
-
         loop {
             let block = match response
                 .payload
@@ -1181,6 +1279,115 @@ where
             };
             Ok(conn)
         }
+    }
+
+    /// Handle HTTP CONNECT tunnel request
+    /// This method:
+    /// 1. Establishes a new TCP connection to the target server (transparent, no TLS wrapper)
+    /// 2. Sends 200 Connection Established response to client
+    /// 3. Forwards any pre-read data to upstream
+    /// 4. Performs bidirectional TCP proxying
+    ///
+    /// Note: CONNECT tunnel always uses plain TCP, not TLS-wrapped connections.
+    /// The client handles TLS negotiation after receiving "200 Connection Established".
+    /// We don't use connection pool here (like WebSocket) to avoid "taking without returning".
+    async fn handle_connect_tunnel<S>(
+        &mut self,
+        incoming: &mut S,
+        endpoint: &str,
+        sock_address: &str,
+        preread_data: &[u8],
+    ) -> Result<(), ProxyError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+        <P as PoolTrait>::Item: Send + Unpin,
+    {
+        // 1. Create a new TCP connection to target (don't use pool, similar to WebSocket)
+        let mut outgoing: <P as PoolTrait>::Item = match TcpStream::connect(sock_address).await {
+            Ok(stream) => <P as PoolTrait>::Item::new(endpoint, stream),
+            Err(e) => {
+                // Log the error with full context for debugging
+                log::error!(
+                    endpoint = endpoint,
+                    sock_address = sock_address,
+                    error = e.to_string();
+                    "connect_tunnel_upstream_connect_failed"
+                );
+                // Send a generic error to client (don't leak internal details)
+                let msg = "upstream connection failed";
+                let resp = format!(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.len(),
+                    msg
+                );
+                incoming
+                    .write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| ProxyError::Client(e.into()))?;
+                return Ok(());
+            }
+        };
+
+        // 2. Send 200 Connection Established response
+        incoming
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .map_err(|e| ProxyError::Client(e.into()))?;
+        incoming
+            .flush()
+            .await
+            .map_err(|e| ProxyError::Client(e.into()))?;
+
+        #[cfg(debug_assertions)]
+        log::info!(endpoint = endpoint, sock_address = sock_address; "connect_tunnel_established");
+
+        // 3. Forward any pre-read data to upstream
+        // (Client may have sent TLS ClientHello immediately after CONNECT request)
+        //
+        // IMPORTANT: After sending "200 Connection Established", we MUST NOT return
+        // ProxyError::Server or ProxyError::Client. The executor would write an HTTP
+        // error response into the tunnel, corrupting the client's TLS handshake.
+        // All errors after this point should be logged and handled by closing connections.
+        if !preread_data.is_empty() {
+            if let Err(e) = outgoing.write_all(preread_data).await {
+                log::error!(
+                    endpoint = endpoint,
+                    preread_bytes = preread_data.len(),
+                    error = e.to_string();
+                    "connect_tunnel_preread_forward_failed"
+                );
+                ConnTrait::shutdown(&mut outgoing).await;
+                return Ok(());
+            }
+            if let Err(e) = outgoing.flush().await {
+                log::error!(
+                    endpoint = endpoint,
+                    error = e.to_string();
+                    "connect_tunnel_preread_flush_failed"
+                );
+                ConnTrait::shutdown(&mut outgoing).await;
+                return Ok(());
+            }
+            #[cfg(debug_assertions)]
+            log::info!(
+                endpoint = endpoint,
+                bytes = preread_data.len();
+                "connect_tunnel_preread_forwarded"
+            );
+        }
+
+        // 4. Bidirectional TCP proxying
+        if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
+            // Log tunnel errors for observability, but don't propagate as ProxyError
+            // since we've already sent "200 Connection Established"
+            log::warn!(
+                endpoint = endpoint,
+                error = e.to_string();
+                "connect_tunnel_copy_error"
+            );
+        }
+
+        Ok(())
     }
 
     /// Handle WebSocket upgrade request with pre-extracted data
