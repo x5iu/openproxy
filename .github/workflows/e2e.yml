@@ -602,8 +602,8 @@ jobs:
             - ${AUTH_KEY}
 
           providers:
-            # For CONNECT tunnel, tls must be false so proxy does transparent TCP forwarding
-            # and client handles TLS directly with upstream
+            # CONNECT tunnel always uses transparent TCP (ignores tls setting).
+            # Client handles TLS directly with upstream after receiving "200 Connection Established".
             - type: openai
               host: ${OPENAI_ENDPOINT}
               endpoint: ${OPENAI_ENDPOINT}

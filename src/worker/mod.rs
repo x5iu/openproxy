@@ -203,17 +203,29 @@ where
                     // We extract the port from the Host header and verify it matches the provider's port.
                     // This prevents "CONNECT A:443" from silently connecting to B:8080.
                     // If Host doesn't include a port, we skip validation (client accepts provider's port).
-                    if let Some(requested_port) = http::extract_port(&host) {
-                        if requested_port != provider.port() {
+                    // If port string is invalid, return 400.
+                    match http::parse_port(&host) {
+                        Ok(Some(requested_port)) => {
+                            if requested_port != provider.port() {
+                                is_bad_request = true;
+                                err_msg = Some(
+                                    format!(
+                                        "CONNECT port {} does not match provider port {}",
+                                        requested_port,
+                                        provider.port()
+                                    )
+                                    .into(),
+                                );
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            // No port specified, skip validation
+                        }
+                        Err(()) => {
+                            // Invalid port string (e.g., "host:abc")
                             is_bad_request = true;
-                            err_msg = Some(
-                                format!(
-                                    "CONNECT port {} does not match provider port {}",
-                                    requested_port,
-                                    provider.port()
-                                )
-                                .into(),
-                            );
+                            err_msg = Some("invalid port in CONNECT target".into());
                             break;
                         }
                     }
@@ -221,17 +233,18 @@ where
                     // Get connection parameters from provider
                     let endpoint = provider.endpoint().to_string();
                     let sock_address = provider.sock_address().to_string();
-                    let use_tls = provider.tls();
+                    // CONNECT tunnel always uses transparent TCP (tls=false).
+                    // The client handles TLS after receiving "200 Connection Established".
+                    // Using provider.tls() would cause "TLS inside TLS" and break handshake.
 
                     // Get any pre-read data (bytes read after headers, e.g., TLS ClientHello)
-                    let preread_data = request.take_preread_data().to_vec();
+                    let preread_data = request.preread_data().to_vec();
 
                     #[cfg(debug_assertions)]
                     log::info!(
                         host = &host,
                         endpoint = &endpoint,
                         sock_address = &sock_address,
-                        use_tls = use_tls,
                         preread_bytes = preread_data.len();
                         "connect_tunnel_request"
                     );
@@ -241,7 +254,7 @@ where
                     drop(request);
 
                     return self
-                        .handle_connect_tunnel(incoming, &endpoint, &sock_address, use_tls, &preread_data)
+                        .handle_connect_tunnel(incoming, &endpoint, &sock_address, &preread_data)
                         .await;
                 }
 
@@ -1270,31 +1283,33 @@ where
 
     /// Handle HTTP CONNECT tunnel request
     /// This method:
-    /// 1. Establishes a connection to the target server (TCP or TLS, reusing get_or_create_h1)
+    /// 1. Establishes a new TCP connection to the target server (transparent, no TLS wrapper)
     /// 2. Sends 200 Connection Established response to client
     /// 3. Forwards any pre-read data to upstream
     /// 4. Performs bidirectional TCP proxying
+    ///
+    /// Note: CONNECT tunnel always uses plain TCP, not TLS-wrapped connections.
+    /// The client handles TLS negotiation after receiving "200 Connection Established".
+    /// We don't use connection pool here (like WebSocket) to avoid "taking without returning".
     async fn handle_connect_tunnel<S>(
         &mut self,
         incoming: &mut S,
         endpoint: &str,
         sock_address: &str,
-        use_tls: bool,
         preread_data: &[u8],
     ) -> Result<(), ProxyError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Send + Unpin,
     {
-        // 1. Connect to target server (reuse get_or_create_h1 for connection pooling and TLS)
-        let mut outgoing = match self.get_or_create_h1(endpoint, sock_address, use_tls).await {
-            Ok(conn) => conn,
+        // 1. Create a new TCP connection to target (don't use pool, similar to WebSocket)
+        let mut outgoing: <P as PoolTrait>::Item = match TcpStream::connect(sock_address).await {
+            Ok(stream) => <P as PoolTrait>::Item::new(endpoint, stream),
             Err(e) => {
                 // Log the error with full context for debugging
                 log::error!(
                     endpoint = endpoint,
                     sock_address = sock_address,
-                    use_tls = use_tls,
                     error = e.to_string();
                     "connect_tunnel_upstream_connect_failed"
                 );
