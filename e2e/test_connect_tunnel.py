@@ -63,6 +63,15 @@ def test_connect_tunnel_disabled():
         sock.close()
 
 
+def strip_url_scheme(host: str) -> str:
+    """Strip https:// or http:// prefix and trailing slash from host."""
+    if host.startswith("https://"):
+        host = host[8:]
+    elif host.startswith("http://"):
+        host = host[7:]
+    return host.rstrip("/")
+
+
 def test_connect_tunnel_enabled():
     """Test that CONNECT requests work correctly when enabled."""
     print(f"\n{'='*50}")
@@ -72,7 +81,7 @@ def test_connect_tunnel_enabled():
     proxy_host = os.environ.get("PROXY_HOST", "localhost")
     proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
     api_key = os.environ.get("OPENAI_API_KEY", "test-key")
-    target_host = os.environ.get("TARGET_HOST", "api.openai.com")
+    target_host = strip_url_scheme(os.environ.get("TARGET_HOST", "api.openai.com"))
     target_port = int(os.environ.get("TARGET_PORT", "443"))
 
     # Create a raw socket connection to send CONNECT request
