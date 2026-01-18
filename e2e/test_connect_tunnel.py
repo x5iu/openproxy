@@ -445,12 +445,20 @@ if __name__ == "__main__":
         test_connect_tunnel_disabled()
         tests_run += 1
 
-    # Test enabled case (config with connect_tunnel_enabled: true)
+    # Test enabled case with TLS handshake (requires real API endpoint)
     if os.environ.get("TEST_CONNECT_ENABLED", "false").lower() == "true":
         test_connect_tunnel_enabled()
+        tests_run += 1
+
+    # Test authentication failure (returns 401)
+    if os.environ.get("TEST_CONNECT_AUTH_FAILURE", "false").lower() == "true":
         test_connect_tunnel_auth_failure()
+        tests_run += 1
+
+    # Test no provider found (returns 404)
+    if os.environ.get("TEST_CONNECT_NO_PROVIDER", "false").lower() == "true":
         test_connect_tunnel_no_provider()
-        tests_run += 3
+        tests_run += 1
 
     # Test data transfer (requires local echo server provider)
     if os.environ.get("TEST_CONNECT_DATA_TRANSFER", "false").lower() == "true":
@@ -468,6 +476,8 @@ if __name__ == "__main__":
         print("Set at least one of these environment variables to 'true':")
         print("  TEST_CONNECT_DISABLED")
         print("  TEST_CONNECT_ENABLED")
+        print("  TEST_CONNECT_AUTH_FAILURE")
+        print("  TEST_CONNECT_NO_PROVIDER")
         print("  TEST_CONNECT_DATA_TRANSFER")
         print("  TEST_CONNECT_PREREAD")
         print("="*50)

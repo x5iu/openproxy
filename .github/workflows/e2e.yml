@@ -615,31 +615,19 @@ jobs:
           curl http://localhost:18080 || true
           echo "CONNECT-enabled proxy started on port 18080"
 
-      - name: Run CONNECT tunnel enabled tests
-        env:
-          PROXY_HOST: localhost
-          PROXY_PORT_CONNECT: 18080
-          OPENAI_API_KEY: ${{ env.AUTH_KEY }}
-          TARGET_HOST: api.openai.com
-          TARGET_PORT: "443"
-          TEST_CONNECT_ENABLED: "true"
-        run: |
-          echo "Testing CONNECT tunnel when enabled..."
-          cd e2e
-          python test_connect_tunnel.py
-          echo "CONNECT tunnel enabled tests passed!"
-
-      - name: Run CONNECT tunnel data transfer and preread tests
+      - name: Run CONNECT tunnel tests (auth failure, no provider, data transfer, preread)
         env:
           PROXY_HOST: localhost
           PROXY_PORT_CONNECT: 18080
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
           ECHO_TARGET_HOST: local-service
           ECHO_TARGET_PORT: "19999"
+          TEST_CONNECT_AUTH_FAILURE: "true"
+          TEST_CONNECT_NO_PROVIDER: "true"
           TEST_CONNECT_DATA_TRANSFER: "true"
           TEST_CONNECT_PREREAD: "true"
         run: |
-          echo "Testing CONNECT tunnel data transfer and preread..."
+          echo "Testing CONNECT tunnel (auth failure, no provider, data transfer, preread)..."
           cd e2e
           python test_connect_tunnel.py
-          echo "CONNECT tunnel data transfer and preread tests passed!"
+          echo "CONNECT tunnel tests passed!"
