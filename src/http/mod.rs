@@ -402,6 +402,28 @@ impl<'a> Payload<'a> {
                         }
                     }
                 }
+                // Always filter Proxy-Authorization to prevent leaking it to upstream,
+                // even if another auth header was used for authentication.
+                {
+                    let header_lines = HeaderLines::new(&crlfs, header);
+                    for line in header_lines.skip(1) {
+                        let Ok(header) = std::str::from_utf8(line) else {
+                            continue;
+                        };
+                        if is_header(header, HEADER_PROXY_AUTHORIZATION) {
+                            let start = {
+                                let block_start = &block[0] as *const u8 as usize;
+                                let header_start = &line[0] as *const u8 as usize;
+                                header_start - block_start
+                            };
+                            let range = start..start + line.len();
+                            if !filtered_headers.contains(&range) {
+                                filtered_headers.push(range);
+                            }
+                            break;
+                        }
+                    }
+                }
                 if auth_range.is_none() {
                     if let Some(auth_query_key) = provider.auth_query_key() {
                         let Some(request_line) = HeaderLines::new(&crlfs, header).next() else {
