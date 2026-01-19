@@ -72,6 +72,15 @@ pub fn new_provider(
             health_check_config,
             is_fallback,
         )?)),
+        "forward" => Ok(Box::new(ForwardProvider::new(
+            host,
+            endpoint,
+            port,
+            tls,
+            weight,
+            health_check_config,
+            is_fallback,
+        )?)),
         _ => Err(format!("Unsupported provider type: {:?}", kind).into()),
     }
 }
@@ -80,6 +89,7 @@ pub enum Type {
     OpenAI,
     Gemini,
     Anthropic,
+    Forward,
 }
 
 impl fmt::Display for Type {
@@ -88,6 +98,7 @@ impl fmt::Display for Type {
             Type::OpenAI => write!(f, "openai"),
             Type::Gemini => write!(f, "gemini"),
             Type::Anthropic => write!(f, "anthropic"),
+            Type::Forward => write!(f, "forward"),
         }
     }
 }
@@ -1038,6 +1049,152 @@ impl Provider for AnthropicProvider {
             )
             .await
         })
+    }
+}
+
+pub struct ForwardProvider {
+    host: Arc<str>,
+    endpoint: Arc<str>,
+    tls: bool,
+    weight: f64,
+    host_header: String,
+    sock_address: String,
+    server_name: rustls_pki_types::ServerName<'static>,
+    is_healthy: AtomicBool,
+    health_check_config: Option<HealthCheckConfig>,
+    is_fallback: bool,
+}
+
+impl ForwardProvider {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        host: &str,
+        endpoint: &str,
+        port: Option<u16>,
+        tls: bool,
+        weight: f64,
+        health_check_config: Option<HealthCheckConfig>,
+        is_fallback: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let host: Arc<str> = Arc::from(host);
+        let endpoint: Arc<str> = Arc::from(endpoint);
+        let server_name = rustls_pki_types::ServerName::try_from(endpoint.to_string())?;
+        let port = port.unwrap_or(if tls { 443 } else { 80 });
+        let host_header = if (tls && port == 443) || (!tls && port == 80) {
+            format!("Host: {}\r\n", endpoint)
+        } else {
+            format!("Host: {}:{}\r\n", endpoint, port)
+        };
+        let sock_address = format!("{}:{}", endpoint, port);
+        Ok(Self {
+            host,
+            endpoint,
+            tls,
+            weight,
+            host_header,
+            sock_address,
+            server_name,
+            is_healthy: AtomicBool::new(true),
+            health_check_config,
+            is_fallback,
+        })
+    }
+}
+
+impl Provider for ForwardProvider {
+    fn kind(&self) -> Type {
+        Type::Forward
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        None
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn server_name(&self) -> rustls_pki_types::ServerName<'static> {
+        self.server_name.clone()
+    }
+
+    fn sock_address(&self) -> &str {
+        &self.sock_address
+    }
+
+    fn host_header(&self) -> &str {
+        &self.host_header
+    }
+
+    fn auth_query_key(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn auth_header(&self) -> Option<&str> {
+        None
+    }
+
+    fn auth_header_key(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn has_auth_keys(&self) -> bool {
+        false
+    }
+
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.is_fallback
+    }
+
+    fn authenticate(&self, _header: Option<&[u8]>) -> Result<(), AuthenticationError> {
+        Ok(())
+    }
+
+    fn authenticate_key(&self, _key: &str) -> Result<(), AuthenticationError> {
+        Ok(())
+    }
+
+    fn tls(&self) -> bool {
+        self.tls
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.is_healthy.load(Ordering::SeqCst)
+    }
+
+    fn set_healthy(&self, healthy: bool) {
+        self.is_healthy.store(healthy, Ordering::SeqCst)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn health_check<'a: 'stream, 'stream>(
+        &'a self,
+        stream: &'stream mut dyn AsyncReadWrite,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
+    {
+        if let Some(ref cfg) = self.health_check_config {
+            Box::pin(health_check(
+                stream,
+                self.endpoint().as_bytes(),
+                cfg.method.as_ref().map(|v| v.as_bytes()).unwrap_or(b"GET"),
+                cfg.path.as_bytes(),
+                None, // No auth header for forward provider
+                cfg.headers
+                    .as_deref()
+                    .map(|v| v.iter().map(|x| x.trim().as_bytes())),
+                cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
+            ))
+        } else {
+            Box::pin(async { Ok(()) })
+        }
     }
 }
 
@@ -2161,6 +2318,234 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("OAuth command failed"));
+    }
+
+    #[test]
+    fn test_forward_provider_creation() {
+        let provider = ForwardProvider::new(
+            "backend.example.com",
+            "backend.internal",
+            None,
+            true,
+            1.0,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(provider.kind(), Type::Forward));
+        assert_eq!(provider.host(), "backend.example.com");
+        assert_eq!(provider.endpoint(), "backend.internal");
+        assert_eq!(provider.api_key(), None);
+        assert_eq!(provider.weight(), 1.0);
+        assert!(provider.tls());
+        assert!(provider.is_healthy());
+        assert!(!provider.is_fallback());
+        assert_eq!(provider.sock_address(), "backend.internal:443");
+        assert_eq!(provider.host_header(), "Host: backend.internal\r\n");
+        assert_eq!(provider.auth_header(), None);
+        assert_eq!(provider.auth_header_key(), None);
+        assert_eq!(provider.auth_query_key(), None);
+    }
+
+    #[test]
+    fn test_forward_provider_without_tls() {
+        let provider = ForwardProvider::new(
+            "backend.example.com",
+            "backend.internal",
+            Some(8080),
+            false,
+            2.0,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(!provider.tls());
+        assert_eq!(provider.sock_address(), "backend.internal:8080");
+        assert_eq!(provider.host_header(), "Host: backend.internal:8080\r\n");
+        assert_eq!(provider.weight(), 2.0);
+    }
+
+    #[test]
+    fn test_forward_provider_always_authenticates() {
+        let provider = ForwardProvider::new(
+            "backend.example.com",
+            "backend.internal",
+            None,
+            true,
+            1.0,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // has_auth_keys always returns false
+        assert!(!provider.has_auth_keys());
+
+        // authenticate always succeeds
+        assert!(provider.authenticate(None).is_ok());
+        assert!(provider.authenticate(Some(b"any-header")).is_ok());
+
+        // authenticate_key always succeeds
+        assert!(provider.authenticate_key("any-key").is_ok());
+    }
+
+    #[test]
+    fn test_forward_provider_health_state() {
+        let provider = ForwardProvider::new(
+            "backend.example.com",
+            "backend.internal",
+            None,
+            true,
+            1.0,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Default is healthy
+        assert!(provider.is_healthy());
+
+        // Set to unhealthy
+        provider.set_healthy(false);
+        assert!(!provider.is_healthy());
+
+        // Set back to healthy
+        provider.set_healthy(true);
+        assert!(provider.is_healthy());
+    }
+
+    #[test]
+    fn test_forward_provider_factory() {
+        let auth_keys = Arc::new(vec![]);
+
+        let forward = new_provider(
+            "forward",
+            "backend.example.com",
+            "backend.internal",
+            None,
+            true,
+            1.0,
+            None,
+            Arc::clone(&auth_keys),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(forward.kind(), Type::Forward));
+    }
+
+    #[test]
+    fn test_type_display_forward() {
+        assert_eq!(Type::Forward.to_string(), "forward");
+    }
+
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct MockHealthCheckStream {
+        written: Vec<u8>,
+        response: Vec<u8>,
+        response_pos: usize,
+    }
+
+    impl MockHealthCheckStream {
+        fn new() -> Self {
+            // Return a minimal valid HTTP 200 response
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+            Self {
+                written: Vec::new(),
+                response,
+                response_pos: 0,
+            }
+        }
+
+        fn get_written(&self) -> &[u8] {
+            &self.written
+        }
+    }
+
+    impl AsyncWrite for MockHealthCheckStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for MockHealthCheckStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.response_pos >= self.response.len() {
+                return Poll::Ready(Ok(()));
+            }
+            let remaining = self.response.len() - self.response_pos;
+            let to_copy = remaining.min(buf.remaining());
+            let end = self.response_pos + to_copy;
+            buf.put_slice(&self.response[self.response_pos..end]);
+            self.response_pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forward_provider_health_check_no_auth_header() {
+        let health_cfg = HealthCheckConfig {
+            method: Some("GET".to_string()),
+            path: "/health".to_string(),
+            body: None,
+            headers: None,
+        };
+
+        let provider = ForwardProvider::new(
+            "backend.example.com",
+            "backend.internal",
+            Some(8080),
+            false,
+            1.0,
+            Some(health_cfg),
+            false,
+        )
+        .unwrap();
+
+        let mut stream = MockHealthCheckStream::new();
+        let result = provider.health_check(&mut stream).await;
+        assert!(result.is_ok(), "health_check should succeed");
+
+        let written = String::from_utf8_lossy(stream.get_written());
+
+        // Verify request line and host
+        assert!(written.contains("GET /health HTTP/1.1"), "should have correct request line");
+        assert!(written.contains("Host: backend.internal"), "should have Host header");
+
+        // Verify NO auth headers are present (proxy doesn't inject any)
+        let written_lower = written.to_lowercase();
+        assert!(
+            !written_lower.contains("authorization:"),
+            "forward provider health_check should NOT contain Authorization header"
+        );
+        assert!(
+            !written_lower.contains("x-api-key:"),
+            "forward provider health_check should NOT contain X-API-Key header"
+        );
     }
 }
 
