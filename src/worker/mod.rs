@@ -313,6 +313,59 @@ where
                     }
                 }
 
+                // Build ProviderInfo for HTTP/1.1 request transformation
+                // This pre-computes all provider-specific values to avoid re-selection in next_block
+                //
+                // Note: get_upstream_auth_header may fail (for dynamic auth). We must handle this
+                // error before proceeding. Since request borrows incoming, we need to drop request
+                // before writing error responses.
+
+                // Get auth header based on incoming auth type - may fail for dynamic auth
+                let auth_header = provider.get_upstream_auth_header(auth_type);
+                if let Err(e) = &auth_header {
+                    log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
+                    // Drop request first to release the borrow on incoming
+                    drop(request);
+                    let msg = "upstream authentication failed";
+                    let resp = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        msg.len(),
+                        msg
+                    );
+                    incoming
+                        .write_all(resp.as_bytes())
+                        .await
+                        .map_err(|e| ProxyError::Client(e.into()))?;
+                    return Ok(());
+                }
+                let auth_header = auth_header.unwrap();
+
+                // Get first header chunk for path rewriting
+                let first_block_rewrite = request.first_header_chunk()
+                    .and_then(|chunk| provider.rewrite_first_header_block(chunk));
+
+                // Compute transformed extra headers
+                let mut extra_headers_transformed = Vec::new();
+                for header_key in provider.extra_headers() {
+                    let existing_value = request.find_header_value(
+                        header_key.trim_end_matches(": ").as_bytes()
+                    );
+                    if let Some(new_header) = provider.transform_extra_header(
+                        header_key,
+                        existing_value.as_deref()
+                    ) {
+                        extra_headers_transformed.push(new_header);
+                    }
+                }
+
+                let provider_info = http::ProviderInfo {
+                    first_block_rewrite,
+                    host_header: provider.host_header().to_string(),
+                    auth_header,
+                    extra_headers_transformed,
+                };
+                request.set_provider_info(provider_info);
+
                 let mut outgoing = self
                     .get_http1_conn(provider)
                     .await

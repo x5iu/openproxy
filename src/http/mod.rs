@@ -87,6 +87,20 @@ impl<'a> Request<'a> {
         self.payload.set_incoming_auth_type(auth_type);
     }
 
+    pub(crate) fn set_provider_info(&mut self, info: ProviderInfo) {
+        self.payload.set_provider_info(info);
+    }
+
+    /// Get the first header chunk for path rewriting.
+    pub fn first_header_chunk(&self) -> Option<&[u8]> {
+        self.payload.first_header_chunk()
+    }
+
+    /// Find a header value by name (case-insensitive).
+    pub fn find_header_value(&self, header_name: &[u8]) -> Option<String> {
+        self.payload.find_header_value(header_name)
+    }
+
     pub fn is_websocket_upgrade(&self) -> bool {
         self.payload.is_websocket_upgrade
     }
@@ -153,6 +167,21 @@ pub(crate) struct WebSocketUpgrade {
     sec_websocket_extensions: Option<Range<usize>>,
 }
 
+/// Pre-computed provider information for HTTP/1.1 request transformation.
+/// This avoids re-selecting a provider during request streaming, which could
+/// result in selecting a different provider than the one authenticated against.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderInfo {
+    /// Rewritten first header block (if path prefix needs stripping)
+    pub(crate) first_block_rewrite: Option<Vec<u8>>,
+    /// Host header to send upstream (e.g., "Host: api.openai.com\r\n")
+    pub(crate) host_header: String,
+    /// Auth header to send upstream (pre-computed)
+    pub(crate) auth_header: Option<String>,
+    /// Transformed extra headers (e.g., anthropic-beta for OAuth)
+    pub(crate) extra_headers_transformed: Vec<String>,
+}
+
 pub(crate) struct Payload<'a> {
     internal_buffer: Box<[u8]>,
     first_block_length: usize,
@@ -166,6 +195,9 @@ pub(crate) struct Payload<'a> {
     auth_range: Option<Range<usize>>,
     /// The auth type used in incoming request (e.g., "x-api-key" or "bearer")
     incoming_auth_type: Option<&'static str>,
+    /// Pre-computed provider info for upstream request transformation.
+    /// Set by Worker layer after select_provider_with_auth succeeds.
+    pub(crate) provider_info: Option<ProviderInfo>,
     pub(crate) body: Body<'a>,
     state: ReadState,
     /// Ranges of header chunks to output (gaps between filtered headers)
@@ -175,16 +207,6 @@ pub(crate) struct Payload<'a> {
     pub(crate) is_websocket_upgrade: bool,
     #[allow(dead_code)]
     pub(crate) websocket_upgrade: Option<WebSocketUpgrade>,
-}
-
-macro_rules! select_provider {
-    (($host:expr, $path:expr) => $provider:ident) => {
-        let p = crate::program();
-        let p = p.read().await;
-        let Some($provider) = p.select_provider($host, $path) else {
-            return Err(Error::NoProviderFound);
-        };
-    };
 }
 
 impl<'a> Payload<'a> {
@@ -332,8 +354,34 @@ impl<'a> Payload<'a> {
                 .as_ref()
                 .map(|range| &block[range.start..range.end]),
         ) {
-            select_provider!((host, path) => provider);
-            if provider.has_auth_keys() {
+            // Get ALL matching providers (not just one) to collect all potential auth headers.
+            // This ensures we filter out auth headers from ALL providers that could match
+            // this host/path, not just the one that will eventually be selected.
+            let p = crate::program();
+            let p = p.read().await;
+            let providers = p.get_matching_providers(host, path);
+            if !providers.is_empty() {
+                // Collect all auth header keys from all matching providers
+                let mut all_auth_header_keys: Vec<&'static str> = Vec::new();
+                let mut all_extra_header_keys: Vec<&'static str> = Vec::new();
+                let mut all_auth_query_keys: Vec<&'static str> = Vec::new();
+                for provider in &providers {
+                    if provider.has_auth_keys() {
+                        all_auth_header_keys.extend(provider.auth_header_keys());
+                    }
+                    all_extra_header_keys.extend(provider.extra_headers());
+                    if let Some(key) = provider.auth_query_key() {
+                        all_auth_query_keys.push(key);
+                    }
+                }
+                // Deduplicate keys
+                all_auth_header_keys.sort();
+                all_auth_header_keys.dedup();
+                all_extra_header_keys.sort();
+                all_extra_header_keys.dedup();
+                all_auth_query_keys.sort();
+                all_auth_query_keys.dedup();
+
                 // Due to the particularity of Gemini (aka googleapis), we will first match the
                 // corresponding Authorization information from the Headers. If there is no
                 // Authorization information in the Headers, we will then try to match the key
@@ -341,8 +389,7 @@ impl<'a> Payload<'a> {
                 //
                 // For providers supporting multiple auth headers (e.g., Anthropic supports both
                 // X-API-Key and Authorization: Bearer), we iterate through all supported keys.
-                let auth_header_keys = provider.auth_header_keys();
-                'auth_search: for auth_header_key in &auth_header_keys {
+                'auth_search: for auth_header_key in &all_auth_header_keys {
                     let header_lines = HeaderLines::new(&crlfs, header);
                     for line in header_lines.skip(1) {
                         let Ok(header) = std::str::from_utf8(line) else {
@@ -362,7 +409,7 @@ impl<'a> Payload<'a> {
                 }
                 // Also filter out any other auth headers that weren't matched
                 // (e.g., if client sent X-API-Key, we should also filter Authorization if present)
-                for auth_header_key in &auth_header_keys {
+                for auth_header_key in &all_auth_header_keys {
                     let header_lines = HeaderLines::new(&crlfs, header);
                     for line in header_lines.skip(1) {
                         let Ok(header) = std::str::from_utf8(line) else {
@@ -425,34 +472,37 @@ impl<'a> Payload<'a> {
                     }
                 }
                 if auth_range.is_none() {
-                    if let Some(auth_query_key) = provider.auth_query_key() {
+                    for auth_query_key in &all_auth_query_keys {
                         let Some(request_line) = HeaderLines::new(&crlfs, header).next() else {
                             return Err(Error::InvalidHeader);
                         };
                         let Ok(request_line_str) = std::str::from_utf8(request_line) else {
                             return Err(Error::InvalidHeader);
                         };
-                        auth_range = get_auth_query_range(request_line_str, auth_query_key);
+                        if let Some(range) = get_auth_query_range(request_line_str, auth_query_key)
+                        {
+                            auth_range = Some(range);
+                            break;
+                        }
                     }
                 }
-            }
-            // Filter out extra headers that will be transformed/replaced
-            // (e.g., anthropic-beta for Anthropic OAuth)
-            let extra_header_keys = provider.extra_headers();
-            for extra_key in &extra_header_keys {
-                let header_lines = HeaderLines::new(&crlfs, header);
-                for line in header_lines.skip(1) {
-                    let Ok(header_str) = std::str::from_utf8(line) else {
-                        continue;
-                    };
-                    if is_header(header_str, extra_key) {
-                        let start = {
-                            let block_start = &block[0] as *const u8 as usize;
-                            let extra_header_start = &line[0] as *const u8 as usize;
-                            extra_header_start - block_start
+                // Filter out extra headers that will be transformed/replaced
+                // (e.g., anthropic-beta for Anthropic OAuth)
+                for extra_key in &all_extra_header_keys {
+                    let header_lines = HeaderLines::new(&crlfs, header);
+                    for line in header_lines.skip(1) {
+                        let Ok(header_str) = std::str::from_utf8(line) else {
+                            continue;
                         };
-                        filtered_headers.push(start..start + line.len());
-                        break;
+                        if is_header(header_str, extra_key) {
+                            let start = {
+                                let block_start = &block[0] as *const u8 as usize;
+                                let extra_header_start = &line[0] as *const u8 as usize;
+                                extra_header_start - block_start
+                            };
+                            filtered_headers.push(start..start + line.len());
+                            break;
+                        }
                     }
                 }
             }
@@ -527,6 +577,7 @@ impl<'a> Payload<'a> {
             host_range,
             auth_range,
             incoming_auth_type: None, // Will be set after authenticate_with_type is called
+            provider_info: None,      // Will be set by Worker layer after provider selection
             body,
             state: ReadState::Start,
             header_chunks: split_header_chunks(filtered_headers, header_length),
@@ -596,13 +647,25 @@ impl<'a> Payload<'a> {
         self.incoming_auth_type = auth_type;
     }
 
+    pub(crate) fn set_provider_info(&mut self, info: ProviderInfo) {
+        self.provider_info = Some(info);
+    }
+
     pub(crate) fn block(&self) -> &[u8] {
         self.internal_buffer.as_ref()
     }
 
+    /// Get the first header chunk (typically the request line) for path rewriting.
+    /// This is used by Worker to pre-compute first_block_rewrite in ProviderInfo.
+    pub(crate) fn first_header_chunk(&self) -> Option<&[u8]> {
+        self.header_chunks.first().map(|range| {
+            &self.internal_buffer[range.start..range.end]
+        })
+    }
+
     /// Find the value of a header by name (case-insensitive).
     /// Returns the header value without the header name prefix.
-    fn find_header_value(&self, header_name: &[u8]) -> Option<String> {
+    pub(crate) fn find_header_value(&self, header_name: &[u8]) -> Option<String> {
         let header = &self.internal_buffer[..self.header_length];
         let header_str = std::str::from_utf8(header).ok()?;
 
@@ -628,12 +691,12 @@ impl<'a> Payload<'a> {
                     self.header_current_chunk += 1;
                     #[cfg(debug_assertions)]
                     log::info!(step = "ReadState::Start"; "current_block:header_chunks({})", cur_idx);
+                    // Use pre-computed provider_info for first block rewrite (if set by Worker)
                     if cur_idx == 0 && self.host_range.is_some() {
-                        select_provider!((self.host().unwrap(), self.path()) => provider);
-                        if let Some(rewritten) = provider.rewrite_first_header_block(
-                            &self.internal_buffer[range.start..range.end],
-                        ) {
-                            return Ok(Some(Cow::Owned(rewritten)));
+                        if let Some(ref info) = self.provider_info {
+                            if let Some(ref rewritten) = info.first_block_rewrite {
+                                return Ok(Some(Cow::Owned(rewritten.clone())));
+                            }
                         }
                     }
                     return Ok(Some(Cow::Borrowed(
@@ -648,8 +711,9 @@ impl<'a> Payload<'a> {
                 if self.host_range.is_some() {
                     #[cfg(debug_assertions)]
                     log::info!(step = "ReadState::HostHeader"; "current_block:host_header");
-                    select_provider!((self.host().unwrap(), self.path()) => provider);
-                    Ok(Some(Cow::Owned(provider.host_header().as_bytes().to_vec())))
+                    // Use pre-computed host_header from provider_info
+                    let info = self.provider_info.as_ref().ok_or(Error::NoProviderFound)?;
+                    Ok(Some(Cow::Owned(info.host_header.as_bytes().to_vec())))
                 } else {
                     Box::pin(self.next_block()).await
                 }
@@ -659,31 +723,19 @@ impl<'a> Payload<'a> {
                 if self.host_range.is_some() {
                     #[cfg(debug_assertions)]
                     log::info!(step = "ReadState::AuthHeader"; "current_block:auth_header");
-                    select_provider!((self.host().unwrap(), self.path()) => provider);
+                    // Use pre-computed auth_header and extra_headers from provider_info
+                    let info = self.provider_info.as_ref().ok_or(Error::NoProviderFound)?;
 
                     let mut result = Vec::new();
 
-                    // Get auth header based on incoming auth type
-                    match provider.get_upstream_auth_header(self.incoming_auth_type) {
-                        Ok(Some(auth_header)) => {
-                            result.extend_from_slice(auth_header.as_bytes());
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
-                            return Err(Error::DynamicAuthFailed);
-                        }
+                    // Add pre-computed auth header
+                    if let Some(ref auth_header) = info.auth_header {
+                        result.extend_from_slice(auth_header.as_bytes());
                     }
 
-                    // Transform extra headers (e.g., add anthropic-beta for OAuth)
-                    for header_key in provider.extra_headers() {
-                        let existing_value =
-                            self.find_header_value(header_key.trim_end_matches(": ").as_bytes());
-                        if let Some(new_header) =
-                            provider.transform_extra_header(header_key, existing_value.as_deref())
-                        {
-                            result.extend_from_slice(new_header.as_bytes());
-                        }
+                    // Add pre-computed transformed extra headers
+                    for header in &info.extra_headers_transformed {
+                        result.extend_from_slice(header.as_bytes());
                     }
 
                     if !result.is_empty() {
@@ -1502,6 +1554,42 @@ mod tests {
         // Verify case-insensitive matching works
         let lowercase_header = "proxy-authorization: Bearer sk-test-key";
         assert!(is_header(lowercase_header, HEADER_PROXY_AUTHORIZATION));
+    }
+
+    #[test]
+    fn test_provider_info_struct() {
+        // Test ProviderInfo construction and field access
+        let info = ProviderInfo {
+            first_block_rewrite: Some(b"GET /test HTTP/1.1".to_vec()),
+            host_header: "Host: api.example.com\r\n".to_string(),
+            auth_header: Some("Authorization: Bearer sk-test\r\n".to_string()),
+            extra_headers_transformed: vec!["X-Custom: value\r\n".to_string()],
+        };
+
+        assert_eq!(info.first_block_rewrite, Some(b"GET /test HTTP/1.1".to_vec()));
+        assert_eq!(info.host_header, "Host: api.example.com\r\n");
+        assert_eq!(info.auth_header, Some("Authorization: Bearer sk-test\r\n".to_string()));
+        assert_eq!(info.extra_headers_transformed.len(), 1);
+
+        // Test Clone
+        let cloned = info.clone();
+        assert_eq!(cloned.first_block_rewrite, info.first_block_rewrite);
+        assert_eq!(cloned.host_header, info.host_header);
+    }
+
+    #[test]
+    fn test_provider_info_without_rewrite() {
+        // Test ProviderInfo without path rewrite
+        let info = ProviderInfo {
+            first_block_rewrite: None,
+            host_header: "Host: api.example.com\r\n".to_string(),
+            auth_header: None,
+            extra_headers_transformed: vec![],
+        };
+
+        assert!(info.first_block_rewrite.is_none());
+        assert!(info.auth_header.is_none());
+        assert!(info.extra_headers_transformed.is_empty());
     }
 }
 
