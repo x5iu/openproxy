@@ -11,6 +11,9 @@ cargo build --release
 # Run all tests
 cargo test
 
+# Run unit tests only
+cargo test --lib
+
 # Run a specific test
 cargo test test_name
 
@@ -27,25 +30,36 @@ cargo fmt
 
 ```bash
 cd e2e
-pip install openai pydantic "httpx[http2]" websockets websocket-client pyyaml
+pip install openai pydantic "httpx[http2]" websockets websocket-client pyyaml anthropic
 
-# Run individual test suites
+# Run individual test suites (examples)
 python test_https.py
 python test_http.py
 python test_websocket.py
 python test_host_path.py
 python test_anthropic_oauth.py
+python test_anthropic_api.py
+python test_auth_selection.py
+python test_rewrite_auth_selection.py
+python test_connect_tunnel.py
+python test_forward.py
+python test_h2_upstream.py
+python test_h2_h1_fallback.py
+python test_h2_large_body.py
+python test_hot_upgrade.py
+python test_health_check_auth.py
+python test_openai_realtime.py
 ```
 
 ## Architecture
 
-OpenProxy is a high-performance LLM proxy server that routes requests to multiple providers (OpenAI, Gemini, Anthropic) based on the `Host` header.
+OpenProxy is a high-performance LLM proxy server that routes requests to multiple providers (OpenAI, Gemini, Anthropic, Forward) based on the `Host` header.
 
 ### Core Modules
 
 - **`src/lib.rs`** - Configuration loading, provider selection with weighted load balancing, TLS setup, global `Program` state
 - **`src/worker/mod.rs`** - Request handling for HTTP/1.1 and HTTP/2, WebSocket proxying, `UpstreamInfo` struct for provider details
-- **`src/provider/mod.rs`** - Provider trait and implementations (OpenAI, Gemini, Anthropic), authentication handling
+- **`src/provider/mod.rs`** - Provider trait and implementations (OpenAI, Gemini, Anthropic, Forward), authentication handling
 - **`src/http/mod.rs`** - HTTP parsing, header manipulation, `Payload` struct with `next_block()` state machine for streaming
 - **`src/http/reader/mod.rs`** - Streaming helpers: `LimitedReader` (Content-Length), `ChunkedReader`/`ChunkedWriter` (Transfer-Encoding: chunked)
 - **`src/executor/mod.rs`** - Connection pooling (`Pool<K, V>`) and health check execution
@@ -95,6 +109,7 @@ Providers are matched by the `Host` header from the client request. When multipl
 
 - **HTTP/1.1**: Plain HTTP and HTTPS with keep-alive
 - **HTTP/2**: Full multiplexing support, Extended CONNECT for WebSocket (RFC 8441), automatic H1 fallback for non-TLS upstreams
+- **HTTP CONNECT Tunnel**: Support for HTTP CONNECT method to establish tunnels (used by forward proxies)
 - **WebSocket**: Transparent proxying for both HTTP/1.1 upgrade and HTTP/2 CONNECT
 
 ### Configuration
@@ -103,10 +118,10 @@ YAML-based config with hot-reload via SIGHUP. Key fields:
 - `https_port` / `http_port`: At least one required
 - `https_bind_address` / `http_bind_address`: Bind address for each listener (default: 0.0.0.0)
 - `cert_file` / `private_key_file`: Required for HTTPS
-- `providers[]`: Type, host (for routing), endpoint (actual backend), api_key, weight, tls, is_fallback
+- `providers[]`: Type (openai, gemini, anthropic, forward), host (for routing), endpoint (actual backend), api_key, weight, tls, is_fallback
 - `auth_keys`: Global authentication keys
 - `health_check.enabled` / `health_check.interval`: Enable health checks and set interval (default: 60s)
-- `http_max_header_size`: Maximum HTTP header size in bytes (default: 8KB)
+- `http_max_header_size`: Maximum HTTP header size in bytes (default: 4096, min: 1024, max: 1MB)
 
 ### Signal Handling
 

@@ -6,7 +6,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 
 ## Features
 
-- **Multi-Provider Support**: Seamlessly proxy requests to OpenAI, Gemini, and Anthropic APIs
+- **Multi-Provider Support**: Seamlessly proxy requests to OpenAI, Gemini, and Anthropic APIs, plus transparent forward proxying
 - **Intelligent Load Balancing**: Weighted provider selection algorithm for optimal resource utilization
 - **Fallback Providers**: Automatic failover to backup providers when primary providers are unavailable
 - **Health Monitoring**: Automatic health checks with configurable intervals and failure recovery
@@ -15,6 +15,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 - **OAuth Support**: Dynamic authentication with shell command execution for Anthropic OAuth tokens
 - **Protocol Support**: Full HTTP/1.1 and HTTP/2 support with automatic protocol negotiation
 - **WebSocket Support**: Transparent WebSocket proxying for both HTTP/1.1 upgrade and HTTP/2 Extended CONNECT (RFC 8441)
+- **HTTP CONNECT Tunnel**: Support for HTTP CONNECT method to establish tunnels for forward proxy scenarios
 - **HTTP & HTTPS Support**: Run with TLS encryption (HTTPS) or plaintext HTTP for internal networks
 - **TLS Encryption**: Secure communication using [rustls](https://crates.io/crates/tokio-rustls) with modern cipher suites
 - **Configuration Management**: YAML-based configuration with hot-reload capability (SIGHUP)
@@ -96,6 +97,10 @@ health_check:
 # HTTP Configuration
 # http_max_header_size: 8192  # Maximum HTTP header size in bytes (default: 4096, min: 1024, max: 1MB)
 
+# CONNECT Tunnel Configuration
+# Enable HTTP CONNECT method for establishing tunnels (used by forward proxies)
+# connect_tunnel_enabled: true  # default: false
+
 # Provider Configuration
 providers:
   # OpenAI Configuration
@@ -168,6 +173,15 @@ providers:
     endpoint: "api.openai.com"
     api_key: "sk-backup-key"
     is_fallback: true                  # Mark as fallback provider
+
+  # Forward Provider (Transparent Proxy)
+  # Forwards requests to the endpoint without any authentication transformation.
+  # Useful for proxying to internal services or custom endpoints.
+  - type: "forward"
+    host: "internal.example.com"       # Client uses "Host: internal.example.com" header
+    endpoint: "backend.internal:8080"  # Actual backend endpoint
+    tls: false
+    weight: 1.0
 ```
 
 ## Usage
@@ -321,45 +335,6 @@ sudo kill -USR2 $(cat /var/run/openproxy.pid)
 
 # Check status
 sudo systemctl status openproxy
-```
-
-## Development
-
-### Running Tests
-
-```bash
-# Run all tests
-cargo test
-
-# Run a specific test
-cargo test test_name
-```
-
-### E2E Testing
-
-The project includes end-to-end tests that run via GitHub Actions. The E2E tests verify the proxy works correctly with real API calls.
-
-To run E2E tests locally:
-
-```bash
-cd e2e
-pip install openai pydantic "httpx[http2]" websockets websocket-client pyyaml
-
-# Run HTTP/HTTPS tests
-python test_https.py
-python test_http.py
-
-# Run WebSocket tests
-python test_websocket.py
-
-# Run host path routing tests
-python test_host_path.py
-
-# Run Anthropic OAuth tests
-python test_anthropic_oauth.py
-
-# Run OpenAI Realtime API test (requires OPENAI_API_KEY)
-OPENAI_API_KEY=sk-xxx python test_openai_realtime.py --direct
 ```
 
 ## License
