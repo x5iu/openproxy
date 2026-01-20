@@ -234,6 +234,43 @@ jobs:
               auth_keys:
                 - sk-auth-key-fallback
               is_fallback: true
+            # Rewrite + Auth Selection test providers
+            # These test that path rewriting uses the same provider selected by auth
+            # Provider 1: has /v1 path prefix, auth key sk-rewrite-key-1
+            - type: openai
+              host: rewrite-auth.local:8443/v1
+              endpoint: localhost
+              port: 9006
+              tls: false
+              api_key: sk-api-key-with-rewrite
+              auth_keys:
+                - sk-rewrite-key-1
+            # Provider 2: no path prefix, auth key sk-rewrite-key-2
+            - type: openai
+              host: rewrite-auth.local:8443
+              endpoint: localhost
+              port: 9007
+              tls: false
+              api_key: sk-api-key-no-rewrite
+              auth_keys:
+                - sk-rewrite-key-2
+            # Same providers for HTTP port
+            - type: openai
+              host: rewrite-auth.local:8080/v1
+              endpoint: localhost
+              port: 9006
+              tls: false
+              api_key: sk-api-key-with-rewrite
+              auth_keys:
+                - sk-rewrite-key-1
+            - type: openai
+              host: rewrite-auth.local:8080
+              endpoint: localhost
+              port: 9007
+              tls: false
+              api_key: sk-api-key-no-rewrite
+              auth_keys:
+                - sk-rewrite-key-2
             # Forward provider - transparent proxying without auth handling
             - type: forward
               host: forward.localhost:8443
@@ -412,6 +449,82 @@ jobs:
         run: |
           cd e2e
           python test_h2_h1_fallback.py
+
+      - name: Start echo servers for rewrite+auth test
+        run: |
+          # Start echo server for provider with path rewrite (port 9006)
+          python3 -c '
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json
+
+          class EchoHandler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def do_GET(self):
+                  self._handle()
+
+              def do_POST(self):
+                  self._handle()
+
+              def _handle(self):
+                  content_length = int(self.headers.get("Content-Length", 0))
+                  if content_length > 0:
+                      self.rfile.read(content_length)
+                  response = {"server_id": "provider_with_rewrite", "received_path": self.path}
+                  body = json.dumps(response).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, format, *args):
+                  pass
+
+          HTTPServer(("127.0.0.1", 9006), EchoHandler).serve_forever()
+          ' &
+          # Start echo server for provider without path rewrite (port 9007)
+          python3 -c '
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json
+
+          class EchoHandler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def do_GET(self):
+                  self._handle()
+
+              def do_POST(self):
+                  self._handle()
+
+              def _handle(self):
+                  content_length = int(self.headers.get("Content-Length", 0))
+                  if content_length > 0:
+                      self.rfile.read(content_length)
+                  response = {"server_id": "provider_no_rewrite", "received_path": self.path}
+                  body = json.dumps(response).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, format, *args):
+                  pass
+
+          HTTPServer(("127.0.0.1", 9007), EchoHandler).serve_forever()
+          ' &
+          sleep 2
+          echo "Echo servers started on ports 9006 and 9007"
+
+      - name: Run rewrite+auth selection test
+        env:
+          PROXY_HTTPS_PORT: 8443
+          PROXY_HTTP_PORT: 8080
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+        run: |
+          cd e2e
+          python test_rewrite_auth_selection.py
 
       - name: Run Gemini E2E tests (HTTPS with curl)
         env:

@@ -280,6 +280,31 @@ impl Program {
         }
     }
 
+    /// Get all providers matching host/path (ignoring health status and auth).
+    /// Used for header filtering to ensure all potential auth headers are stripped,
+    /// regardless of which specific provider is eventually selected.
+    pub fn get_matching_providers(&self, host: &str, path: &str) -> Vec<&dyn Provider> {
+        let host_without_port = http::strip_port(host);
+        self.providers
+            .iter()
+            .filter_map(|provider| {
+                let (provider_host, provider_path_prefix) = http::split_host_path(provider.host());
+                let provider_host_without_port = http::strip_port(provider_host);
+                let selected = if let Some(provider_path_prefix) = provider_path_prefix {
+                    (provider_host == host || provider_host_without_port == host_without_port)
+                        && path.starts_with(provider_path_prefix)
+                        && matches!(
+                            path.as_bytes().get(provider_path_prefix.len()),
+                            None | Some(b'/')
+                        )
+                } else {
+                    provider_host == host || provider_host_without_port == host_without_port
+                };
+                selected.then_some(&**provider)
+            })
+            .collect()
+    }
+
     /// Select a provider with authentication during selection.
     /// This method tries to authenticate with each matching provider and returns
     /// the first one that authenticates successfully.
