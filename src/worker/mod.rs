@@ -48,7 +48,9 @@ where
     fn new(pool: Arc<P>, h2pool: Arc<H2P>) -> Self;
     fn get_http1_conn<'a>(
         &'a mut self,
-        provider: &'a dyn Provider,
+        endpoint: &'a str,
+        sock_address: &'a str,
+        use_tls: bool,
     ) -> Pin<Box<dyn Future<Output = Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Send;
@@ -91,21 +93,23 @@ where
 
     fn get_http1_conn<'a>(
         &'a mut self,
-        provider: &'a dyn Provider,
+        endpoint: &'a str,
+        sock_address: &'a str,
+        use_tls: bool,
     ) -> Pin<Box<dyn Future<Output = Result<<P as PoolTrait>::Item, Error>> + Send + 'a>>
     where
         <P as PoolTrait>::Item: Send,
     {
         Box::pin(async move {
-            if let Some(conn) = self.select_h1(provider.endpoint()).await {
+            if let Some(conn) = self.select_h1(endpoint).await {
                 Ok(conn)
             } else {
-                let stream = TcpStream::connect(provider.sock_address()).await?;
-                let conn = if provider.tls() {
+                let stream = TcpStream::connect(sock_address).await?;
+                let conn = if use_tls {
                     let connector = new_tls_connector();
-                    <P as PoolTrait>::Item::new_tls(provider.endpoint(), stream, connector).await?
+                    <P as PoolTrait>::Item::new_tls(endpoint, stream, connector).await?
                 } else {
-                    <P as PoolTrait>::Item::new(provider.endpoint(), stream)
+                    <P as PoolTrait>::Item::new(endpoint, stream)
                 };
                 Ok(conn)
             }
@@ -341,19 +345,18 @@ where
                 let auth_header = auth_header.unwrap();
 
                 // Get first header chunk for path rewriting
-                let first_block_rewrite = request.first_header_chunk()
+                let first_block_rewrite = request
+                    .first_header_chunk()
                     .and_then(|chunk| provider.rewrite_first_header_block(chunk));
 
                 // Compute transformed extra headers
                 let mut extra_headers_transformed = Vec::new();
                 for header_key in provider.extra_headers() {
-                    let existing_value = request.find_header_value(
-                        header_key.trim_end_matches(": ").as_bytes()
-                    );
-                    if let Some(new_header) = provider.transform_extra_header(
-                        header_key,
-                        existing_value.as_deref()
-                    ) {
+                    let existing_value =
+                        request.find_header_value(header_key.trim_end_matches(": ").as_bytes());
+                    if let Some(new_header) =
+                        provider.transform_extra_header(header_key, existing_value.as_deref())
+                    {
                         extra_headers_transformed.push(new_header);
                     }
                 }
@@ -366,8 +369,18 @@ where
                 };
                 request.set_provider_info(provider_info);
 
+                // Extract all needed values from provider and program before dropping the lock
+                let endpoint = provider.endpoint().to_string();
+                let sock_address = provider.sock_address().to_string();
+                let provider_tls = provider.tls();
+                let http_max_header_size = p.http_max_header_size;
+
+                // Drop the read lock BEFORE network I/O to prevent RwLock starvation
+                // when SIGHUP triggers config reload (which needs write lock)
+                drop(p);
+
                 let mut outgoing = self
-                    .get_http1_conn(provider)
+                    .get_http1_conn(&endpoint, &sock_address, provider_tls)
                     .await
                     .map_err(ProxyError::Server)?;
                 if let Err(e) = request.write_to(&mut outgoing).await {
@@ -390,7 +403,7 @@ where
                 }
                 let incoming_conn_keep_alive = request.payload.conn_keep_alive;
                 drop(request);
-                let mut response = http::Response::new(&mut outgoing, p.http_max_header_size)
+                let mut response = http::Response::new(&mut outgoing, http_max_header_size)
                     .await
                     .map_err(ProxyError::Server)?;
                 response
@@ -400,7 +413,7 @@ where
                 let conn_keep_alive = response.payload.conn_keep_alive;
                 drop(response);
                 if conn_keep_alive {
-                    self.return_http1_conn(provider.endpoint(), outgoing).await;
+                    self.return_http1_conn(&endpoint, outgoing).await;
                 }
                 if !incoming_conn_keep_alive {
                     break;

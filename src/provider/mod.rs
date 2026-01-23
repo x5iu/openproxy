@@ -2533,8 +2533,14 @@ mod tests {
         let written = String::from_utf8_lossy(stream.get_written());
 
         // Verify request line and host
-        assert!(written.contains("GET /health HTTP/1.1"), "should have correct request line");
-        assert!(written.contains("Host: backend.internal"), "should have Host header");
+        assert!(
+            written.contains("GET /health HTTP/1.1"),
+            "should have correct request line"
+        );
+        assert!(
+            written.contains("Host: backend.internal"),
+            "should have Host header"
+        );
 
         // Verify NO auth headers are present (proxy doesn't inject any)
         let written_lower = written.to_lowercase();
