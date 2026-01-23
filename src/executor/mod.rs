@@ -40,7 +40,10 @@ impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
         tokio::spawn(async move {
             loop {
                 let p = crate::program();
-                let providers = p.read().await.providers.clone();
+                let (providers, http_max_header_size) = {
+                    let guard = p.read().await;
+                    (guard.providers.clone(), guard.http_max_header_size)
+                };
                 for provider in providers.iter() {
                     let provider_api_key = || {
                         provider.api_key().and_then(|k| {
@@ -64,7 +67,7 @@ impl<P: PoolTrait, H2P: H2PoolTrait + 'static> Executor<P, H2P> {
                             provider.set_healthy(false);
                             return;
                         };
-                        if let Err(e) = provider.health_check(&mut conn).await {
+                        if let Err(e) = provider.health_check(&mut conn, http_max_header_size).await {
                             if provider.is_healthy() {
                                 log::warn!(provider = provider.host(), api_key = provider_api_key(), error = e.to_string(); "health_check_error");
                             }
