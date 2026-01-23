@@ -658,9 +658,9 @@ impl<'a> Payload<'a> {
     /// Get the first header chunk (typically the request line) for path rewriting.
     /// This is used by Worker to pre-compute first_block_rewrite in ProviderInfo.
     pub(crate) fn first_header_chunk(&self) -> Option<&[u8]> {
-        self.header_chunks.first().map(|range| {
-            &self.internal_buffer[range.start..range.end]
-        })
+        self.header_chunks
+            .first()
+            .map(|range| &self.internal_buffer[range.start..range.end])
     }
 
     /// Find the value of a header by name (case-insensitive).
@@ -1566,9 +1566,15 @@ mod tests {
             extra_headers_transformed: vec!["X-Custom: value\r\n".to_string()],
         };
 
-        assert_eq!(info.first_block_rewrite, Some(b"GET /test HTTP/1.1".to_vec()));
+        assert_eq!(
+            info.first_block_rewrite,
+            Some(b"GET /test HTTP/1.1".to_vec())
+        );
         assert_eq!(info.host_header, "Host: api.example.com\r\n");
-        assert_eq!(info.auth_header, Some("Authorization: Bearer sk-test\r\n".to_string()));
+        assert_eq!(
+            info.auth_header,
+            Some("Authorization: Bearer sk-test\r\n".to_string())
+        );
         assert_eq!(info.extra_headers_transformed.len(), 1);
 
         // Test Clone

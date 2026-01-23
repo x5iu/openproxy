@@ -222,6 +222,7 @@ pub trait Provider: Send + Sync {
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         #[allow(unused)] stream: &'stream mut dyn AsyncReadWrite,
+        #[allow(unused)] buffer_size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         Box::pin(async move { Ok(()) })
@@ -412,6 +413,7 @@ impl Provider for OpenAIProvider {
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
+        buffer_size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
@@ -425,6 +427,7 @@ impl Provider for OpenAIProvider {
                     .as_deref()
                     .map(|v| v.iter().map(|x| x.trim().as_bytes())),
                 cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
+                buffer_size,
             ))
         } else {
             Box::pin(async { Ok(()) })
@@ -620,6 +623,7 @@ impl Provider for GeminiProvider {
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
+        buffer_size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
@@ -635,6 +639,7 @@ impl Provider for GeminiProvider {
                         .as_deref()
                         .map(|v| v.iter().map(|x| x.trim().as_bytes())),
                     cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
+                    buffer_size,
                 )
                 .await
             })
@@ -1019,6 +1024,7 @@ impl Provider for AnthropicProvider {
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
+        buffer_size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         Box::pin(async move {
@@ -1046,6 +1052,7 @@ impl Provider for AnthropicProvider {
                     .as_deref()
                     .map(|v| v.iter().map(|x| x.trim().as_bytes())),
                 cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
+                buffer_size,
             )
             .await
         })
@@ -1178,6 +1185,7 @@ impl Provider for ForwardProvider {
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
         stream: &'stream mut dyn AsyncReadWrite,
+        buffer_size: usize,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
@@ -1191,6 +1199,7 @@ impl Provider for ForwardProvider {
                     .as_deref()
                     .map(|v| v.iter().map(|x| x.trim().as_bytes())),
                 cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
+                buffer_size,
             ))
         } else {
             Box::pin(async { Ok(()) })
@@ -2527,14 +2536,20 @@ mod tests {
         .unwrap();
 
         let mut stream = MockHealthCheckStream::new();
-        let result = provider.health_check(&mut stream).await;
+        let result = provider.health_check(&mut stream, 4096).await;
         assert!(result.is_ok(), "health_check should succeed");
 
         let written = String::from_utf8_lossy(stream.get_written());
 
         // Verify request line and host
-        assert!(written.contains("GET /health HTTP/1.1"), "should have correct request line");
-        assert!(written.contains("Host: backend.internal"), "should have Host header");
+        assert!(
+            written.contains("GET /health HTTP/1.1"),
+            "should have correct request line"
+        );
+        assert!(
+            written.contains("Host: backend.internal"),
+            "should have Host header"
+        );
 
         // Verify NO auth headers are present (proxy doesn't inject any)
         let written_lower = written.to_lowercase();
@@ -2557,6 +2572,7 @@ async fn health_check(
     authorization: Option<&[u8]>,
     headers: Option<impl Iterator<Item = &[u8]>>,
     req: &[u8],
+    buffer_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(method).await?;
     stream.write_all(b" ").await?;
@@ -2580,7 +2596,7 @@ async fn health_check(
     }
     stream.write_all(b"\r\n").await?;
     stream.write_all(req).await?;
-    let response = http::Response::new(stream, 4096).await?;
+    let response = http::Response::new(stream, buffer_size).await?;
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parser = httparse::Response::new(&mut headers);
     parser.parse(response.payload.block())?;
