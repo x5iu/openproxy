@@ -132,9 +132,11 @@ where
             let mut err_msg: Option<Cow<str>> = None;
             loop {
                 let p = crate::program();
-                let p = p.read().await;
+                // Read config under lock, but never hold the guard across network I/O.
+                let incoming_max_header_size = p.read().await.http_max_header_size;
+
                 let mut request =
-                    match http::Request::new(&mut incoming, p.http_max_header_size).await {
+                    match http::Request::new(&mut incoming, incoming_max_header_size).await {
                         Ok(request) => request,
                         Err(e @ Error::HeaderTooLarge) => {
                             is_bad_request = true;
@@ -160,6 +162,7 @@ where
                 };
                 // Use auth-during-selection: try to find a provider that authenticates successfully
                 let auth_key = request.auth_key().map(|k| k.to_vec());
+                let p = p.read().await;
                 let (provider, auth_type) = match p.select_provider_with_auth(
                     &host,
                     request.path(),
@@ -328,7 +331,9 @@ where
                 let auth_header = provider.get_upstream_auth_header(auth_type);
                 if let Err(e) = &auth_header {
                     log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
-                    // Drop request first to release the borrow on incoming
+                    // Drop the program lock before network I/O.
+                    drop(p);
+                    // Drop request to release the borrow on incoming.
                     drop(request);
                     let msg = "upstream authentication failed";
                     let resp = format!(
