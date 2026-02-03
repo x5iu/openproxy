@@ -154,6 +154,111 @@ def test_connect_tunnel_enabled():
             pass
 
 
+def test_connect_tunnel_upstream_tls_plaintext():
+    """Test CONNECT tunnel with provider TLS enabled.
+
+    In this mode, OpenProxy establishes a TLS connection to the upstream before
+    returning "200 Connection Established". The client must NOT start a TLS
+    handshake inside the tunnel. Instead, it should send plaintext application
+    data (e.g., an HTTP/1.1 request) which OpenProxy will forward as TLS
+    application data.
+
+    This test validates the behavior by:
+    1) CONNECTing to a provider host that is configured with tls: true
+    2) Sending a plaintext HTTP request inside the tunnel
+    3) Verifying we get an HTTP response back (200/401/etc)
+
+    Required environment variables:
+    - PROXY_HOST, PROXY_PORT_CONNECT
+    - OPENAI_API_KEY (proxy auth key)
+    - TARGET_HOST (real upstream hostname, used in Host header inside the tunnel)
+    - TLS_CONNECT_HOST (provider host used for CONNECT, configured with tls: true)
+    """
+    print(f"\n{'='*50}")
+    print("Testing CONNECT tunnel with upstream TLS (client sends plaintext)")
+    print('='*50)
+
+    proxy_host = os.environ.get("PROXY_HOST", "localhost")
+    proxy_port = int(os.environ.get("PROXY_PORT_CONNECT", "8081"))
+    api_key = os.environ.get("OPENAI_API_KEY", "test-key")
+
+    connect_host = os.environ.get("TLS_CONNECT_HOST", "connect-tls")
+    connect_port = int(os.environ.get("TLS_CONNECT_PORT", "443"))
+
+    upstream_host = strip_url_scheme(os.environ.get("TARGET_HOST", "api.openai.com"))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+
+    try:
+        sock.connect((proxy_host, proxy_port))
+
+        # Send CONNECT request to the tls:true provider host
+        request = (
+            f"CONNECT {connect_host}:{connect_port} HTTP/1.1\r\n"
+            f"Host: {connect_host}:{connect_port}\r\n"
+            f"Authorization: Bearer {api_key}\r\n"
+            f"\r\n"
+        )
+        sock.sendall(request.encode())
+
+        # Read CONNECT response
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        response_str = response.decode("utf-8", errors="replace")
+        print(f"CONNECT Response:\n{response_str}")
+
+        # Should get 200 Connection Established
+        assert "200" in response_str, f"Expected 200, got: {response_str}"
+
+        # Send plaintext HTTP request through the tunnel
+        http_request = (
+            "GET /v1/models HTTP/1.1\r\n"
+            f"Host: {upstream_host}\r\n"
+            f"Authorization: Bearer {api_key}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        sock.sendall(http_request.encode())
+
+        # Read response (might be 200/401/etc depending on upstream auth)
+        http_response = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                http_response += chunk
+                # Avoid unbounded reads; we only need the start of the response
+                if len(http_response) > 64 * 1024:
+                    break
+        except socket.timeout:
+            # If we already received some data, treat timeout as acceptable
+            pass
+
+        http_response_str = http_response.decode("utf-8", errors="replace")
+        print(
+            f"HTTP Response through tunnel (first 500 chars):\n{http_response_str[:500]}"
+        )
+
+        assert "HTTP/1.1" in http_response_str, (
+            f"Expected HTTP response, got: {http_response_str[:200]}"
+        )
+
+        print("\u2713 CONNECT tunnel upstream TLS plaintext test passed!")
+
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def test_connect_tunnel_auth_failure():
     """Test that CONNECT requests with invalid auth return 401."""
     print(f"\n{'='*50}")
@@ -584,6 +689,11 @@ if __name__ == "__main__":
         test_connect_tunnel_enabled()
         tests_run += 1
 
+    # Test upstream TLS mode (provider tls: true, client sends plaintext inside tunnel)
+    if os.environ.get("TEST_CONNECT_UPSTREAM_TLS", "false").lower() == "true":
+        test_connect_tunnel_upstream_tls_plaintext()
+        tests_run += 1
+
     # Test authentication failure (returns 401)
     if os.environ.get("TEST_CONNECT_AUTH_FAILURE", "false").lower() == "true":
         test_connect_tunnel_auth_failure()
@@ -620,6 +730,7 @@ if __name__ == "__main__":
         print("Set at least one of these environment variables to 'true':")
         print("  TEST_CONNECT_DISABLED")
         print("  TEST_CONNECT_ENABLED")
+        print("  TEST_CONNECT_UPSTREAM_TLS")
         print("  TEST_CONNECT_AUTH_FAILURE")
         print("  TEST_CONNECT_NO_PROVIDER")
         print("  TEST_CONNECT_DATA_TRANSFER")

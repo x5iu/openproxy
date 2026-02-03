@@ -100,6 +100,16 @@ health_check:
 # CONNECT Tunnel Configuration
 # Enable HTTP CONNECT method for establishing tunnels (used by forward proxies)
 # connect_tunnel_enabled: true  # default: false
+#
+# CONNECT upstream TLS behavior:
+# - The tunnel uses the selected provider's `tls` field to decide how to connect upstream.
+# - tls: false -> plain TCP to upstream (standard CONNECT behavior; the client negotiates TLS inside the tunnel)
+# - tls: true  -> OpenProxy establishes TLS to upstream before returning "200 Connection Established"
+#                (this wraps the tunnel payload inside that TLS session)
+#
+# NOTE: Most HTTPS CONNECT clients (curl/browsers) will start a TLS handshake inside the tunnel.
+# With tls: true, that inner TLS handshake will be forwarded as application data and will likely fail.
+# For standard HTTPS CONNECT, set tls: false on the provider used for tunneling.
 
 # Provider Configuration
 providers:
@@ -239,6 +249,88 @@ curl -X POST https://localhost/v1/messages \
   -H "X-API-Key: client-api-key-1" \
   -H "Content-Type: application/json" \
   -d '{"model": "claude-3-haiku-20240307", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+### HTTP CONNECT Tunnel
+
+When `connect_tunnel_enabled: true`, OpenProxy can handle the HTTP `CONNECT` method and act as a forward proxy.
+
+#### Provider matching
+
+CONNECT requests use an authority-form target like `CONNECT api.openai.com:443 HTTP/1.1`.
+OpenProxy routes the tunnel by the `Host` header (port is stripped for matching), and validates that the requested port
+matches the selected provider's `port`.
+
+In practice, configure a provider whose `host` matches the CONNECT target host (e.g. `api.openai.com`) and whose `port`
+matches the CONNECT target port (e.g. `443`).
+
+#### Authentication
+
+CONNECT requests are authenticated during provider selection. For OpenAI/Gemini/Anthropic providers, both
+`Authorization` and `Proxy-Authorization` are accepted on the CONNECT request.
+
+#### Upstream TLS behavior
+
+For CONNECT tunnels, the upstream connection uses the provider's `tls` setting (default: `true`):
+
+- `tls: false` (recommended for standard HTTPS CONNECT): OpenProxy connects to upstream with plain TCP.
+  The client negotiates TLS inside the tunnel after receiving `200 Connection Established`.
+- `tls: true` (advanced): OpenProxy performs a TLS handshake to upstream before returning 200.
+  Most HTTPS CONNECT clients (curl/browsers) will then try to start another TLS handshake inside the tunnel and will fail.
+
+Example (standard HTTPS CONNECT tunnel to OpenAI):
+
+```yaml
+http_port: 8081
+connect_tunnel_enabled: true
+
+auth_keys:
+  - "client-api-key-1"
+
+providers:
+  - type: "openai"
+    host: "api.openai.com"
+    endpoint: "api.openai.com"
+    port: 443
+    tls: false
+```
+
+```bash
+# curl will send CONNECT to the proxy, then negotiate TLS inside the tunnel.
+curl https://api.openai.com/v1/models \
+  -x http://localhost:8081 \
+  --proxy-header "Proxy-Authorization: Bearer client-api-key-1" \
+  -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+Example (tls: true, client sends plaintext inside the tunnel):
+
+This mode is useful when you want TLS between OpenProxy and the upstream, but your client should NOT start a TLS
+handshake inside the CONNECT tunnel.
+
+```yaml
+http_port: 8081
+connect_tunnel_enabled: true
+
+auth_keys:
+  - "client-api-key-1"
+
+providers:
+  - type: "openai"
+    host: "api.openai.com"
+    endpoint: "api.openai.com"
+    port: 443
+    tls: true
+```
+
+```bash
+# Use http://...:443 + --proxytunnel so curl does NOT start TLS inside the tunnel.
+# OpenProxy will establish TLS to upstream and forward this plain HTTP request as TLS application data.
+curl --proxytunnel http://api.openai.com:443/v1/models \
+  -x http://localhost:8081 \
+  --proxy-header "Proxy-Authorization: Bearer client-api-key-1" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Host: api.openai.com"
 ```
 
 ### WebSocket Connections

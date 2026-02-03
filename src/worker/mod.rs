@@ -240,9 +240,10 @@ where
                     // Get connection parameters from provider
                     let endpoint = provider.endpoint().to_string();
                     let sock_address = provider.sock_address().to_string();
-                    // CONNECT tunnel always uses transparent TCP (tls=false).
-                    // The client handles TLS after receiving "200 Connection Established".
-                    // Using provider.tls() would cause "TLS inside TLS" and break handshake.
+                    // CONNECT tunnel uses provider.tls() to decide whether to use TLS for upstream.
+                    // Set tls: false in config for standard transparent TCP behavior.
+                    // Set tls: true to wrap upstream connection with TLS (secure transport).
+                    let provider_tls = provider.tls();
 
                     // Get any pre-read data (bytes read after headers, e.g., TLS ClientHello)
                     let preread_data = request.preread_data().to_vec();
@@ -252,6 +253,7 @@ where
                         host = &host,
                         endpoint = &endpoint,
                         sock_address = &sock_address,
+                        provider_tls = provider_tls,
                         preread_bytes = preread_data.len();
                         "connect_tunnel_request"
                     );
@@ -261,7 +263,13 @@ where
                     drop(request);
 
                     return self
-                        .handle_connect_tunnel(incoming, &endpoint, &sock_address, &preread_data)
+                        .handle_connect_tunnel(
+                            incoming,
+                            &endpoint,
+                            &sock_address,
+                            provider_tls,
+                            &preread_data,
+                        )
                         .await;
                 }
 
@@ -1354,19 +1362,21 @@ where
 
     /// Handle HTTP CONNECT tunnel request
     /// This method:
-    /// 1. Establishes a new TCP connection to the target server (transparent, no TLS wrapper)
-    /// 2. Sends 200 Connection Established response to client
-    /// 3. Forwards any pre-read data to upstream
-    /// 4. Performs bidirectional TCP proxying
+    /// 1. Establishes a new TCP connection to the target server
+    /// 2. Optionally wraps connection with TLS based on provider config
+    /// 3. Sends 200 Connection Established response to client
+    /// 4. Forwards any pre-read data to upstream
+    /// 5. Performs bidirectional TCP proxying
     ///
-    /// Note: CONNECT tunnel always uses plain TCP, not TLS-wrapped connections.
-    /// The client handles TLS negotiation after receiving "200 Connection Established".
+    /// Note: When provider_tls is false, uses plain TCP (standard CONNECT behavior).
+    /// When provider_tls is true, wraps upstream connection with TLS (for secure transport).
     /// We don't use connection pool here (like WebSocket) to avoid "taking without returning".
     async fn handle_connect_tunnel<S>(
         &mut self,
         incoming: &mut S,
         endpoint: &str,
         sock_address: &str,
+        provider_tls: bool,
         preread_data: &[u8],
     ) -> Result<(), ProxyError>
     where
@@ -1374,8 +1384,8 @@ where
         <P as PoolTrait>::Item: Send + Unpin,
     {
         // 1. Create a new TCP connection to target (don't use pool, similar to WebSocket)
-        let mut outgoing: <P as PoolTrait>::Item = match TcpStream::connect(sock_address).await {
-            Ok(stream) => <P as PoolTrait>::Item::new(endpoint, stream),
+        let stream = match TcpStream::connect(sock_address).await {
+            Ok(stream) => stream,
             Err(e) => {
                 // Log the error with full context for debugging
                 log::error!(
@@ -1399,7 +1409,36 @@ where
             }
         };
 
-        // 2. Send 200 Connection Established response
+        // 2. Optionally wrap with TLS based on provider config
+        let mut outgoing: <P as PoolTrait>::Item = if provider_tls {
+            let connector = new_tls_connector();
+            match <P as PoolTrait>::Item::new_tls(endpoint, stream, connector).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!(
+                        endpoint = endpoint,
+                        sock_address = sock_address,
+                        error = e.to_string();
+                        "connect_tunnel_tls_handshake_failed"
+                    );
+                    let msg = "upstream TLS handshake failed";
+                    let resp = format!(
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        msg.len(),
+                        msg
+                    );
+                    incoming
+                        .write_all(resp.as_bytes())
+                        .await
+                        .map_err(|e| ProxyError::Client(e.into()))?;
+                    return Ok(());
+                }
+            }
+        } else {
+            <P as PoolTrait>::Item::new(endpoint, stream)
+        };
+
+        // 3. Send 200 Connection Established response
         incoming
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -1412,7 +1451,7 @@ where
         #[cfg(debug_assertions)]
         log::info!(endpoint = endpoint, sock_address = sock_address; "connect_tunnel_established");
 
-        // 3. Forward any pre-read data to upstream
+        // 4. Forward any pre-read data to upstream
         // (Client may have sent TLS ClientHello immediately after CONNECT request)
         //
         // IMPORTANT: After sending "200 Connection Established", we MUST NOT return
@@ -1447,7 +1486,7 @@ where
             );
         }
 
-        // 4. Bidirectional TCP proxying
+        // 5. Bidirectional TCP proxying
         if let Err(e) = websocket::bidirectional_copy(incoming, &mut outgoing).await {
             // Log tunnel errors for observability, but don't propagate as ProxyError
             // since we've already sent "200 Connection Established"
