@@ -779,14 +779,22 @@ jobs:
             - ${AUTH_KEY}
 
           providers:
-            # CONNECT tunnel always uses transparent TCP (ignores tls setting).
-            # Client handles TLS directly with upstream after receiving "200 Connection Established".
+            # CONNECT tunnel upstream transport is controlled by provider.tls:
+            # - tls: false -> plain TCP (standard CONNECT; client negotiates TLS inside the tunnel)
+            # - tls: true  -> OpenProxy establishes TLS to upstream; client must send plaintext inside the tunnel
             - type: openai
               host: ${OPENAI_ENDPOINT}
               endpoint: ${OPENAI_ENDPOINT}
               port: 443
               api_key: ${OPENAI_API_KEY}
               tls: false
+            # tls:true provider for CONNECT tunnel (used by TEST_CONNECT_UPSTREAM_TLS)
+            - type: openai
+              host: connect-tls
+              endpoint: ${OPENAI_ENDPOINT}
+              port: 443
+              api_key: ${OPENAI_API_KEY}
+              tls: true
             # Echo server provider for data transfer test
             - type: openai
               host: local-service
@@ -816,7 +824,10 @@ jobs:
           OPENAI_API_KEY: ${{ env.AUTH_KEY }}
           TARGET_HOST: ${{ secrets.OPENAI_HOST }}
           TARGET_PORT: "443"
+          TLS_CONNECT_HOST: "connect-tls"
+          TLS_CONNECT_PORT: "443"
           TEST_CONNECT_ENABLED: "true"
+          TEST_CONNECT_UPSTREAM_TLS: "true"
           TEST_CONNECT_AUTH_FAILURE: "true"
           TEST_CONNECT_NO_PROVIDER: "true"
           TEST_CONNECT_PORT_MISMATCH: "true"
