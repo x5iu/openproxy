@@ -693,6 +693,15 @@ jobs:
           python test_forward.py
           echo "Forward provider E2E tests passed!"
 
+      - name: Run no-auth-keys filtering E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing auth header filtering when no auth_keys configured..."
+          cd e2e
+          python test_no_auth_keys_filtering.py
+          echo "No-auth-keys filtering E2E tests passed!"
+
       - name: Start echo servers for auth selection test
         run: |
           # Start echo servers that return their server_id
