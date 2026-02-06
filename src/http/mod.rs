@@ -366,9 +366,7 @@ impl<'a> Payload<'a> {
                 let mut all_extra_header_keys: Vec<&'static str> = Vec::new();
                 let mut all_auth_query_keys: Vec<&'static str> = Vec::new();
                 for provider in &providers {
-                    if provider.has_auth_keys() {
-                        all_auth_header_keys.extend(provider.auth_header_keys());
-                    }
+                    all_auth_header_keys.extend(provider.auth_header_keys());
                     all_extra_header_keys.extend(provider.extra_headers());
                     if let Some(key) = provider.auth_query_key() {
                         all_auth_query_keys.push(key);

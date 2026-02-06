@@ -1,6 +1,7 @@
 # OpenProxy
 
 [![E2E Tests](https://github.com/x5iu/openproxy/actions/workflows/e2e.yml/badge.svg)](https://github.com/x5iu/openproxy/actions/workflows/e2e.yml)
+[![Security Scan](https://github.com/x5iu/openproxy/actions/workflows/security.yml/badge.svg)](https://github.com/x5iu/openproxy/actions/workflows/security.yml)
 
 A high-performance LLM (Large Language Model) proxy server written in Rust, designed to intelligently route requests between multiple LLM providers with advanced features like weighted load balancing, health checks, and connection pooling.
 
@@ -97,6 +98,9 @@ health_check:
 # HTTP Configuration
 # http_max_header_size: 8192  # Maximum HTTP header size in bytes (default: 4096, min: 1024, max: 1MB)
 
+# Graceful Shutdown
+# graceful_shutdown_timeout: 5  # Timeout in seconds for graceful shutdown (default: 5)
+
 # CONNECT Tunnel Configuration
 # Enable HTTP CONNECT method for establishing tunnels (used by forward proxies)
 # connect_tunnel_enabled: true  # default: false
@@ -186,12 +190,22 @@ providers:
 
   # Forward Provider (Transparent Proxy)
   # Forwards requests to the endpoint without any authentication transformation.
+  # Client headers (including Authorization) are passed through as-is.
   # Useful for proxying to internal services or custom endpoints.
   - type: "forward"
     host: "internal.example.com"       # Client uses "Host: internal.example.com" header
     endpoint: "backend.internal:8080"  # Actual backend endpoint
     tls: false
     weight: 1.0
+
+  # Path Prefix Routing
+  # Include a path prefix in `host` to route by both host and path.
+  # Requests to "localhost:8080/openai/v1/chat/completions" will match this provider
+  # and strip the "/openai" prefix before forwarding to upstream.
+  - type: "openai"
+    host: "localhost:8080/openai"      # Host + path prefix for routing
+    endpoint: "api.openai.com"
+    api_key: "sk-your-openai-api-key"
 ```
 
 ## Usage
@@ -367,7 +381,8 @@ ws.close()
 ## Security
 
 - **TLS 1.3**: Modern encryption standards with forward secrecy
-- **API Key Validation**: Multi-layer authentication system
+- **Credential Isolation**: Client authentication headers are never forwarded to upstream providers. The proxy strips client credentials and injects the provider's own `api_key` instead, preventing credential leakage. The `forward` provider type is the exception — it passes all client headers through as-is for transparent proxying.
+- **API Key Validation**: Multi-layer authentication system with global and per-provider keys
 - **No Key Logging**: Secure handling of sensitive credentials
 - **Constant-Time Comparison**: API key validation uses constant-time comparison to prevent timing attacks
 
