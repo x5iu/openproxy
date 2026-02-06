@@ -70,6 +70,13 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/openproxy dist/openproxy-linux-amd64
           cd dist && tar -czvf openproxy-linux-amd64.tar.gz openproxy-linux-amd64
 
+      - name: Build Linux arm64 binary (static linking with musl)
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          cross build --release --target aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/openproxy dist/openproxy-linux-arm64
+          cd dist && tar -czvf openproxy-linux-arm64.tar.gz openproxy-linux-arm64
+
       - name: Setup Node.js
         if: steps.check_version.outputs.should_release == 'true'
         uses: actions/setup-node@v4
@@ -99,6 +106,7 @@ jobs:
           generate_release_notes: false
           files: |
             dist/openproxy-linux-amd64.tar.gz
+            dist/openproxy-linux-arm64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
