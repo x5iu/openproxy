@@ -5,8 +5,12 @@ This test suite validates:
 1. api_key: $(command) uses dynamic Authorization: Bearer header upstream
 2. Standard (non-command) api_key behavior is unchanged
 3. Health checks also use dynamic API key when configured
+4. WebSocket upgrade also uses dynamic API key when configured
+5. Dynamic api_key command failure returns 502 Bad Gateway
 """
 
+import base64
+import hashlib
 import json
 import os
 import socket
@@ -17,6 +21,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+WS_ACCEPT_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 def find_free_port() -> int:
@@ -147,6 +153,66 @@ def start_mock_server(port: int):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
+
+
+class MockWebSocketHandler(BaseHTTPRequestHandler):
+    """Mock upstream for WebSocket upgrade requests."""
+
+    received_headers = {}
+    authorization_values = []
+
+    def log_message(self, format, *args):
+        pass
+
+    @classmethod
+    def reset(cls):
+        cls.received_headers = {}
+        cls.authorization_values = []
+
+    def do_GET(self):
+        MockWebSocketHandler.received_headers = {
+            key.lower(): value for key, value in self.headers.items()
+        }
+        MockWebSocketHandler.authorization_values = (
+            self.headers.get_all("Authorization") or []
+        )
+
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        sec_ws_key = self.headers.get("Sec-WebSocket-Key", "")
+        sec_ws_accept = base64.b64encode(
+            hashlib.sha1((sec_ws_key + WS_ACCEPT_MAGIC).encode("utf-8")).digest()
+        ).decode("utf-8")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", sec_ws_accept)
+        self.end_headers()
+        self.close_connection = True
+
+
+def start_mock_websocket_server(port: int):
+    """Start mock websocket upstream server in background thread."""
+    server = HTTPServer(("127.0.0.1", port), MockWebSocketHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+def read_http_response_header(sock: socket.socket, timeout: float = 10.0) -> str:
+    """Read HTTP response headers from a socket."""
+    sock.settimeout(timeout)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode("latin-1", errors="replace")
 
 
 def test_dynamic_api_key_forwarding():
@@ -366,11 +432,154 @@ def test_dynamic_api_key_health_check():
             upstream_server.server_close()
 
 
+def test_dynamic_api_key_websocket_upgrade():
+    """WebSocket upgrade should use dynamic Authorization header in command mode."""
+    import yaml
+
+    print(f"\n{'=' * 60}")
+    print("Testing OpenAI Dynamic API Key WebSocket Upgrade")
+    print("=" * 60)
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+    MockWebSocketHandler.reset()
+    upstream_server = start_mock_websocket_server(upstream_port)
+
+    if not wait_for_port("127.0.0.1", upstream_port):
+        raise RuntimeError("Mock websocket server failed to start")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = os.path.join(tmpdir, "config.yml")
+        log_path = os.path.join(tmpdir, "openproxy.log")
+
+        config = {
+            "http_port": proxy_port,
+            "providers": [
+                {
+                    "type": "openai",
+                    "host": "openai-ws-dynamic.local",
+                    "endpoint": "127.0.0.1",
+                    "port": upstream_port,
+                    "tls": False,
+                    "api_key": "$(echo sk-dynamic-ws-24680)",
+                }
+            ],
+        }
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f)
+
+        proxy_process, proxy_log = start_openproxy(config_path, log_path)
+        try:
+            if not wait_for_port("127.0.0.1", proxy_port, timeout=30):
+                proxy_log.flush()
+                with open(log_path, "r", encoding="utf-8") as f:
+                    print(f.read())
+                raise RuntimeError("openproxy failed to start")
+
+            with socket.create_connection(("127.0.0.1", proxy_port), timeout=10.0) as sock:
+                ws_request = (
+                    "GET /v1/realtime?model=gpt-4o-mini HTTP/1.1\r\n"
+                    "Host: openai-ws-dynamic.local\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "Authorization: Bearer client-should-not-pass-through\r\n"
+                    "\r\n"
+                )
+                sock.sendall(ws_request.encode("utf-8"))
+                response_header = read_http_response_header(sock)
+
+            status_line = response_header.split("\r\n", 1)[0]
+            assert (
+                "101" in status_line
+            ), f"Expected WebSocket 101 response, got: {status_line}"
+
+            auth_values = MockWebSocketHandler.authorization_values
+            assert len(auth_values) == 1, f"Expected 1 Authorization header, got: {auth_values}"
+            assert auth_values[0] == "Bearer sk-dynamic-ws-24680", (
+                f"Unexpected WebSocket Authorization header: {auth_values[0]}"
+            )
+            print("WebSocket upstream Authorization:", auth_values[0])
+            print("PASS: OpenAI dynamic API key websocket test passed!")
+        finally:
+            stop_process(proxy_process)
+            proxy_log.close()
+            upstream_server.shutdown()
+            upstream_server.server_close()
+
+
+def test_dynamic_api_key_command_failure_returns_502():
+    """Dynamic command failure should return 502 without contacting upstream."""
+    import httpx
+    import yaml
+
+    print(f"\n{'=' * 60}")
+    print("Testing OpenAI Dynamic API Key Command Failure")
+    print("=" * 60)
+
+    proxy_port = find_free_port()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = os.path.join(tmpdir, "config.yml")
+        log_path = os.path.join(tmpdir, "openproxy.log")
+
+        config = {
+            "http_port": proxy_port,
+            "providers": [
+                {
+                    "type": "openai",
+                    "host": "openai-command-fail.local",
+                    "endpoint": "127.0.0.1",
+                    "port": find_free_port(),
+                    "tls": False,
+                    "api_key": "$(exit 1)",
+                }
+            ],
+        }
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f)
+
+        proxy_process, proxy_log = start_openproxy(config_path, log_path)
+        try:
+            if not wait_for_port("127.0.0.1", proxy_port, timeout=30):
+                proxy_log.flush()
+                with open(log_path, "r", encoding="utf-8") as f:
+                    print(f.read())
+                raise RuntimeError("openproxy failed to start")
+
+            with httpx.Client(base_url=f"http://127.0.0.1:{proxy_port}", timeout=30, proxy=None) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Host": "openai-command-fail.local",
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer client-auth",
+                    },
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+
+            assert response.status_code == 502, f"Expected 502, got: {response.status_code}"
+            assert "upstream authentication failed" in response.text, (
+                f"Unexpected response body: {response.text}"
+            )
+            print("Response body:", response.text)
+            print("PASS: OpenAI dynamic command failure returns 502 test passed!")
+        finally:
+            stop_process(proxy_process)
+            proxy_log.close()
+
+
 if __name__ == "__main__":
     try:
         test_dynamic_api_key_forwarding()
         test_standard_openai_api_key_still_works()
         test_dynamic_api_key_health_check()
+        test_dynamic_api_key_websocket_upgrade()
+        test_dynamic_api_key_command_failure_returns_502()
     except Exception as e:
         print(f"ERROR: {e}")
         sys.exit(1)
