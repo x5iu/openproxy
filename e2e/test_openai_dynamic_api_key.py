@@ -477,12 +477,13 @@ def test_dynamic_api_key_websocket_upgrade():
                 raise RuntimeError("openproxy failed to start")
 
             with socket.create_connection(("127.0.0.1", proxy_port), timeout=10.0) as sock:
+                websocket_key = base64.b64encode(os.urandom(16)).decode("ascii")
                 ws_request = (
                     "GET /v1/realtime?model=gpt-4o-mini HTTP/1.1\r\n"
                     "Host: openai-ws-dynamic.local\r\n"
                     "Upgrade: websocket\r\n"
                     "Connection: Upgrade\r\n"
-                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    f"Sec-WebSocket-Key: {websocket_key}\r\n"
                     "Sec-WebSocket-Version: 13\r\n"
                     "Authorization: Bearer client-should-not-pass-through\r\n"
                     "\r\n"
