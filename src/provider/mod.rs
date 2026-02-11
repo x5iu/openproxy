@@ -253,6 +253,7 @@ pub struct OpenAIProvider {
     weight: f64,
     host_header: String,
     auth_header: Option<String>,
+    dynamic_api_key_command: Option<String>,
     sock_address: String,
     server_name: rustls_pki_types::ServerName<'static>,
     auth_keys: Arc<Vec<String>>,
@@ -286,8 +287,18 @@ impl OpenAIProvider {
         } else {
             format!("Host: {}:{}\r\n", endpoint, port)
         };
-        let auth_header =
-            api_key.map(|api_key| format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, api_key));
+        let (auth_header, dynamic_api_key_command) = if let Some(cmd) =
+            api_key.and_then(extract_oauth_command)
+        {
+            // Dynamic API key mode: execute command for each request
+            (None, Some(cmd.to_string()))
+        } else {
+            (
+                api_key
+                    .map(|api_key| format!("{}Bearer {}\r\n", http::HEADER_AUTHORIZATION, api_key)),
+                None,
+            )
+        };
         let sock_address = format!("{}:{}", endpoint, port);
         Ok(Self {
             host,
@@ -297,6 +308,7 @@ impl OpenAIProvider {
             weight,
             host_header,
             auth_header,
+            dynamic_api_key_command,
             sock_address,
             server_name,
             auth_keys,
@@ -409,6 +421,23 @@ impl Provider for OpenAIProvider {
         self.is_healthy.store(healthy, Ordering::SeqCst)
     }
 
+    fn uses_dynamic_auth(&self) -> bool {
+        self.dynamic_api_key_command.is_some()
+    }
+
+    fn get_dynamic_auth_header(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref cmd) = self.dynamic_api_key_command {
+            let api_key = execute_oauth_command(cmd)?;
+            Ok(format!(
+                "{}Bearer {}\r\n",
+                http::HEADER_AUTHORIZATION,
+                api_key
+            ))
+        } else {
+            Err("Not a dynamic API key provider".into())
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn health_check<'a: 'stream, 'stream>(
         &'a self,
@@ -417,18 +446,30 @@ impl Provider for OpenAIProvider {
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'stream>>
     {
         if let Some(ref cfg) = self.health_check_config {
-            Box::pin(health_check(
-                stream,
-                self.endpoint().as_bytes(),
-                cfg.method.as_ref().map(|v| v.as_bytes()).unwrap_or(b"GET"),
-                cfg.path.as_bytes(),
-                self.auth_header().map(|v| v.as_bytes()),
-                cfg.headers
-                    .as_deref()
-                    .map(|v| v.iter().map(|x| x.trim().as_bytes())),
-                cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
-                buffer_size,
-            ))
+            Box::pin(async move {
+                let auth_header = if self.uses_dynamic_auth() {
+                    Some(
+                        self.get_dynamic_auth_header()
+                            .map_err(|e| e as Box<dyn std::error::Error>)?,
+                    )
+                } else {
+                    self.auth_header().map(|v| v.to_string())
+                };
+
+                health_check(
+                    stream,
+                    self.endpoint().as_bytes(),
+                    cfg.method.as_ref().map(|v| v.as_bytes()).unwrap_or(b"GET"),
+                    cfg.path.as_bytes(),
+                    auth_header.as_ref().map(|v| v.as_bytes()),
+                    cfg.headers
+                        .as_deref()
+                        .map(|v| v.iter().map(|x| x.trim().as_bytes())),
+                    cfg.body.as_ref().map(|v| v.as_bytes()).unwrap_or_default(),
+                    buffer_size,
+                )
+                .await
+            })
         } else {
             Box::pin(async { Ok(()) })
         }
@@ -1910,6 +1951,68 @@ mod tests {
 
         assert_eq!(provider.api_key(), None);
         assert_eq!(provider.auth_header(), None);
+    }
+
+    #[test]
+    fn test_openai_provider_dynamic_api_key_mode() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("$(echo dynamic-openai-key)"),
+            auth_keys,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(provider.api_key(), Some("$(echo dynamic-openai-key)"));
+        assert_eq!(provider.auth_header(), None);
+        assert!(provider.uses_dynamic_auth());
+
+        let dynamic_auth = provider.get_dynamic_auth_header();
+        assert!(dynamic_auth.is_ok());
+        assert_eq!(
+            dynamic_auth.unwrap(),
+            "Authorization: Bearer dynamic-openai-key\r\n"
+        );
+
+        let upstream_auth = provider.get_upstream_auth_header(None);
+        assert!(upstream_auth.is_ok());
+        assert_eq!(
+            upstream_auth.unwrap(),
+            Some("Authorization: Bearer dynamic-openai-key\r\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_openai_provider_dynamic_api_key_command_failure() {
+        let auth_keys = Arc::new(vec![]);
+        let provider = OpenAIProvider::new(
+            "api.openai.com",
+            "api.openai.com",
+            None,
+            true,
+            1.0,
+            Some("$(exit 1)"),
+            auth_keys,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(provider.uses_dynamic_auth());
+        let result = provider.get_dynamic_auth_header();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("OAuth command failed"));
     }
 
     #[test]

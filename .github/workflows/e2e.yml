@@ -614,6 +614,15 @@ jobs:
           python test_anthropic_oauth.py
           echo "Anthropic OAuth E2E tests passed!"
 
+      - name: Run OpenAI Dynamic API Key E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing OpenAI dynamic API key authentication..."
+          cd e2e
+          python test_openai_dynamic_api_key.py
+          echo "OpenAI dynamic API key E2E tests passed!"
+
       - name: Run Anthropic API E2E tests
         env:
           PROXY_HTTPS_URL: https://localhost:8443

@@ -9,4 +9,5 @@ description = "Ignore documentation examples and test files with fake keys"
 paths = [
     '''README\.md''',
     '''e2e/test_health_check_auth\.py''',
+    '''e2e/test_openai_dynamic_api_key\.py''',
 ]
