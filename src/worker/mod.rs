@@ -278,6 +278,27 @@ where
                     #[cfg(debug_assertions)]
                     log::info!(host = &host, path = request.path(); "websocket_upgrade_request");
 
+                    let auth_header = provider.get_upstream_auth_header(auth_type);
+                    if let Err(e) = &auth_header {
+                        log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
+                        // Drop the program lock before network I/O.
+                        drop(p);
+                        // Drop request to release the borrow on incoming.
+                        drop(request);
+                        let msg = "upstream authentication failed";
+                        let resp = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            msg.len(),
+                            msg
+                        );
+                        incoming
+                            .write_all(resp.as_bytes())
+                            .await
+                            .map_err(|e| ProxyError::Client(e.into()))?;
+                        return Ok(());
+                    }
+                    let auth_header = auth_header.unwrap();
+
                     // Extract WebSocket upgrade info before dropping request and p
                     let raw_headers = request.header_bytes().to_vec();
                     let endpoint = provider.endpoint().to_string();
@@ -285,7 +306,6 @@ where
                     let provider_tls = provider.tls();
                     let max_header_size = p.http_max_header_size;
                     let host_header = provider.host_header().to_string();
-                    let auth_header = provider.auth_header().map(|s| s.to_string());
                     let path_prefix = provider.path_prefix().map(|s| s.to_string());
 
                     // Drop p (RwLockReadGuard) first, then request
@@ -610,13 +630,22 @@ where
                         #[cfg(debug_assertions)]
                         log::info!(authority = authority.to_string(), path = request.uri().path(); "h2_websocket_request");
 
+                        let auth_header = match provider
+                            .get_upstream_auth_header(incoming_auth_type)
+                        {
+                            Ok(h) => h,
+                            Err(e) => {
+                                log::error!(error = e.to_string(); "failed_to_get_upstream_auth_header");
+                                return invalid!(respond, 502, "upstream authentication failed");
+                            }
+                        };
+
                         // Handle WebSocket over HTTP/2
                         let endpoint = provider.endpoint().to_string();
                         let sock_address = provider.sock_address().to_string();
                         let provider_tls = provider.tls();
                         let max_header_size = p.http_max_header_size;
                         let host_header = provider.host_header().to_string();
-                        let auth_header = provider.auth_header().map(|s| s.to_string());
                         let path_prefix = provider.path_prefix();
                         let mut path = request
                             .uri()
