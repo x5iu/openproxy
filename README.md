@@ -13,7 +13,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 - **Health Monitoring**: Automatic health checks with configurable intervals and failure recovery
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
 - **Authentication & Authorization**: Flexible API key management with per-provider and global authentication
-- **OAuth Support**: Dynamic authentication with shell command execution for Anthropic OAuth tokens
+- **Dynamic API Key Commands**: Use `api_key: $(...)` to fetch per-request credentials for OpenAI and Anthropic
 - **Protocol Support**: Full HTTP/1.1 and HTTP/2 support with automatic protocol negotiation
 - **WebSocket Support**: Transparent WebSocket proxying for both HTTP/1.1 upgrade and HTTP/2 Extended CONNECT (RFC 8441)
 - **HTTP CONNECT Tunnel**: Support for HTTP CONNECT method to establish tunnels for forward proxy scenarios
@@ -128,6 +128,16 @@ providers:
     health_check:
       method: "GET"
       path: "/v1/models"
+
+  # OpenAI Configuration (Dynamic API Key Command)
+  # Use $(command) pattern to execute a shell command that returns the API key.
+  # The command is executed per request (including health checks and WebSocket upgrade).
+  # If command execution fails, OpenProxy returns 502: "upstream authentication failed".
+  - type: "openai"
+    host: "openai-dynamic.example.com"
+    endpoint: "api.openai.com"
+    api_key: "$(cat /path/to/openai-token.txt)"
+    # api_key: "$(op read 'op://llm/openai/api_key')"
 
   # Gemini Configuration
   - type: "gemini"
