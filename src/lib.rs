@@ -30,6 +30,57 @@ fn program() -> Arc<RwLock<Program>> {
     Arc::clone(PROGRAM.get().unwrap())
 }
 
+fn keep_highest_priority<T, F>(candidates: Vec<T>, priority_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> i32,
+{
+    let Some(highest_priority) = candidates
+        .iter()
+        .map(|candidate| priority_of(candidate))
+        .max()
+    else {
+        return candidates;
+    };
+
+    candidates
+        .into_iter()
+        .filter(|candidate| priority_of(candidate) == highest_priority)
+        .collect()
+}
+
+fn prefer_non_fallback<T, F>(candidates: Vec<T>, is_fallback_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> bool,
+{
+    if candidates
+        .iter()
+        .any(|candidate| !is_fallback_of(candidate))
+    {
+        candidates
+            .into_iter()
+            .filter(|candidate| !is_fallback_of(candidate))
+            .collect()
+    } else {
+        candidates
+    }
+}
+
+fn select_weighted<T, F>(mut candidates: Vec<T>, weight_of: F) -> Option<T>
+where
+    F: Fn(&T) -> f64,
+{
+    match candidates.len() {
+        0 => None,
+        1 => candidates.pop(),
+        _ => {
+            let dist = WeightedIndex::new(candidates.iter().map(|candidate| weight_of(candidate)))
+                .expect("Failed to create WeightedIndex: invalid weights detected");
+            let selected_idx = rng().sample(&dist);
+            Some(candidates.swap_remove(selected_idx))
+        }
+    }
+}
+
 pub async fn load_config(
     path: impl AsRef<Path>,
     first_load: bool,
@@ -161,6 +212,7 @@ impl Program {
                         api_key_config
                             .weight
                             .unwrap_or(provider.weight.unwrap_or(1.0)),
+                        provider.priority,
                         Some(&api_key_config.key),
                         Arc::clone(&auth_keys),
                         provider.provider_auth_keys.clone(),
@@ -180,6 +232,7 @@ impl Program {
                         .as_ref()
                         .and_then(|cfg| cfg.weight)
                         .unwrap_or(provider.weight.unwrap_or(1.0)),
+                    provider.priority,
                     api_key_config.as_ref().map(|cfg| cfg.key.as_ref()),
                     Arc::clone(&auth_keys),
                     provider.provider_auth_keys.clone(),
@@ -256,28 +309,10 @@ impl Program {
             })
             .collect();
 
-        // Separate non-fallback and fallback providers
-        let (non_fallback, fallback): (Vec<_>, Vec<_>) = healthy_providers
-            .into_iter()
-            .partition(|p| !p.is_fallback());
+        let candidates = prefer_non_fallback(healthy_providers, |provider| provider.is_fallback());
+        let candidates = keep_highest_priority(candidates, |provider| provider.priority());
 
-        // Prefer non-fallback providers; only use fallback if no non-fallback providers exist
-        let candidates = if non_fallback.is_empty() {
-            fallback
-        } else {
-            non_fallback
-        };
-
-        match candidates.len() {
-            0 => None,
-            1 => Some(candidates[0]),
-            _ => {
-                let dist = WeightedIndex::new(candidates.iter().map(|p| p.weight()))
-                    .expect("Failed to create WeightedIndex: invalid weights detected");
-                let selected_idx = rng().sample(&dist);
-                Some(candidates[selected_idx])
-            }
-        }
+        select_weighted(candidates, |provider| provider.weight())
     }
 
     /// Get all providers matching host/path (ignoring health status and auth).
@@ -309,10 +344,12 @@ impl Program {
     /// This method tries to authenticate with each matching provider and returns
     /// the first one that authenticates successfully.
     ///
-    /// The authentication order is:
-    /// 1. Try all non-fallback providers first (with weighted random selection)
-    /// 2. If all non-fallback providers fail authentication, try fallback providers
-    /// 3. If all providers fail authentication, return None
+    /// The selection order is:
+    /// 1. Keep only healthy providers matching host/path
+    /// 2. Authenticate providers and keep the successful ones
+    /// 3. Prefer non-fallback providers
+    /// 4. Within that tier, keep only providers with the highest priority value
+    /// 5. If multiple providers remain, select by weight
     ///
     /// Returns a tuple of (provider, auth_type) where auth_type is the type returned
     /// by authenticate_with_type (e.g., "x-api-key" or "bearer").
@@ -368,29 +405,13 @@ impl Program {
             return Err(provider::AuthenticationError);
         }
 
-        // Separate authenticated providers into non-fallback and fallback
-        let (non_fallback, fallback): (Vec<_>, Vec<_>) = authenticated_providers
-            .into_iter()
-            .partition(|(p, _)| !p.is_fallback());
+        let candidates = prefer_non_fallback(authenticated_providers, |(provider, _)| {
+            provider.is_fallback()
+        });
+        let candidates = keep_highest_priority(candidates, |(provider, _)| provider.priority());
 
-        // Prefer non-fallback providers; only use fallback if no non-fallback providers authenticated
-        let candidates = if non_fallback.is_empty() {
-            fallback
-        } else {
-            non_fallback
-        };
-
-        // Select one provider based on weight
-        match candidates.len() {
-            0 => Err(provider::AuthenticationError),
-            1 => Ok(candidates.into_iter().next().unwrap()),
-            _ => {
-                let dist = WeightedIndex::new(candidates.iter().map(|(p, _)| p.weight()))
-                    .expect("Failed to create WeightedIndex: invalid weights detected");
-                let selected_idx = rng().sample(&dist);
-                Ok(candidates.into_iter().nth(selected_idx).unwrap())
-            }
-        }
+        select_weighted(candidates, |(provider, _)| provider.weight())
+            .ok_or(provider::AuthenticationError)
     }
 
     /// Check if any provider (ignoring health status) can authenticate with the given key.
@@ -493,6 +514,9 @@ struct ProviderConfig<'a> {
     port: Option<u16>,
     tls: Option<bool>,
     weight: Option<f64>,
+    /// Higher numbers are preferred first. Defaults to 0.
+    #[serde(default)]
+    priority: i32,
     #[serde(skip_serializing)]
     #[serde(borrow)]
     api_key: Option<APIKeys<'a>>,
@@ -827,6 +851,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-test"),
                 Arc::clone(&auth_keys),
                 None,
@@ -841,6 +866,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-fallback"),
                 Arc::clone(&auth_keys),
                 None,
@@ -890,6 +916,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-fallback1"),
                 Arc::clone(&auth_keys),
                 None,
@@ -904,6 +931,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-fallback2"),
                 Arc::clone(&auth_keys),
                 None,
@@ -947,6 +975,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-test"),
                 Arc::clone(&auth_keys),
                 None,
@@ -961,6 +990,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-fallback"),
                 Arc::clone(&auth_keys),
                 None,
@@ -998,6 +1028,182 @@ mod tests {
     }
 
     #[test]
+    fn test_select_provider_prefers_higher_priority() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "low-priority.openai.com",
+                None,
+                true,
+                1.0,
+                1,
+                Some("sk-low"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "high-priority.openai.com",
+                None,
+                true,
+                1.0,
+                10,
+                Some("sk-high"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
+            http_max_header_size: 4096,
+            enable_health_check: false,
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
+        };
+
+        for _ in 0..50 {
+            let selected = program
+                .select_provider("api.openai.com", "/v1/chat")
+                .unwrap();
+            assert_eq!(selected.endpoint(), "high-priority.openai.com");
+        }
+    }
+
+    #[test]
+    fn test_select_provider_falls_back_to_lower_priority_when_higher_unhealthy() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "high-priority.openai.com",
+                None,
+                true,
+                1.0,
+                10,
+                Some("sk-high"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "low-priority.openai.com",
+                None,
+                true,
+                1.0,
+                1,
+                Some("sk-low"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        providers[0].set_healthy(false);
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
+            http_max_header_size: 4096,
+            enable_health_check: false,
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
+        };
+
+        let selected = program
+            .select_provider("api.openai.com", "/v1/chat")
+            .unwrap();
+        assert_eq!(selected.endpoint(), "low-priority.openai.com");
+    }
+
+    #[test]
+    fn test_select_provider_preserves_fallback_precedence_across_priorities() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "high-priority-fallback.openai.com",
+                None,
+                true,
+                1.0,
+                10,
+                Some("sk-high-fallback"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "low-priority-primary.openai.com",
+                None,
+                true,
+                1.0,
+                1,
+                Some("sk-low-primary"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
+            http_max_header_size: 4096,
+            enable_health_check: false,
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
+        };
+
+        let selected = program
+            .select_provider("api.openai.com", "/v1/chat")
+            .unwrap();
+        assert_eq!(selected.endpoint(), "low-priority-primary.openai.com");
+        assert!(!selected.is_fallback());
+    }
+
+    #[test]
     fn test_select_provider_with_auth_selects_authenticated_provider() {
         let auth_keys = Arc::new(vec!["valid-key".to_string()]);
         let providers: Vec<Box<dyn provider::Provider>> = vec![
@@ -1008,6 +1214,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-test1"),
                 Arc::clone(&auth_keys),
                 Some(vec!["key-for-provider1".to_string()]),
@@ -1022,6 +1229,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-test2"),
                 Arc::clone(&auth_keys),
                 Some(vec!["key-for-provider2".to_string()]),
@@ -1086,6 +1294,128 @@ mod tests {
     }
 
     #[test]
+    fn test_select_provider_with_auth_prefers_higher_priority() {
+        let auth_keys = Arc::new(vec!["valid-key".to_string()]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "low-priority.openai.com",
+                None,
+                true,
+                1.0,
+                1,
+                Some("sk-low"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "high-priority.openai.com",
+                None,
+                true,
+                1.0,
+                10,
+                Some("sk-high"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
+            http_max_header_size: 4096,
+            enable_health_check: false,
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
+        };
+
+        let auth_header = b"Authorization: Bearer valid-key";
+        for _ in 0..50 {
+            let (provider, _) = program
+                .select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+                    provider.authenticate_with_type(Some(auth_header))
+                })
+                .unwrap();
+            assert_eq!(provider.endpoint(), "high-priority.openai.com");
+        }
+    }
+
+    #[test]
+    fn test_select_provider_with_auth_uses_lower_priority_when_higher_cannot_authenticate() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "high-priority.openai.com",
+                None,
+                true,
+                1.0,
+                10,
+                Some("sk-high"),
+                Arc::clone(&auth_keys),
+                Some(vec!["key-for-high".to_string()]),
+                None,
+                false,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "low-priority.openai.com",
+                None,
+                true,
+                1.0,
+                1,
+                Some("sk-low"),
+                Arc::clone(&auth_keys),
+                Some(vec!["key-for-low".to_string()]),
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
+            http_max_header_size: 4096,
+            enable_health_check: false,
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
+        };
+
+        let auth_header = b"Authorization: Bearer key-for-low";
+        let (provider, _) = program
+            .select_provider_with_auth("api.openai.com", "/v1/chat", |provider| {
+                provider.authenticate_with_type(Some(auth_header))
+            })
+            .unwrap();
+        assert_eq!(provider.endpoint(), "low-priority.openai.com");
+    }
+
+    #[test]
     fn test_select_provider_with_auth_tries_fallback_after_non_fallback() {
         let auth_keys = Arc::new(vec![]);
         let providers: Vec<Box<dyn provider::Provider>> = vec![
@@ -1096,6 +1426,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-primary"),
                 Arc::clone(&auth_keys),
                 Some(vec!["key-for-primary".to_string()]),
@@ -1110,6 +1441,7 @@ mod tests {
                 None,
                 true,
                 1.0,
+                0,
                 Some("sk-fallback"),
                 Arc::clone(&auth_keys),
                 Some(vec!["key-for-fallback".to_string()]),
@@ -1167,6 +1499,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             Arc::clone(&auth_keys),
             None,
@@ -1209,6 +1542,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             Arc::clone(&auth_keys),
             None, // No provider auth keys
@@ -1356,6 +1690,26 @@ providers:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let program = Program::from_config(config).unwrap();
         assert_eq!(program.http_max_header_size, 1048576);
+    }
+
+    #[test]
+    fn test_provider_priority_parsing() {
+        let yaml = r#"
+http_port: 8080
+providers:
+  - type: openai
+    host: api.openai.com
+    endpoint: api.openai.com
+    api_key: sk-test
+    priority: 10
+  - type: openai
+    host: api.openai.com
+    endpoint: backup.openai.com
+    api_key: sk-backup
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.providers[0].priority, 10);
+        assert_eq!(config.providers[1].priority, 0);
     }
 
     #[test]

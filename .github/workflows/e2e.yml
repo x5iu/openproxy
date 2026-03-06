@@ -189,6 +189,7 @@ jobs:
               endpoint: localhost
               port: 9002
               tls: false
+              priority: 10
               api_key: sk-api-key-1
               auth_keys:
                 - sk-auth-key-1
@@ -197,6 +198,7 @@ jobs:
               endpoint: localhost
               port: 9003
               tls: false
+              priority: 1
               api_key: sk-api-key-2
               auth_keys:
                 - sk-auth-key-2
@@ -205,6 +207,7 @@ jobs:
               endpoint: localhost
               port: 9004
               tls: false
+              priority: 100
               api_key: sk-api-key-fallback
               auth_keys:
                 - sk-auth-key-fallback
@@ -214,6 +217,7 @@ jobs:
               endpoint: localhost
               port: 9002
               tls: false
+              priority: 10
               api_key: sk-api-key-1
               auth_keys:
                 - sk-auth-key-1
@@ -222,6 +226,7 @@ jobs:
               endpoint: localhost
               port: 9003
               tls: false
+              priority: 1
               api_key: sk-api-key-2
               auth_keys:
                 - sk-auth-key-2
@@ -230,6 +235,7 @@ jobs:
               endpoint: localhost
               port: 9004
               tls: false
+              priority: 100
               api_key: sk-api-key-fallback
               auth_keys:
                 - sk-auth-key-fallback
@@ -751,6 +757,18 @@ jobs:
           cd e2e
           python test_auth_selection.py
           echo "Auth selection E2E tests passed!"
+
+      - name: Run Provider Priority E2E tests
+        env:
+          PROXY_HTTPS_PORT: 8443
+          PROXY_HTTP_PORT: 8080
+          SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
+          AUTH_KEY: ${{ env.AUTH_KEY }}
+        run: |
+          echo "Testing provider priority selection..."
+          cd e2e
+          python test_provider_priority.py
+          echo "Provider priority E2E tests passed!"
 
       - name: Run Health Check Auth E2E tests
         env:

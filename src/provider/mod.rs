@@ -29,6 +29,7 @@ pub fn new_provider(
     port: Option<u16>,
     tls: bool,
     weight: f64,
+    priority: i32,
     api_key: Option<&str>,
     auth_keys: Arc<Vec<String>>,
     provider_auth_keys: Option<Vec<String>>,
@@ -42,6 +43,7 @@ pub fn new_provider(
             port,
             tls,
             weight,
+            priority,
             api_key,
             auth_keys,
             provider_auth_keys,
@@ -54,6 +56,7 @@ pub fn new_provider(
             port,
             tls,
             weight,
+            priority,
             api_key,
             auth_keys,
             provider_auth_keys,
@@ -66,6 +69,7 @@ pub fn new_provider(
             port,
             tls,
             weight,
+            priority,
             api_key,
             auth_keys,
             provider_auth_keys,
@@ -78,6 +82,7 @@ pub fn new_provider(
             port,
             tls,
             weight,
+            priority,
             health_check_config,
             is_fallback,
         )?)),
@@ -118,6 +123,7 @@ pub trait Provider: Send + Sync {
     fn authenticate(&self, auth: Option<&[u8]>) -> Result<(), AuthenticationError>;
     fn authenticate_key(&self, key: &str) -> Result<(), AuthenticationError>;
     fn weight(&self) -> f64;
+    fn priority(&self) -> i32;
     fn is_fallback(&self) -> bool;
 
     /// Returns the path prefix that should be stripped from requests, if any.
@@ -251,6 +257,7 @@ pub struct OpenAIProvider {
     endpoint: Arc<str>,
     tls: bool,
     weight: f64,
+    priority: i32,
     host_header: String,
     auth_header: Option<String>,
     dynamic_api_key_command: Option<String>,
@@ -271,6 +278,7 @@ impl OpenAIProvider {
         port: Option<u16>,
         tls: bool,
         weight: f64,
+        priority: i32,
         api_key: Option<&str>,
         auth_keys: Arc<Vec<String>>,
         provider_auth_keys: Option<Vec<String>>,
@@ -306,6 +314,7 @@ impl OpenAIProvider {
             endpoint,
             tls,
             weight,
+            priority,
             host_header,
             auth_header,
             dynamic_api_key_command,
@@ -367,6 +376,10 @@ impl Provider for OpenAIProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
     }
 
     fn is_fallback(&self) -> bool {
@@ -481,6 +494,7 @@ pub struct GeminiProvider {
     endpoint: Arc<str>,
     tls: bool,
     weight: f64,
+    priority: i32,
     api_key: String,
     host_header: String,
     auth_header: String,
@@ -501,6 +515,7 @@ impl GeminiProvider {
         port: Option<u16>,
         tls: bool,
         weight: f64,
+        priority: i32,
         api_key: Option<&str>,
         auth_keys: Arc<Vec<String>>,
         provider_auth_keys: Option<Vec<String>>,
@@ -527,6 +542,7 @@ impl GeminiProvider {
             endpoint,
             tls,
             weight,
+            priority,
             api_key: api_key.to_string(),
             host_header,
             auth_header,
@@ -588,6 +604,10 @@ impl Provider for GeminiProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
     }
 
     fn is_fallback(&self) -> bool {
@@ -696,6 +716,7 @@ pub struct AnthropicProvider {
     endpoint: Arc<str>,
     tls: bool,
     weight: f64,
+    priority: i32,
     host_header: String,
     /// Static auth header (for x-api-key style authentication)
     auth_header: Option<String>,
@@ -750,6 +771,7 @@ impl AnthropicProvider {
         port: Option<u16>,
         tls: bool,
         weight: f64,
+        priority: i32,
         api_key: Option<&str>,
         auth_keys: Arc<Vec<String>>,
         provider_auth_keys: Option<Vec<String>>,
@@ -789,6 +811,7 @@ impl AnthropicProvider {
             endpoint,
             tls,
             weight,
+            priority,
             host_header,
             auth_header,
             oauth_command,
@@ -866,6 +889,10 @@ impl Provider for AnthropicProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
     }
 
     fn is_fallback(&self) -> bool {
@@ -1105,6 +1132,7 @@ pub struct ForwardProvider {
     endpoint: Arc<str>,
     tls: bool,
     weight: f64,
+    priority: i32,
     host_header: String,
     sock_address: String,
     server_name: rustls_pki_types::ServerName<'static>,
@@ -1121,6 +1149,7 @@ impl ForwardProvider {
         port: Option<u16>,
         tls: bool,
         weight: f64,
+        priority: i32,
         health_check_config: Option<HealthCheckConfig>,
         is_fallback: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -1139,6 +1168,7 @@ impl ForwardProvider {
             endpoint,
             tls,
             weight,
+            priority,
             host_header,
             sock_address,
             server_name,
@@ -1196,6 +1226,10 @@ impl Provider for ForwardProvider {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
     }
 
     fn is_fallback(&self) -> bool {
@@ -1351,6 +1385,7 @@ mod tests {
             None,
             true,
             1.0,
+            7,
             Some("sk-test-key"),
             auth_keys,
             None,
@@ -1364,6 +1399,7 @@ mod tests {
         assert_eq!(provider.endpoint(), "api.openai.com");
         assert_eq!(provider.api_key(), Some("sk-test-key"));
         assert_eq!(provider.weight(), 1.0);
+        assert_eq!(provider.priority(), 7);
         assert!(provider.tls());
         assert!(provider.is_healthy());
         assert_eq!(provider.sock_address(), "api.openai.com:443");
@@ -1385,6 +1421,7 @@ mod tests {
             Some(8080),
             false,
             2.0,
+            0,
             Some("sk-test"),
             auth_keys,
             None,
@@ -1407,6 +1444,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             auth_keys,
             None,
@@ -1443,6 +1481,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             auth_keys,
             None,
@@ -1467,6 +1506,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             auth_keys,
             provider_auth_keys,
@@ -1489,6 +1529,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None,
             auth_keys,
             None,
@@ -1518,6 +1559,7 @@ mod tests {
             None,
             true,
             1.5,
+            0,
             Some("gemini-api-key"),
             auth_keys,
             None,
@@ -1547,6 +1589,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None, // Missing API key
             auth_keys,
             None,
@@ -1566,6 +1609,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("gemini-api-key"),
             auth_keys,
             None,
@@ -1594,6 +1638,7 @@ mod tests {
             None,
             true,
             0.5,
+            0,
             Some("anthropic-api-key"),
             auth_keys,
             None,
@@ -1620,6 +1665,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None, // Missing API key
             auth_keys,
             None,
@@ -1639,6 +1685,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("anthropic-api-key"),
             auth_keys,
             None,
@@ -1667,6 +1714,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("anthropic-api-key"),
             auth_keys,
             None,
@@ -1697,6 +1745,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("anthropic-api-key"),
             auth_keys,
             None,
@@ -1727,6 +1776,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("anthropic-api-key"),
             auth_keys,
             None,
@@ -1750,6 +1800,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("upstream-api-key"),
             auth_keys,
             None,
@@ -1789,6 +1840,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(echo oauth-token)"),
             auth_keys,
             None,
@@ -1819,6 +1871,7 @@ mod tests {
             None,
             true,
             1.0,
+            9,
             Some("sk-test"),
             Arc::clone(&auth_keys),
             None,
@@ -1827,6 +1880,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(openai.kind(), Type::OpenAI));
+        assert_eq!(openai.priority(), 9);
 
         // Test Gemini
         let gemini = new_provider(
@@ -1836,6 +1890,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("gemini-key"),
             Arc::clone(&auth_keys),
             None,
@@ -1853,6 +1908,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("anthropic-key"),
             Arc::clone(&auth_keys),
             None,
@@ -1870,6 +1926,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("key"),
             Arc::clone(&auth_keys),
             None,
@@ -1890,6 +1947,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("key"),
             Arc::clone(&auth_keys),
             None,
@@ -1906,6 +1964,7 @@ mod tests {
             None,
             false,
             1.0,
+            0,
             Some("key"),
             Arc::clone(&auth_keys),
             None,
@@ -1922,6 +1981,7 @@ mod tests {
             Some(8443),
             true,
             1.0,
+            0,
             Some("key"),
             Arc::clone(&auth_keys),
             None,
@@ -1941,6 +2001,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None, // No API key
             auth_keys,
             None,
@@ -1962,6 +2023,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(echo dynamic-openai-key)"),
             auth_keys,
             None,
@@ -1998,6 +2060,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(exit 1)"),
             auth_keys,
             None,
@@ -2026,6 +2089,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("key"),
             auth_keys.clone(),
             None,
@@ -2049,6 +2113,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("key"),
             auth_keys,
             None,
@@ -2070,6 +2135,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("gemini-api-key"),
             auth_keys,
             None,
@@ -2106,6 +2172,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             auth_keys,
             None,
@@ -2130,6 +2197,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-test"),
             auth_keys,
             None,
@@ -2149,6 +2217,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("key"),
             Arc::new(vec!["valid-key".to_string()]),
             None,
@@ -2213,6 +2282,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(echo oauth-token-123)"),
             auth_keys,
             None,
@@ -2243,6 +2313,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-ant-api-key-123"),
             auth_keys,
             None,
@@ -2272,6 +2343,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(echo token)"),
             auth_keys,
             None,
@@ -2328,6 +2400,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("sk-ant-api-key-123"),
             auth_keys,
             None,
@@ -2359,6 +2432,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(nonexistent_command_that_will_fail_12345)"),
             auth_keys,
             None,
@@ -2386,6 +2460,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(printf '')"),
             auth_keys,
             None,
@@ -2414,6 +2489,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             Some("$(exit 1)"),
             auth_keys,
             None,
@@ -2440,6 +2516,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None,
             false,
         )
@@ -2468,6 +2545,7 @@ mod tests {
             Some(8080),
             false,
             2.0,
+            0,
             None,
             false,
         )
@@ -2487,6 +2565,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None,
             false,
         )
@@ -2511,6 +2590,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None,
             false,
         )
@@ -2539,6 +2619,7 @@ mod tests {
             None,
             true,
             1.0,
+            0,
             None,
             Arc::clone(&auth_keys),
             None,
@@ -2633,6 +2714,7 @@ mod tests {
             Some(8080),
             false,
             1.0,
+            0,
             Some(health_cfg),
             false,
         )
