@@ -1087,6 +1087,77 @@ mod tests {
     }
 
     #[test]
+    fn test_select_provider_same_priority_still_uses_weight() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn provider::Provider>> = vec![
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "heavy-weight.openai.com",
+                None,
+                true,
+                9.0,
+                10,
+                Some("sk-heavy"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            provider::new_provider(
+                "openai",
+                "api.openai.com",
+                "light-weight.openai.com",
+                None,
+                true,
+                1.0,
+                10,
+                Some("sk-light"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let program = Program {
+            tls_server_config: None,
+            https_port: None,
+            http_port: Some(8080),
+            https_bind_address: "0.0.0.0".to_string(),
+            http_bind_address: "0.0.0.0".to_string(),
+            http_max_header_size: 4096,
+            enable_health_check: false,
+            health_check_interval: 0,
+            graceful_shutdown_timeout: 5,
+            connect_tunnel_enabled: false,
+            shutdown_tx: tokio::sync::broadcast::channel(1).0,
+            providers: Arc::new(providers),
+        };
+
+        let mut heavy_count = 0;
+        let mut light_count = 0;
+        for _ in 0..2000 {
+            match program
+                .select_provider("api.openai.com", "/v1/chat")
+                .unwrap()
+                .endpoint()
+            {
+                "heavy-weight.openai.com" => heavy_count += 1,
+                "light-weight.openai.com" => light_count += 1,
+                endpoint => panic!("unexpected endpoint selected: {endpoint}"),
+            }
+        }
+
+        assert!(
+            heavy_count > light_count * 5,
+            "Expected heavy-weight provider to dominate selection, got heavy={heavy_count}, light={light_count}"
+        );
+    }
+
+    #[test]
     fn test_select_provider_falls_back_to_lower_priority_when_higher_unhealthy() {
         let auth_keys = Arc::new(vec![]);
         let providers: Vec<Box<dyn provider::Provider>> = vec![
