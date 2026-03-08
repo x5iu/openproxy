@@ -1074,9 +1074,7 @@ impl Provider for AnthropicProvider {
         existing_value: Option<&str>,
     ) -> Option<String> {
         // Only transform headers when using OAuth
-        if self.oauth_command.is_none() {
-            return None;
-        }
+        self.oauth_command.as_ref()?;
 
         if header_key == http::HEADER_ANTHROPIC_BETA {
             const OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
@@ -1085,7 +1083,7 @@ impl Provider for AnthropicProvider {
                 Some(existing) => {
                     // Check if oauth-2025-04-20 is already in the existing header
                     let values: Vec<&str> = existing.split(',').map(|s| s.trim()).collect();
-                    if values.iter().any(|v| *v == OAUTH_BETA_VALUE) {
+                    if values.contains(&OAUTH_BETA_VALUE) {
                         // Already contains the value, keep as is
                         Some(format!("{}{}\r\n", header_key, existing))
                     } else {
@@ -1397,6 +1395,7 @@ fn replace_path<'a>(prefix: &str, block_str: &'a str) -> Cow<'a, str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -2853,6 +2852,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn health_check(
     stream: &mut dyn AsyncReadWrite,
     endpoint: &[u8],

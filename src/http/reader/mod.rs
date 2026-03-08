@@ -514,7 +514,7 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "inner failure")))
+            Poll::Ready(Err(io::Error::other("inner failure")))
         }
     }
 
@@ -652,7 +652,7 @@ mod tests {
         }
         let n = rb.filled().len();
         assert!(n > 0);
-        let mut enc = Vec::from(&rb.filled()[..]);
+        let mut enc = Vec::from(rb.filled());
         let mut tmp = [0u8; 256];
         loop {
             let m = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();
@@ -686,7 +686,7 @@ mod tests {
             Poll::Ready(Ok(())) => {}
             _ => panic!("expected Ready after pendings"),
         }
-        let mut enc = Vec::from(&rb.filled()[..]);
+        let mut enc = Vec::from(rb.filled());
         let mut tmp = [0u8; 256];
         loop {
             let m = AsyncReadExt::read(&mut w, &mut tmp).await.unwrap();

@@ -34,11 +34,7 @@ fn keep_highest_priority<T, F>(candidates: Vec<T>, priority_of: F) -> Vec<T>
 where
     F: Fn(&T) -> i32,
 {
-    let Some(highest_priority) = candidates
-        .iter()
-        .map(|candidate| priority_of(candidate))
-        .max()
-    else {
+    let Some(highest_priority) = candidates.iter().map(&priority_of).max() else {
         return candidates;
     };
 
@@ -73,7 +69,7 @@ where
         0 => None,
         1 => candidates.pop(),
         _ => {
-            let dist = WeightedIndex::new(candidates.iter().map(|candidate| weight_of(candidate)))
+            let dist = WeightedIndex::new(candidates.iter().map(weight_of))
                 .expect("Failed to create WeightedIndex: invalid weights detected");
             let selected_idx = rng().sample(&dist);
             Some(candidates.swap_remove(selected_idx))
@@ -271,7 +267,7 @@ impl Program {
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
             http_max_header_size: config
                 .http_max_header_size
-                .map(|size| size.max(1024).min(1024 * 1024))
+                .map(|size| size.clamp(1024, 1024 * 1024))
                 .unwrap_or(4096),
             enable_health_check,
             health_check_interval,
@@ -811,7 +807,7 @@ mod tests {
     #[test]
     fn test_error_display() {
         // Test all error variants have proper Display impl
-        let io_err = Error::IO(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let io_err = Error::IO(std::io::Error::other("test"));
         assert!(io_err.to_string().contains("IO error"));
 
         let header_err = Error::HeaderTooLarge;

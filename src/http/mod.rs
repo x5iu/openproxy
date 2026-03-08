@@ -1368,7 +1368,7 @@ mod tests {
         assert_eq!(result[0], 0..100);
 
         // Test with one filtered header (Host)
-        let filtered = vec![20..40];
+        let filtered: Vec<Range<usize>> = std::iter::once(20..40).collect();
         let result = split_header_chunks(filtered, 100);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], 0..20);
@@ -1498,7 +1498,7 @@ mod tests {
     fn test_read_state_copy_clone() {
         let state = ReadState::Start;
         let state_copy = state;
-        let state_clone = state.clone();
+        let state_clone = state;
 
         // Both should be the same variant
         assert!(matches!(state_copy, ReadState::Start));
@@ -1758,7 +1758,7 @@ fn split_header_chunks(
     header_length: usize,
 ) -> Vec<Range<usize>> {
     if filtered_headers.is_empty() {
-        return vec![0..header_length];
+        return std::iter::once(0..header_length).collect();
     }
 
     // Sort by start position
