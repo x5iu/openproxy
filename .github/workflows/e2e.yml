@@ -717,6 +717,24 @@ jobs:
           python test_no_auth_keys_filtering.py
           echo "No-auth-keys filtering E2E tests passed!"
 
+      - name: Run strict HTTP parsing E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing strict HTTP request parsing..."
+          cd e2e
+          python test_strict_http_parsing.py
+          echo "Strict HTTP parsing E2E tests passed!"
+
+      - name: Run Proxy-Authorization filtering E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing Proxy-Authorization filtering across protocols..."
+          cd e2e
+          python test_proxy_authorization_filtering.py
+          echo "Proxy-Authorization filtering E2E tests passed!"
+
       - name: Start echo servers for auth selection test
         run: |
           # Start echo servers that return their server_id

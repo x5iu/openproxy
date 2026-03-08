@@ -2,8 +2,11 @@ use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -19,6 +22,83 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     // Length check is not constant-time, but this is acceptable since
     // API key lengths are typically public knowledge (e.g., OpenAI keys are always 51 chars)
     a_bytes.len() == b_bytes.len() && bool::from(a_bytes.ct_eq(b_bytes))
+}
+
+const OAUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[inline]
+fn log_auth_header_debug(provider: &'static str, header_len: usize, auth_header: bool) {
+    #[cfg(debug_assertions)]
+    log::info!(
+        provider = provider,
+        header_len = header_len,
+        auth_header = auth_header;
+        "authentication"
+    );
+}
+
+fn sanitize_header_value(
+    value: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err("OAuth command output contains invalid header characters".into());
+    }
+    Ok(value)
+}
+
+fn execute_oauth_command_with_timeout(
+    command: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("OAuth command timed out after {:?}", timeout).into());
+            }
+        }
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        pipe.read_to_end(&mut stdout)?;
+    }
+
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        pipe.read_to_end(&mut stderr)?;
+    }
+
+    if !status.success() {
+        let stderr_empty = stderr.is_empty();
+        return Err(format!(
+            "OAuth command failed with status {}{}",
+            status,
+            if stderr_empty {
+                ""
+            } else {
+                " (stderr omitted)"
+            }
+        )
+        .into());
+    }
+
+    let token = String::from_utf8(stdout)?;
+    sanitize_header_value(token.trim().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -395,11 +475,15 @@ impl Provider for OpenAIProvider {
         };
         let Ok(header_str) = std::str::from_utf8(header) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "openai", header:serde = header.to_vec(); "invalid_authentication_header");
+            log::error!(provider = "openai", header_len = header.len(); "invalid_authentication_header");
             return Err(AuthenticationError);
         };
-        #[cfg(debug_assertions)]
-        log::info!(provider = "openai", header = header_str; "authentication");
+        log_auth_header_debug(
+            "openai",
+            header.len(),
+            http::is_header(header_str, http::HEADER_AUTHORIZATION)
+                || http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION),
+        );
         // Accept both Authorization and Proxy-Authorization headers
         // Proxy-Authorization is commonly used by HTTP proxy clients (e.g., CONNECT tunnel)
         if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
@@ -623,11 +707,15 @@ impl Provider for GeminiProvider {
         };
         let Ok(mut key_str) = std::str::from_utf8(key) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "gemini", key:serde = key.to_vec(); "invalid_authentication_key");
+            log::error!(provider = "gemini", key_len = key.len(); "invalid_authentication_key");
             return Err(AuthenticationError);
         };
-        #[cfg(debug_assertions)]
-        log::info!(provider = "gemini", key = key_str; "authentication");
+        log_auth_header_debug(
+            "gemini",
+            key.len(),
+            http::is_header(key_str, http::HEADER_X_GOOG_API_KEY)
+                || http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION),
+        );
         if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
             key_str = &key_str[http::HEADER_X_GOOG_API_KEY.len()..];
         } else if http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION) {
@@ -749,18 +837,14 @@ fn extract_oauth_command(api_key: &str) -> Option<&str> {
 fn execute_oauth_command(
     command: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("OAuth command failed: {}", stderr).into());
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                execute_oauth_command_with_timeout(command, OAUTH_COMMAND_TIMEOUT)
+            })
+        }
+        _ => execute_oauth_command_with_timeout(command, OAUTH_COMMAND_TIMEOUT),
     }
-
-    let token = String::from_utf8(output.stdout)?;
-    Ok(token.trim().to_string())
 }
 
 impl AnthropicProvider {
@@ -908,11 +992,15 @@ impl Provider for AnthropicProvider {
         };
         let Ok(header_str) = std::str::from_utf8(header) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
+            log::error!(provider = "anthropic", header_len = header.len(); "invalid_authentication_header");
             return Err(AuthenticationError);
         };
-        #[cfg(debug_assertions)]
-        log::info!(provider = "anthropic", header = header_str; "authentication");
+        log_auth_header_debug(
+            "anthropic",
+            header.len(),
+            http::is_header(header_str, http::HEADER_X_API_KEY)
+                || http::is_header(header_str, http::HEADER_AUTHORIZATION),
+        );
 
         // Check X-API-Key header
         if http::is_header(header_str, http::HEADER_X_API_KEY) {
@@ -1034,7 +1122,7 @@ impl Provider for AnthropicProvider {
         };
         let Ok(header_str) = std::str::from_utf8(header) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
+            log::error!(provider = "anthropic", header_len = header.len(); "invalid_authentication_header");
             return Err(AuthenticationError);
         };
 
@@ -2271,6 +2359,22 @@ mod tests {
         // Test failing command
         let result = execute_oauth_command("exit 1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_oauth_command_rejects_header_injection() {
+        let result = execute_oauth_command("printf 'token\\r\\nextra'");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_oauth_command_timeout() {
+        let result = execute_oauth_command_with_timeout("sleep 1", Duration::from_millis(50));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("timed out"),
+            "expected timeout error"
+        );
     }
 
     #[test]

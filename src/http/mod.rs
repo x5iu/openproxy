@@ -54,20 +54,25 @@ impl<'a> Request<'a> {
     pub async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
-        let mut payload_blocks = Vec::new();
+        let mut payload_block_count = 0usize;
+        #[cfg(debug_assertions)]
+        let mut payload_bytes = 0usize;
         loop {
             let Some(block) = self.payload.next_block().await? else {
                 break;
             };
             if !block.is_empty() {
                 #[cfg(debug_assertions)]
-                payload_blocks.push(block.to_vec());
+                {
+                    payload_block_count += 1;
+                    payload_bytes += block.len();
+                }
                 writer.write_all(&block).await?;
             }
         }
         writer.flush().await?;
         #[cfg(debug_assertions)]
-        log::info!(payload:serde = payload_blocks; "http_request_blocks");
+        log::info!(blocks = payload_block_count, bytes = payload_bytes; "http_request_forwarded");
         Ok(())
     }
 
@@ -138,20 +143,25 @@ impl<'a> Response<'a> {
     pub async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
-        let mut payload_blocks = Vec::new();
+        let mut payload_block_count = 0usize;
+        #[cfg(debug_assertions)]
+        let mut payload_bytes = 0usize;
         loop {
             let Some(block) = self.payload.next_block().await? else {
                 break;
             };
             if !block.is_empty() {
                 #[cfg(debug_assertions)]
-                payload_blocks.push(block.to_vec());
+                {
+                    payload_block_count += 1;
+                    payload_bytes += block.len();
+                }
                 writer.write_all(&block).await?;
             }
         }
         writer.flush().await?;
         #[cfg(debug_assertions)]
-        log::info!(payload:serde = payload_blocks; "http_response_blocks");
+        log::info!(blocks = payload_block_count, bytes = payload_bytes; "http_response_forwarded");
         Ok(())
     }
 }
@@ -245,6 +255,7 @@ impl<'a> Payload<'a> {
         let mut header_lines = HeaderLines::new(&crlfs, header);
         let mut content_length: Option<usize> = None;
         let mut transfer_encoding_chunked = false;
+        let mut saw_transfer_encoding = false;
         let mut host_range: Option<Range<usize>> = None;
         let mut auth_range: Option<Range<usize>> = None;
         let mut filtered_headers: Vec<Range<usize>> = Vec::new();
@@ -264,14 +275,21 @@ impl<'a> Payload<'a> {
                 return Err(Error::InvalidHeader);
             };
             if is_header(header, HEADER_CONTENT_LENGTH) {
-                content_length = match header[HEADER_CONTENT_LENGTH.len()..].parse() {
+                if content_length.is_some() {
+                    return Err(Error::InvalidHeader);
+                }
+                content_length = match header[HEADER_CONTENT_LENGTH.len()..].trim().parse() {
                     Ok(length) => Some(length),
                     Err(_) => return Err(Error::InvalidHeader),
-                }
+                };
             } else if is_header(header, HEADER_TRANSFER_ENCODING) {
-                if header[HEADER_TRANSFER_ENCODING.len()..].contains(TRANSFER_ENCODING_CHUNKED) {
-                    transfer_encoding_chunked = true;
+                if saw_transfer_encoding {
+                    return Err(Error::InvalidHeader);
                 }
+                transfer_encoding_chunked =
+                    parse_transfer_encoding(header[HEADER_TRANSFER_ENCODING.len()..].trim())
+                        .map_err(|()| Error::InvalidHeader)?;
+                saw_transfer_encoding = true;
             } else if is_header(header, HEADER_HOST) {
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
@@ -965,6 +983,7 @@ pub(crate) fn get_req_path(header: &str) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn test_split_host_path() {
@@ -1282,6 +1301,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transfer_encoding() {
+        assert_eq!(parse_transfer_encoding("chunked"), Ok(true));
+        assert_eq!(parse_transfer_encoding("Chunked"), Ok(true));
+        assert_eq!(parse_transfer_encoding("CHUNKED"), Ok(true));
+
+        assert_eq!(parse_transfer_encoding("gzip"), Err(()));
+        assert_eq!(parse_transfer_encoding("gzip, chunked"), Err(()));
+        assert_eq!(parse_transfer_encoding("chunked, chunked"), Err(()));
+        assert_eq!(parse_transfer_encoding(""), Err(()));
+    }
+
+    #[test]
     fn test_find_crlfs() {
         // Test with single CRLF (no double CRLF to end headers)
         let buffer = b"Line1\r\nLine2";
@@ -1595,6 +1626,58 @@ mod tests {
         assert!(info.auth_header.is_none());
         assert!(info.extra_headers_transformed.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_request_rejects_duplicate_content_length() {
+        let request = b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_duplicate_transfer_encoding() {
+        let request =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_content_length_with_mixed_case_chunked() {
+        let request =
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: Chunked\r\n\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_accepts_mixed_case_chunked_transfer_encoding() {
+        let request =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let request = Request::new(&mut client, 4096).await.unwrap();
+        assert!(matches!(request.payload.body, Body::Unread(_)));
+    }
 }
 
 pub(crate) fn get_auth_query_range(header: &str, key: &str) -> Option<Range<usize>> {
@@ -1642,6 +1725,29 @@ pub(crate) fn is_header(header: &str, key: &str) -> bool {
     // str could cause `not a char boundary` issue, so we use bytes
     let (header, key) = (header.as_bytes(), key.as_bytes());
     header.len() >= key.len() && header[..key.len()].eq_ignore_ascii_case(key)
+}
+
+#[inline]
+fn parse_transfer_encoding(value: &str) -> Result<bool, ()> {
+    let mut is_chunked = false;
+
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(());
+        }
+
+        if part.eq_ignore_ascii_case(TRANSFER_ENCODING_CHUNKED) {
+            if is_chunked {
+                return Err(());
+            }
+            is_chunked = true;
+        } else {
+            return Err(());
+        }
+    }
+
+    Ok(is_chunked)
 }
 
 /// Split the header buffer into chunks, excluding the filtered header ranges.
