@@ -585,6 +585,12 @@ where
                         None
                     };
 
+                    let all_auth_header_keys = {
+                        let providers =
+                            p.get_matching_providers(authority.host(), request.uri().path());
+                        collect_auth_header_keys(&providers)
+                    };
+
                     // Use auth-during-selection: try to find a provider that authenticates successfully
                     // For HTTP/2, we need to extract auth info from headers and query params
                     let (provider, incoming_auth_type) = match p.select_provider_with_auth(
@@ -743,12 +749,7 @@ where
                         }
                     }
 
-                    // Collect all auth header keys to filter (lowercase, without ": ")
-                    let auth_header_keys: Vec<String> = provider
-                        .auth_header_keys()
-                        .iter()
-                        .map(|k| k.trim_end_matches([' ', ':']).to_lowercase())
-                        .collect();
+                    let auth_header_keys = all_auth_header_keys;
 
                     let info = UpstreamInfo {
                         endpoint: provider.endpoint().to_string(),
@@ -2152,6 +2153,17 @@ fn is_http2_invalid_headers(key: &str) -> bool {
         || key.eq_ignore_ascii_case("content-length")
 }
 
+fn collect_auth_header_keys(providers: &[&dyn Provider]) -> Vec<String> {
+    let mut auth_header_keys: Vec<String> = providers
+        .iter()
+        .flat_map(|provider| provider.auth_header_keys())
+        .map(|key| key.trim_end_matches([' ', ':']).to_lowercase())
+        .collect();
+    auth_header_keys.sort();
+    auth_header_keys.dedup();
+    auth_header_keys
+}
+
 /// Build upstream path by stripping prefix and replacing auth query param.
 fn build_upstream_path(
     path: &str,
@@ -2678,6 +2690,50 @@ mod tests {
 
         // Just colon
         assert_eq!(parse_auth_header(":"), Some(("", "")));
+    }
+
+    #[test]
+    fn test_collect_auth_header_keys_deduplicates_all_matching_providers() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn Provider>> = vec![
+            crate::provider::new_provider(
+                "openai",
+                "shared.example.com",
+                "api.openai.com",
+                None,
+                true,
+                1.0,
+                0,
+                Some("sk-test"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            crate::provider::new_provider(
+                "anthropic",
+                "shared.example.com",
+                "api.anthropic.com",
+                None,
+                true,
+                1.0,
+                0,
+                Some("ant-test"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+        let provider_refs: Vec<&dyn Provider> =
+            providers.iter().map(|provider| &**provider).collect();
+        let auth_keys = collect_auth_header_keys(&provider_refs);
+        assert_eq!(
+            auth_keys,
+            vec!["authorization".to_string(), "x-api-key".to_string(),]
+        );
     }
 
     #[test]

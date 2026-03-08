@@ -281,7 +281,7 @@ def test_websocket_filters_proxy_authorization() -> None:
         f"GET /v1/realtime HTTP/1.1\r\n"
         f"Host: {WS_HOST}\r\n"
         f"Authorization: Bearer {AUTH_KEY}\r\n"
-        f"Proxy-Authorization: {PROXY_AUTH_VALUE}\r\n"
+        f"Proxy-Authorization:{PROXY_AUTH_VALUE}\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {sec_websocket_key}\r\n"

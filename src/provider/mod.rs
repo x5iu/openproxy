@@ -486,10 +486,11 @@ impl Provider for OpenAIProvider {
         );
         // Accept both Authorization and Proxy-Authorization headers
         // Proxy-Authorization is commonly used by HTTP proxy clients (e.g., CONNECT tunnel)
-        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            self.authenticate_key(&header_str[http::HEADER_AUTHORIZATION.len()..])
-        } else if http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION) {
-            self.authenticate_key(&header_str[http::HEADER_PROXY_AUTHORIZATION.len()..])
+        if let Some(value) = http::header_value(header_str, http::HEADER_AUTHORIZATION) {
+            self.authenticate_key(value)
+        } else if let Some(value) = http::header_value(header_str, http::HEADER_PROXY_AUTHORIZATION)
+        {
+            self.authenticate_key(value)
         } else {
             Err(AuthenticationError)
         }
@@ -716,11 +717,11 @@ impl Provider for GeminiProvider {
             http::is_header(key_str, http::HEADER_X_GOOG_API_KEY)
                 || http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION),
         );
-        if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
-            key_str = &key_str[http::HEADER_X_GOOG_API_KEY.len()..];
-        } else if http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION) {
+        if let Some(value) = http::header_value(key_str, http::HEADER_X_GOOG_API_KEY) {
+            key_str = value;
+        } else if let Some(value) = http::header_value(key_str, http::HEADER_PROXY_AUTHORIZATION) {
             // Support Proxy-Authorization for HTTP proxy clients (e.g., CONNECT tunnel)
-            let value = key_str[http::HEADER_PROXY_AUTHORIZATION.len()..].trim();
+            let value = value.trim();
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 key_str = value[7..].trim();
             } else {
@@ -1003,13 +1004,13 @@ impl Provider for AnthropicProvider {
         );
 
         // Check X-API-Key header
-        if http::is_header(header_str, http::HEADER_X_API_KEY) {
-            return self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..]);
+        if let Some(value) = http::header_value(header_str, http::HEADER_X_API_KEY) {
+            return self.authenticate_key(value);
         }
 
         // Check Authorization: Bearer header (case-insensitive prefix matching for "Bearer ")
-        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
+        if let Some(value) = http::header_value(header_str, http::HEADER_AUTHORIZATION) {
+            let value = value.trim();
             // RFC 7235 specifies that auth-scheme is case-insensitive
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
@@ -1089,7 +1090,7 @@ impl Provider for AnthropicProvider {
                     } else {
                         // Append the oauth beta value to existing header
                         Some(format!(
-                            "{}{},{}\r\n",
+                            "{}{}, {}\r\n",
                             header_key, existing, OAUTH_BETA_VALUE
                         ))
                     }
@@ -1125,14 +1126,14 @@ impl Provider for AnthropicProvider {
         };
 
         // Check X-API-Key
-        if http::is_header(header_str, http::HEADER_X_API_KEY) {
-            self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..])?;
+        if let Some(value) = http::header_value(header_str, http::HEADER_X_API_KEY) {
+            self.authenticate_key(value)?;
             return Ok(Some("x-api-key"));
         }
 
         // Check Authorization: Bearer (case-insensitive prefix matching for "Bearer ")
-        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
+        if let Some(value) = http::header_value(header_str, http::HEADER_AUTHORIZATION) {
+            let value = value.trim();
             // RFC 7235 specifies that auth-scheme is case-insensitive
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
@@ -1142,8 +1143,8 @@ impl Provider for AnthropicProvider {
         }
 
         // Check Proxy-Authorization: Bearer (for HTTP proxy clients like CONNECT tunnel)
-        if http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION) {
-            let value = header_str[http::HEADER_PROXY_AUTHORIZATION.len()..].trim();
+        if let Some(value) = http::header_value(header_str, http::HEADER_PROXY_AUTHORIZATION) {
+            let value = value.trim();
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
                 self.authenticate_key(token)?;
@@ -1543,6 +1544,10 @@ mod tests {
         // Test valid authentication
         let valid_header = "Authorization: Bearer valid-key";
         assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+        let compact_header = "Authorization:Bearer valid-key";
+        assert!(provider
+            .authenticate(Some(compact_header.as_bytes()))
+            .is_ok());
 
         // Test invalid authentication
         let invalid_header = "Authorization: Bearer invalid-key";
@@ -1784,6 +1789,10 @@ mod tests {
         // Test with X-API-Key header
         let valid_header = "X-API-Key: client-key";
         assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+        let compact_header = "X-API-Key:client-key";
+        assert!(provider
+            .authenticate(Some(compact_header.as_bytes()))
+            .is_ok());
 
         // Test invalid header key (now Authorization Bearer is also valid)
         let bearer_header = "Authorization: Bearer client-key";
@@ -1816,6 +1825,11 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some("x-api-key"));
 
+        let compact_header = "X-API-Key:valid-key";
+        let result = provider.authenticate_with_type(Some(compact_header.as_bytes()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("x-api-key"));
+
         // Test with invalid key
         let invalid_header = "X-API-Key: invalid-key";
         assert!(provider
@@ -1844,6 +1858,11 @@ mod tests {
         // Test with Authorization: Bearer header
         let header = "Authorization: Bearer valid-key";
         let result = provider.authenticate_with_type(Some(header.as_bytes()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("bearer"));
+
+        let compact_proxy_header = "Proxy-Authorization:	Bearer valid-key";
+        let result = provider.authenticate_with_type(Some(compact_proxy_header.as_bytes()));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some("bearer"));
 
@@ -2472,7 +2491,7 @@ mod tests {
             .transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
         assert_eq!(
             result,
-            Some("anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n".to_string())
+            Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string())
         );
 
         // With existing anthropic-beta header (already contains oauth value)
@@ -2491,6 +2510,19 @@ mod tests {
         assert_eq!(
             result,
             Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string())
+        );
+
+        // With existing duplicate anthropic-beta values collapsed by parser
+        let result = provider.transform_extra_header(
+            http::HEADER_ANTHROPIC_BETA,
+            Some("streaming-2024-01-01, tools-2024-04-04"),
+        );
+        assert_eq!(
+            result,
+            Some(
+                "anthropic-beta: streaming-2024-01-01, tools-2024-04-04, oauth-2025-04-20\r\n"
+                    .to_string()
+            )
         );
     }
 

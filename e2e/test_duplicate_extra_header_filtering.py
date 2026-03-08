@@ -1,13 +1,12 @@
 """
-E2E tests for strict HTTP/1.1 request parsing.
+E2E test for filtering duplicate extra headers that are transformed upstream.
 
-These tests verify that malformed framing headers are rejected with 400 before
-the request reaches the upstream server:
-1. Duplicate Content-Length
-2. Duplicate Transfer-Encoding
-3. Content-Length combined with mixed-case Transfer-Encoding: Chunked
+This verifies that when a client sends multiple anthropic-beta headers to an
+Anthropic OAuth provider over HTTP/1.1, the proxy strips all client copies and
+forwards a single transformed anthropic-beta header upstream.
 """
 
+import json
 import os
 import socket
 import subprocess
@@ -19,27 +18,29 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 
-PROXY_HTTP_PORT = 28081
-UPSTREAM_PORT = 29009
-TEST_HOST = f"strict-http.local:{PROXY_HTTP_PORT}"
+PROXY_HTTP_PORT = 28084
+UPSTREAM_PORT = 29013
+TEST_HOST = f"duplicate-extra.local:{PROXY_HTTP_PORT}"
+AUTH_KEY = "duplicate-extra-auth"
 
 
-class CountingHandler(BaseHTTPRequestHandler):
+class EchoHeadersHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    request_count = 0
 
     def do_GET(self):
-        type(self).request_count += 1
-        body = b"ok"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        headers_multi = {}
+        for key in self.headers.keys():
+            lower = key.lower()
+            headers_multi.setdefault(lower, []).extend(self.headers.get_all(key) or [])
 
-    def do_POST(self):
-        type(self).request_count += 1
-        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        body = json.dumps(
+            {
+                "headers": headers_multi,
+                "path": self.path,
+            }
+        ).encode("utf-8")
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -73,27 +74,30 @@ def wait_for_port(port: int, timeout: float = 10.0) -> None:
     raise TimeoutError(f"Timed out waiting for port {port}")
 
 
-def start_upstream_server() -> tuple[HTTPServer, threading.Thread]:
-    server = HTTPServer(("127.0.0.1", UPSTREAM_PORT), CountingHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    wait_for_port(UPSTREAM_PORT)
-    return server, thread
-
-
 def create_config(config_path: str) -> None:
     config = f"""
 http_port: {PROXY_HTTP_PORT}
+auth_keys:
+  - {AUTH_KEY}
 
 providers:
-  - type: openai
+  - type: anthropic
     host: {TEST_HOST}
     endpoint: localhost
     port: {UPSTREAM_PORT}
     tls: false
+    api_key: '$(printf oauth-token)'
 """
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(config)
+
+
+def start_upstream_server() -> tuple[HTTPServer, threading.Thread]:
+    server = HTTPServer(("127.0.0.1", UPSTREAM_PORT), EchoHeadersHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    wait_for_port(UPSTREAM_PORT)
+    return server, thread
 
 
 def start_openproxy(config_file: str, log_file: str):
@@ -121,21 +125,7 @@ def send_raw_request(request: bytes) -> str:
             if not chunk:
                 break
             response += chunk
-            if b"\r\n\r\n" in response:
-                break
     return response.decode("utf-8", errors="replace")
-
-
-def assert_bad_request(name: str, request: bytes) -> None:
-    before = CountingHandler.request_count
-    response = send_raw_request(request)
-    print(f"\n{name}")
-    print(response)
-    assert "400 Bad Request" in response, f"{name}: expected 400, got {response!r}"
-    time.sleep(0.2)
-    assert CountingHandler.request_count == before, (
-        f"{name}: upstream should not receive the request"
-    )
 
 
 def main() -> None:
@@ -148,55 +138,31 @@ def main() -> None:
         proxy, log_handle = start_openproxy(config_file, log_file)
 
         try:
-            assert_bad_request(
-                "Duplicate Content-Length should be rejected",
+            print("\nTesting duplicate transformed extra header filtering")
+            response = send_raw_request(
                 (
-                    f"POST /v1/test HTTP/1.1\r\n"
+                    f"GET /v1/messages HTTP/1.1\r\n"
                     f"Host: {TEST_HOST}\r\n"
-                    "Content-Length: 1\r\n"
-                    "Content-Length: 1\r\n"
+                    f"Authorization: Bearer {AUTH_KEY}\r\n"
+                    "anthropic-beta: streaming-2024-01-01\r\n"
+                    "anthropic-beta: tools-2024-04-04\r\n"
                     "\r\n"
-                    "a"
-                ).encode("utf-8"),
+                ).encode("utf-8")
             )
+            print(response)
+            assert "200 OK" in response, response
 
-            assert_bad_request(
-                "Duplicate Transfer-Encoding should be rejected",
-                (
-                    f"POST /v1/test HTTP/1.1\r\n"
-                    f"Host: {TEST_HOST}\r\n"
-                    "Transfer-Encoding: chunked\r\n"
-                    "Transfer-Encoding: chunked\r\n"
-                    "\r\n"
-                    "0\r\n\r\n"
-                ).encode("utf-8"),
-            )
+            body = response.split("\r\n\r\n", 1)[1]
+            data = json.loads(body)
+            headers = data["headers"]
+            print(json.dumps(data, indent=2))
 
-            assert_bad_request(
-                "Chunked Transfer-Encoding without space should be rejected with Content-Length",
-                (
-                    f"POST /v1/test HTTP/1.1\r\n"
-                    f"Host: {TEST_HOST}\r\n"
-                    "Content-Length:5\r\n"
-                    "Transfer-Encoding:chunked\r\n"
-                    "\r\n"
-                    "0\r\n\r\n"
-                ).encode("utf-8"),
-            )
+            assert headers.get("authorization") == ["Bearer oauth-token"], headers
+            assert headers.get("anthropic-beta") == [
+                "streaming-2024-01-01, tools-2024-04-04, oauth-2025-04-20"
+            ], headers
 
-            assert_bad_request(
-                "Mixed-case Transfer-Encoding with Content-Length should be rejected",
-                (
-                    f"POST /v1/test HTTP/1.1\r\n"
-                    f"Host: {TEST_HOST}\r\n"
-                    "Content-Length: 5\r\n"
-                    "Transfer-Encoding: Chunked\r\n"
-                    "\r\n"
-                    "0\r\n\r\n"
-                ).encode("utf-8"),
-            )
-
-            print("\nAll strict HTTP parsing E2E tests passed.")
+            print("\nDuplicate extra header filtering E2E test passed.")
         finally:
             proxy.terminate()
             try:

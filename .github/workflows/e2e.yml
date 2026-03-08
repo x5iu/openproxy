@@ -735,6 +735,33 @@ jobs:
           python test_proxy_authorization_filtering.py
           echo "Proxy-Authorization filtering E2E tests passed!"
 
+      - name: Run HTTP/2 auth header filtering E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing HTTP/2 auth header filtering across matching providers..."
+          cd e2e
+          python test_h2_auth_header_filtering.py
+          echo "HTTP/2 auth header filtering E2E tests passed!"
+
+      - name: Run duplicate extra header filtering E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing duplicate transformed extra header filtering..."
+          cd e2e
+          python test_duplicate_extra_header_filtering.py
+          echo "Duplicate extra header filtering E2E tests passed!"
+
+      - name: Run HTTP/2 auth header filtering (H2 upstream) E2E tests
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          echo "Testing HTTP/2 auth header filtering on HTTP/2 upstream..."
+          cd e2e
+          python test_h2_auth_header_filtering_h2_upstream.py
+          echo "HTTP/2 auth header filtering (H2 upstream) E2E tests passed!"
+
       - name: Start echo servers for auth selection test
         run: |
           # Start echo servers that return their server_id
