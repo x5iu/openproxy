@@ -819,6 +819,7 @@ where
 
 /// Provider information extracted for upstream request handling.
 /// This struct holds all the necessary provider details to avoid passing many parameters.
+#[derive(Clone)]
 struct UpstreamInfo {
     endpoint: String,
     sock_address: String,
@@ -3042,5 +3043,135 @@ providers:
             .unwrap();
         assert!(req_str.starts_with("GET /test HTTP/1.1\r\n"));
         assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_h2_filters_matching_provider_auth_headers_on_h2_upstream() {
+        use std::collections::HashMap;
+
+        use tokio::time::{timeout, Duration};
+
+        // Build an in-memory HTTP/2 upstream so we can verify forwarded headers directly
+        // without depending on TLS trust for a local self-signed certificate.
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(64 * 1024);
+        let (upstream_send_request, upstream_client_conn) =
+            h2::client::handshake(upstream_client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = upstream_client_conn.await;
+        });
+        let h2conn = crate::h2client::H2Connection::new(upstream_send_request, "upstream.local");
+
+        let (captured_tx, captured_rx) =
+            tokio::sync::oneshot::channel::<(String, HashMap<String, Vec<String>>)>();
+        tokio::spawn(async move {
+            let mut upstream = h2::server::handshake(upstream_server_io).await.unwrap();
+            let mut captured_tx = Some(captured_tx);
+            while let Some(next) = upstream.accept().await {
+                let (request, mut respond) = next.unwrap();
+                let tx = captured_tx.take();
+
+                tokio::spawn(async move {
+                    let path = request
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    let mut headers = HashMap::<String, Vec<String>>::new();
+                    for (name, value) in request.headers() {
+                        headers
+                            .entry(name.as_str().to_string())
+                            .or_default()
+                            .push(value.to_str().unwrap().to_string());
+                    }
+                    if let Some(tx) = tx {
+                        let _ = tx.send((path, headers));
+                    }
+
+                    let response = httplib::Response::builder()
+                        .status(200)
+                        .version(httplib::Version::HTTP_2)
+                        .header("content-type", "application/json")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    send.send_data(bytes::Bytes::from_static(b"{}"), true)
+                        .unwrap();
+                });
+            }
+        });
+
+        let info = UpstreamInfo {
+            endpoint: "upstream.local".to_string(),
+            sock_address: "unused".to_string(),
+            use_tls: true,
+            max_header_size: 4096,
+            host_header_value: "upstream.local".to_string(),
+            auth_header: Some("Authorization: Bearer sk-upstream\r\n".to_string()),
+            auth_header_keys: vec!["authorization".to_string(), "x-api-key".to_string()],
+            path_prefix: None,
+            api_key: None,
+            auth_query_key: None,
+            extra_header_keys: vec![],
+            extra_headers_transformed: vec![],
+        };
+
+        let (client_io, proxy_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        tokio::spawn(async move {
+            let mut proxy = h2::server::handshake(proxy_io).await.unwrap();
+            while let Some(next) = proxy.accept().await {
+                let (request, respond) = next.unwrap();
+                let info = info.clone();
+                let h2conn = h2conn.clone();
+                tokio::spawn(async move {
+                    info.proxy_h2(h2conn, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::GET)
+            .uri("https://shared-auth-h2.local/v1/test")
+            .header("host", "shared-auth-h2.local")
+            .header("authorization", "Bearer shared-auth-key")
+            .header("x-api-key", "shared-auth-key")
+            .header("proxy-authorization", "Bearer proxy-secret")
+            .body(())
+            .unwrap();
+        let (response_fut, _send_stream) = client.send_request(request, true).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let mut body = response.into_body();
+        let collected = timeout(Duration::from_secs(2), async {
+            let mut collected = Vec::new();
+            while let Some(chunk) = body.data().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            collected
+        })
+        .await
+        .expect("timeout reading h2 body");
+        assert_eq!(collected, b"{}");
+
+        let (path, headers) = timeout(Duration::from_secs(2), captured_rx)
+            .await
+            .expect("upstream was not contacted")
+            .unwrap();
+        assert_eq!(path, "/v1/test");
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&vec!["Bearer sk-upstream".to_string()])
+        );
+        assert!(!headers.contains_key("x-api-key"));
+        assert!(!headers.contains_key("proxy-authorization"));
     }
 }

@@ -47,7 +47,7 @@ Name E2E tests by behavior (`test_connect_tunnel.py`, `test_auth_selection.py`, 
 No explicit coverage threshold is enforced, but PRs should include:
 - unit tests for parsing/routing/auth logic changes
 - targeted E2E coverage for protocol, auth, reload, or hot-upgrade behavior changes
-- for auth/header-filtering regressions, prefer focused E2E scripts in `e2e/` such as `test_proxy_authorization_filtering.py`, `test_h2_auth_header_filtering.py`, `test_h2_auth_header_filtering_h2_upstream.py`, `test_duplicate_extra_header_filtering.py`, `test_no_auth_keys_filtering.py`, and `test_strict_http_parsing.py`
+- for auth/header-filtering regressions, prefer focused E2E scripts in `e2e/` such as `test_proxy_authorization_filtering.py`, `test_h2_auth_header_filtering.py`, `test_duplicate_extra_header_filtering.py`, `test_no_auth_keys_filtering.py`, and `test_strict_http_parsing.py`; cover the HTTP/2 upstream forwarding path with Rust unit tests in `src/worker/mod.rs`
 - for provider selection/path rewrite changes, look at `test_auth_selection.py`, `test_rewrite_auth_selection.py`, `test_provider_priority.py`, and `test_host_path.py`
 - for protocol behavior changes, look at `test_http.py`, `test_https.py`, `test_h2_upstream.py`, `test_h2_large_body.py`, `test_h2_h1_fallback.py`, `test_connect_tunnel.py`, and `test_websocket.py`
 - for reload, hot-upgrade, or dynamic credential changes, look at `test_sighup_reload.py`, `test_hot_upgrade.py`, `test_openai_dynamic_api_key.py`, `test_anthropic_oauth.py`, and `test_health_check_auth.py`
