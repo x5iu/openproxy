@@ -28,37 +28,12 @@ cargo fmt
 
 ## E2E Tests
 
-E2E tests are Python scripts in `e2e/`. There are two patterns:
+E2E tests are Python scripts in `e2e/`. **Do NOT run E2E tests locally — always run them via PR GitHub Actions** (`.github/workflows/e2e.yml`).
 
-**CI-dependent tests** rely on the proxy instance started by `.github/workflows/e2e.yml` (with real API keys from GitHub Secrets and multiple Python echo servers on ports 9000-9007):
-```bash
-python test_https.py
-python test_http.py
-python test_websocket.py
-python test_host_path.py
-python test_anthropic_oauth.py
-python test_anthropic_api.py
-python test_auth_selection.py
-python test_rewrite_auth_selection.py
-python test_connect_tunnel.py
-python test_forward.py
-python test_h2_upstream.py
-python test_h2_h1_fallback.py
-python test_h2_large_body.py
-python test_openai_realtime.py
-```
+There are two patterns:
 
-**Self-contained tests** start their own openproxy instance with a temporary config, certs, and echo server. These can run locally with just the compiled binary:
-```bash
-python test_hot_upgrade.py
-python test_health_check_auth.py
-python test_no_auth_keys_filtering.py
-python test_sighup_reload.py
-```
-
-Dependencies: `pip install openai pydantic "httpx[http2]" websockets websocket-client pyyaml anthropic`
-
-Self-contained tests find the binary via `OPENPROXY_BINARY` env var or auto-detect from `target/release/` or `target/debug/`.
+- **CI-dependent tests** rely on the proxy instance started by the CI workflow (with real API keys from GitHub Secrets and multiple Python echo servers on ports 9000-9007).
+- **Self-contained tests** start their own openproxy instance with a temporary config, certs, and echo server. They find the binary via `OPENPROXY_BINARY` env var or auto-detect from `target/release/` or `target/debug/`.
 
 ## Architecture
 
@@ -141,8 +116,9 @@ The `Provider` trait (`src/provider/mod.rs`) defines how each LLM provider handl
 Path prefix matching requires the request path to start with the prefix AND the next character must be `/` or end-of-string (prevents `/v1` matching `/v10`).
 
 When multiple healthy providers match:
+- Higher `priority` value wins (default: 0). Only the highest-priority group is considered.
 - Non-fallback providers are preferred over fallback providers
-- Among matches, weighted random selection using `WeightedIndex`
+- Among matches at the same priority, weighted random selection using `WeightedIndex`
 - Unhealthy providers (failed health checks) are excluded
 
 ### Configuration
@@ -151,7 +127,7 @@ YAML-based config with hot-reload via SIGHUP. Key fields:
 - `https_port` / `http_port`: At least one required
 - `https_bind_address` / `http_bind_address`: Bind address for each listener (default: 0.0.0.0)
 - `cert_file` / `private_key_file`: Required for HTTPS
-- `providers[]`: Type (openai, gemini, anthropic, forward), host (for routing), endpoint (actual backend), api_key, weight, tls, is_fallback
+- `providers[]`: Type (openai, gemini, anthropic, forward), host (for routing), endpoint (actual backend), api_key, weight, priority, tls, is_fallback
 - `auth_keys`: Global authentication keys
 - `health_check.enabled` / `health_check.interval`: Enable health checks and set interval (default: 60s)
 - `http_max_header_size`: Maximum HTTP header size in bytes (default: 4096, min: 1024, max: 1MB)
