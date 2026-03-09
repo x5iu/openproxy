@@ -9,6 +9,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 
 - **Multi-Provider Support**: Seamlessly proxy requests to OpenAI, Gemini, and Anthropic APIs, plus transparent forward proxying
 - **Intelligent Load Balancing**: Weighted provider selection algorithm for optimal resource utilization
+- **Priority-Based Routing**: Prefer higher-priority matching providers before applying weights
 - **Fallback Providers**: Automatic failover to backup providers when primary providers are unavailable
 - **Health Monitoring**: Automatic health checks with configurable intervals and failure recovery
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
@@ -117,12 +118,20 @@ health_check:
 
 # Provider Configuration
 providers:
+  # Matching provider selection order:
+  # 1. Match by host + optional path prefix
+  # 2. Exclude unhealthy providers
+  # 3. Prefer non-fallback providers over fallback providers
+  # 4. Keep only the highest priority tier (default: 0)
+  # 5. Use weight only within that remaining tier
+  #
   # OpenAI Configuration
   - type: "openai"
     host: "openai.example.com"       # Client uses "Host: openai.example.com" header to route to this provider
     endpoint: "api.openai.com"       # Actual OpenAI API endpoint
     port: 443
     tls: true
+    priority: 10                     # Higher priority wins before weight is considered
     weight: 1.0
     api_key: "sk-your-openai-api-key"
     health_check:
@@ -133,6 +142,7 @@ providers:
   # Use $(command) pattern to execute a shell command that returns the API key.
   # The command is executed per request (including health checks and WebSocket upgrade).
   # If command execution fails, OpenProxy returns 502: "upstream authentication failed".
+  # Output is trimmed, and values containing CR/LF/NUL are rejected for header safety.
   - type: "openai"
     host: "openai-dynamic.example.com"
     endpoint: "api.openai.com"
@@ -145,6 +155,7 @@ providers:
     endpoint: "generativelanguage.googleapis.com"  # Actual Google API endpoint
     port: 443
     tls: true
+    priority: 5
     weight: 1.5
     api_key: "your-gemini-api-key"
     health_check:
@@ -157,6 +168,7 @@ providers:
     endpoint: "api.anthropic.com"    # Actual Anthropic API endpoint
     port: 443
     tls: true
+    priority: 5
     weight: 1.2
     api_key: "sk-ant-your-anthropic-api-key"
     health_check:
@@ -181,12 +193,13 @@ providers:
   - type: "openai"
     host: "openai-backup.example.com"  # Different host name for separate routing
     endpoint: "api.openai.com"
+    priority: 1
     api_keys:
       - key: "sk-key-1"
         weight: 1.0
       - key: "sk-key-2"
         weight: 2.0
-    auth_keys:
+    auth_keys:                         # Optional provider-specific client keys
       - "provider-specific-auth-key"
 
   # Fallback Provider
@@ -206,6 +219,7 @@ providers:
     host: "internal.example.com"       # Client uses "Host: internal.example.com" header
     endpoint: "backend.internal:8080"  # Actual backend endpoint
     tls: false
+    priority: 0
     weight: 1.0
 
   # Path Prefix Routing
@@ -217,6 +231,24 @@ providers:
     endpoint: "api.openai.com"
     api_key: "sk-your-openai-api-key"
 ```
+
+### Provider Selection
+
+When multiple providers match the same request, OpenProxy resolves them in this order:
+
+1. Match providers by `host` and optional path prefix.
+2. Exclude unhealthy providers.
+3. Prefer non-fallback providers over fallback providers.
+4. Keep only providers with the highest `priority` value. Higher numbers win; omitted means `0`.
+5. Apply `weight` only within the remaining priority tier.
+
+This means `priority` decides the tier, while `weight` only distributes traffic among ties in that tier.
+
+### Authentication Scopes
+
+- Top-level `auth_keys` applies globally across all providers.
+- Provider-level `auth_keys` applies only to that specific provider.
+- During auth-based selection, OpenProxy can still fall back to a lower-priority matching provider if higher-priority providers are unhealthy or reject the presented client credentials.
 
 ## Usage
 
