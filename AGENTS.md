@@ -10,7 +10,7 @@
 - `src/h2client/`, `src/websocket/`, `src/executor/`: upstream HTTP/2 client/pool, WebSocket proxy helpers, and connection pooling/health checks.
 
 Top-level support files:
-- `README.md`: user-facing config and deployment documentation.
+- `README.md`: user-facing config and deployment documentation, including `forward` provider transparency/auth semantics and HTTP/2→HTTP/1.1 fallback framing behavior.
 - `Dockerfile`: container image build.
 - `.github/workflows/e2e.yml`: Rust unit tests plus secret-backed E2E coverage.
 - `.github/workflows/security.yml`: cargo-audit, CodeQL, Gitleaks, Semgrep, Scorecard, and Trivy.
@@ -49,7 +49,7 @@ No explicit coverage threshold is enforced, but PRs should include:
 - targeted E2E coverage for protocol, auth, reload, or hot-upgrade behavior changes
 - for auth/header-filtering regressions, prefer focused E2E scripts in `e2e/` such as `test_proxy_authorization_filtering.py`, `test_h2_auth_header_filtering.py`, `test_duplicate_extra_header_filtering.py`, `test_no_auth_keys_filtering.py`, and `test_strict_http_parsing.py`; cover the HTTP/2 upstream forwarding path with Rust unit tests in `src/worker/mod.rs`
 - for provider selection/path rewrite changes, look at `test_auth_selection.py`, `test_rewrite_auth_selection.py`, `test_provider_priority.py`, and `test_host_path.py`
-- for protocol behavior changes, look at `test_http.py`, `test_https.py`, `test_h2_upstream.py`, `test_h2_large_body.py`, `test_h2_h1_fallback.py`, `test_connect_tunnel.py`, and `test_websocket.py`
+- for protocol behavior changes, look at `test_http.py`, `test_https.py`, `test_h2_upstream.py`, `test_h2_large_body.py`, `test_h2_h1_fallback.py`, `test_h2_h1_fallback_framing.py`, `test_connect_tunnel.py`, and `test_websocket.py`
 - for reload, hot-upgrade, or dynamic credential changes, look at `test_sighup_reload.py`, `test_hot_upgrade.py`, `test_openai_dynamic_api_key.py`, `test_anthropic_oauth.py`, and `test_health_check_auth.py`
 
 ## Commit & Pull Request Guidelines

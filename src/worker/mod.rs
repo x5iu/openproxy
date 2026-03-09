@@ -771,7 +771,6 @@ where
                         extra_header_keys,
                         extra_headers_transformed,
                     };
-                    let authority_host = authority.host().to_string();
 
                     // Drop the read lock before async operations
                     drop(p);
@@ -793,8 +792,7 @@ where
                             info.proxy_h2(h2conn, request, respond).await;
                         }
                         H2ConnectResult::FallbackToH1 => {
-                            info.proxy_h1(&mut worker, request, respond, &authority_host)
-                                .await;
+                            info.proxy_h1(&mut worker, request, respond).await;
                         }
                     }
                 });
@@ -1064,7 +1062,6 @@ impl UpstreamInfo {
         worker: &mut Worker<P, H2P>,
         request: httplib::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<bytes::Bytes>,
-        authority_host: &str,
     ) where
         P: PoolTrait + Send + Sync + 'static,
         H2P: H2PoolTrait,
@@ -1092,27 +1089,18 @@ impl UpstreamInfo {
             }};
         }
 
-        let mut request = request;
+        let request = request;
+        let has_body = !request.body().is_end_stream();
 
-        // Add default headers
-        request
-            .headers_mut()
-            .entry("Connection")
-            .or_insert(httplib::HeaderValue::from_static("keep-alive"));
-        request
-            .headers_mut()
-            .entry("Host")
-            .or_insert(httplib::HeaderValue::from_str(authority_host).unwrap());
-
-        let has_content_length = request.headers().contains_key("content-length");
-
-        // Build HTTP/1.1 request headers
+        // Build HTTP/1.1 request headers.
+        // Security: when falling back from HTTP/2 to HTTP/1.1, we MUST rebuild H1 framing
+        // ourselves instead of trusting client-supplied Content-Length/Transfer-Encoding.
         let req_headers = build_h1_request_headers(
             request.headers().iter(),
             &self.host_header_value,
             &self.auth_header_keys,
             self.auth_header.as_deref(),
-            has_content_length,
+            has_body,
             &self.extra_header_keys,
             &self.extra_headers_transformed,
         );
@@ -1137,12 +1125,7 @@ impl UpstreamInfo {
             req_headers,
         );
 
-        let h2stream_reader = H2StreamReader::new(request.into_body());
-        let mut req_body: Box<dyn AsyncRead + Unpin + Send + Sync> = if has_content_length {
-            Box::new(h2stream_reader)
-        } else {
-            Box::new(http::reader::ChunkedWriter::new(h2stream_reader))
-        };
+        let request_body = request.into_body();
 
         let mut outgoing = match worker
             .get_or_create_h1(&self.endpoint, &self.sock_address, self.use_tls)
@@ -1159,9 +1142,12 @@ impl UpstreamInfo {
             invalid!(respond, 502, format!("upstream: {}", e));
             return;
         }
-        if let Err(e) = tokio::io::copy(&mut req_body, &mut outgoing).await {
-            invalid!(respond, 502, format!("upstream: {}", e));
-            return;
+        if has_body {
+            let mut req_body = http::reader::ChunkedWriter::new(H2StreamReader::new(request_body));
+            if let Err(e) = tokio::io::copy(&mut req_body, &mut outgoing).await {
+                invalid!(respond, 502, format!("upstream: {}", e));
+                return;
+            }
         }
         if let Err(e) = outgoing.flush().await {
             invalid!(respond, 502, format!("upstream: {}", e));
@@ -2210,6 +2196,19 @@ fn should_filter_forwarded_header(
     extra_header_keys.iter().any(|k| k == &key_lower)
 }
 
+#[inline]
+fn is_h1_framing_or_hop_by_hop_header(key: &str) -> bool {
+    key.eq_ignore_ascii_case("host")
+        || key.eq_ignore_ascii_case("connection")
+        || key.eq_ignore_ascii_case("content-length")
+        || key.eq_ignore_ascii_case("transfer-encoding")
+        || key.eq_ignore_ascii_case("proxy-connection")
+        || key.eq_ignore_ascii_case("keep-alive")
+        || key.eq_ignore_ascii_case("te")
+        || key.eq_ignore_ascii_case("trailer")
+        || key.eq_ignore_ascii_case("upgrade")
+}
+
 fn rewrite_websocket_upgrade_request(
     raw_headers: &[u8],
     host_header: &str,
@@ -2283,14 +2282,15 @@ fn rewrite_websocket_upgrade_request(
     Ok(modified_request)
 }
 
-/// Build HTTP/1.1 request headers string from an iterator of headers.
-/// Filters out auth headers, extra headers, and replaces Host header with the upstream host.
+/// Build HTTP/1.1 request headers string from an iterator of HTTP/2 request headers.
+/// Filters out client auth headers, hop-by-hop/framing headers, and applies proxy-controlled
+/// Host/Connection/framing for safe HTTP/2 -> HTTP/1.1 fallback.
 fn build_h1_request_headers<'a, I>(
     headers: I,
     host_header_value: &str,
     auth_header_keys: &[String],
     auth_header: Option<&str>,
-    has_content_length: bool,
+    has_body: bool,
     extra_header_keys: &[String],
     extra_headers_transformed: &[(String, String)],
 ) -> String
@@ -2298,15 +2298,16 @@ where
     I: Iterator<Item = (&'a httplib::HeaderName, &'a httplib::HeaderValue)>,
 {
     let mut req_headers = String::with_capacity(1024);
+    req_headers.push_str("Host: ");
+    req_headers.push_str(host_header_value);
+    req_headers.push_str("\r\n");
+    req_headers.push_str("Connection: keep-alive\r\n");
 
     for (key, value) in headers {
         let key_str = key.as_str();
-        if should_filter_forwarded_header(key_str, auth_header_keys, extra_header_keys) {
-            continue;
-        }
-        // Replace Host header
-        if key_str.eq_ignore_ascii_case("host") {
-            req_headers.push_str(&format!("Host: {}\r\n", host_header_value));
+        if is_h1_framing_or_hop_by_hop_header(key_str)
+            || should_filter_forwarded_header(key_str, auth_header_keys, extra_header_keys)
+        {
             continue;
         }
         req_headers.push_str(key_str);
@@ -2328,8 +2329,8 @@ where
         req_headers.push_str("\r\n");
     }
 
-    // Add Transfer-Encoding if no Content-Length
-    if !has_content_length {
+    // Security: when proxying H2 -> H1, always generate body framing ourselves.
+    if has_body {
         req_headers.push_str("Transfer-Encoding: chunked\r\n");
     }
 
@@ -2786,15 +2787,40 @@ mod tests {
     fn test_build_h1_request_headers() {
         use httplib::header::{HeaderMap, HeaderName, HeaderValue};
 
-        // Create test headers
+        // Create test headers, including hop-by-hop and framing headers that must be stripped
+        // during HTTP/2 -> HTTP/1.1 fallback.
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("host"),
             HeaderValue::from_static("client.example.com"),
         );
         headers.insert(
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("close"),
+        );
+        headers.insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_static("123"),
+        );
+        headers.insert(
+            HeaderName::from_static("transfer-encoding"),
+            HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            HeaderName::from_static("te"),
+            HeaderValue::from_static("trailers"),
+        );
+        headers.insert(
+            HeaderName::from_static("trailer"),
+            HeaderValue::from_static("x-checksum"),
+        );
+        headers.insert(
+            HeaderName::from_static("upgrade"),
+            HeaderValue::from_static("websocket"),
         );
         headers.insert(
             HeaderName::from_static("authorization"),
@@ -2805,9 +2831,37 @@ mod tests {
             HeaderValue::from_static("Bearer proxy_secret"),
         );
 
-        // Test with auth header replacement and no content-length
         let auth_keys = vec!["authorization".to_string()];
         let result = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            &auth_keys,
+            Some("Authorization: Bearer server_token\r\n"),
+            true,
+            &[],
+            &[],
+        );
+
+        assert!(result.contains("Host: upstream.example.com\r\n"));
+        assert!(result.contains("Connection: keep-alive\r\n"));
+        assert!(result.contains("content-type: application/json\r\n"));
+        assert!(result.contains("Authorization: Bearer server_token\r\n"));
+        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
+
+        // The proxy must rebuild HTTP/1.1 framing instead of forwarding client framing.
+        assert!(!result.contains("content-length: 123\r\n"));
+        assert!(!result.contains("transfer-encoding: gzip\r\n"));
+        assert!(!result.contains("te: trailers\r\n"));
+        assert!(!result.contains("trailer: x-checksum\r\n"));
+        assert!(!result.contains("upgrade: websocket\r\n"));
+        assert!(!result.contains("connection: close\r\n"));
+
+        // Should NOT contain the client's authorization
+        assert!(!result.contains("Bearer client_token"));
+        assert!(!result.contains("proxy_secret"));
+
+        // No body => no Transfer-Encoding and no forwarded Content-Length.
+        let result_without_body = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
             &auth_keys,
@@ -2816,44 +2870,26 @@ mod tests {
             &[],
             &[],
         );
+        assert!(!result_without_body.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!result_without_body.contains("content-length: 123\r\n"));
 
-        assert!(result.contains("Host: upstream.example.com\r\n"));
-        assert!(result.contains("content-type: application/json\r\n"));
-        assert!(result.contains("Authorization: Bearer server_token\r\n"));
-        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
-        // Should NOT contain the client's authorization
-        assert!(!result.contains("Bearer client_token"));
-        assert!(!result.contains("proxy_secret"));
-
-        // Test with content-length (no Transfer-Encoding)
-        let result_with_cl = build_h1_request_headers(
-            headers.iter(),
-            "upstream.example.com",
-            &auth_keys,
-            Some("Authorization: Bearer server_token\r\n"),
-            true,
-            &[],
-            &[],
-        );
-
-        assert!(!result_with_cl.contains("Transfer-Encoding"));
-
-        // Test without auth header replacement
+        // Test without auth header replacement.
         let no_auth_keys: Vec<String> = vec![];
         let result_no_auth = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
             &no_auth_keys,
             None,
-            true,
+            false,
             &[],
             &[],
         );
 
         assert!(result_no_auth.contains("authorization: Bearer client_token\r\n"));
         assert!(!result_no_auth.contains("proxy_secret"));
+        assert!(!result_no_auth.contains("content-length: 123\r\n"));
 
-        // Test with extra headers filtering and transformation
+        // Test with extra headers filtering and transformation.
         let mut headers_with_extra = HeaderMap::new();
         headers_with_extra.insert(
             HeaderName::from_static("host"),
@@ -2885,11 +2921,12 @@ mod tests {
         );
 
         assert!(result_with_extra.contains("Host: upstream.example.com\r\n"));
+        assert!(result_with_extra.contains("Connection: keep-alive\r\n"));
         assert!(result_with_extra.contains("content-type: application/json\r\n"));
-        // Should contain transformed header, not original
+        // Should contain transformed header, not original.
         assert!(result_with_extra.contains("anthropic-beta: existing-value,oauth-2025-04-20\r\n"));
-        // Should NOT contain the original value alone
         assert!(!result_with_extra.contains("anthropic-beta: existing-value\r\n"));
+        assert!(result_with_extra.contains("Transfer-Encoding: chunked\r\n"));
     }
 
     #[tokio::test]
@@ -2992,8 +3029,7 @@ providers:
                 };
 
                 tokio::spawn(async move {
-                    info.proxy_h1(&mut worker, request, respond, "route.example.com")
-                        .await;
+                    info.proxy_h1(&mut worker, request, respond).await;
                 });
             }
         });
@@ -3043,6 +3079,129 @@ providers:
             .unwrap();
         assert!(req_str.starts_with("GET /test HTTP/1.1\r\n"));
         assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+    }
+
+    #[tokio::test]
+    async fn test_h2_fallback_to_h1_rebuilds_request_framing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let mut n = 0usize;
+            loop {
+                if n == buf.len() {
+                    buf.resize(buf.len() * 2, 0);
+                }
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                n += read;
+
+                if let Some(header_end) = find_header_end(&buf[..n]).map(|pos| pos + 4) {
+                    let body = &buf[header_end..n];
+                    if body.windows(5).any(|window| window == b"0\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+            buf.truncate(n);
+            let _ = req_tx.send(buf);
+
+            let body = "OK";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::POST)
+            .uri("https://route.example.com/upload")
+            .header("content-length", "10")
+            .header("content-type", "application/octet-stream")
+            .body(())
+            .unwrap();
+        let (response_fut, mut send_stream) = client.send_request(request, false).unwrap();
+        send_stream
+            .send_data(bytes::Bytes::from_static(b"abcdefghij"), true)
+            .unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("http/1.1")
+        );
+
+        let req_bytes = timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("upstream request was not captured")
+            .unwrap();
+        let req_str = String::from_utf8_lossy(&req_bytes);
+        assert!(req_str.starts_with("POST /upload HTTP/1.1\r\n"));
+        assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+        assert!(req_str.contains("Connection: keep-alive\r\n"));
+        assert!(req_str.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(req_str.contains("content-type: application/octet-stream\r\n"));
+        assert!(!req_str.contains("content-length: 10\r\n"));
+
+        let body_start = find_header_end(&req_bytes).unwrap() + 4;
+        assert_eq!(&req_bytes[body_start..], b"a\r\nabcdefghij\r\n0\r\n\r\n");
     }
 
     #[tokio::test]

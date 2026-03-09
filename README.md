@@ -13,7 +13,7 @@ A high-performance LLM (Large Language Model) proxy server written in Rust, desi
 - **Fallback Providers**: Automatic failover to backup providers when primary providers are unavailable
 - **Health Monitoring**: Automatic health checks with configurable intervals and failure recovery
 - **Connection Pooling**: Efficient connection reuse to minimize latency and resource usage
-- **Authentication & Authorization**: Flexible API key management with per-provider and global authentication
+- **Authentication & Authorization**: Flexible API key management with per-provider and global authentication for OpenAI, Gemini, and Anthropic routes
 - **Dynamic API Key Commands**: Use `api_key: $(...)` to fetch per-request credentials for OpenAI and Anthropic
 - **Protocol Support**: Full HTTP/1.1 and HTTP/2 support with automatic protocol negotiation
 - **WebSocket Support**: Transparent WebSocket proxying for both HTTP/1.1 upgrade and HTTP/2 Extended CONNECT (RFC 8441)
@@ -214,6 +214,8 @@ providers:
   # Forward Provider (Transparent Proxy)
   # Forwards requests to the endpoint without any authentication transformation.
   # Client headers (including Authorization) are passed through as-is.
+  # NOTE: `forward` is intentionally transparent and does NOT inherit top-level
+  # or provider-level `auth_keys`. Protect it with an external auth layer if needed.
   # Useful for proxying to internal services or custom endpoints.
   - type: "forward"
     host: "internal.example.com"       # Client uses "Host: internal.example.com" header
@@ -246,8 +248,9 @@ This means `priority` decides the tier, while `weight` only distributes traffic 
 
 ### Authentication Scopes
 
-- Top-level `auth_keys` applies globally across all providers.
-- Provider-level `auth_keys` applies only to that specific provider.
+- Top-level `auth_keys` applies to provider types that perform client authentication: `openai`, `gemini`, and `anthropic`.
+- Provider-level `auth_keys` applies only to that specific authenticating provider.
+- The `forward` provider is intentionally transparent: it forwards client headers as-is and does **not** inherit top-level or provider-level `auth_keys`.
 - During auth-based selection, OpenProxy can still fall back to a lower-priority matching provider if higher-priority providers are unhealthy or reject the presented client credentials.
 
 ## Usage
@@ -424,7 +427,8 @@ ws.close()
 
 - **TLS 1.3**: Modern encryption standards with forward secrecy
 - **Credential Isolation**: Client authentication headers are never forwarded to upstream providers. The proxy strips client credentials and injects the provider's own `api_key` instead, preventing credential leakage. The `forward` provider type is the exception — it passes all client headers through as-is for transparent proxying.
-- **API Key Validation**: Multi-layer authentication system with global and per-provider keys
+- **API Key Validation**: Multi-layer authentication system with global and per-provider keys for `openai`, `gemini`, and `anthropic` providers; `forward` remains transparent by design
+- **Safe H2→H1 Fallback Framing**: When an HTTP/2 client request is forwarded to an HTTP/1.1 upstream, OpenProxy rebuilds the HTTP/1.1 body framing itself and does not forward client-supplied `Content-Length` or `Transfer-Encoding`.
 - **No Key Logging**: Secure handling of sensitive credentials
 - **Constant-Time Comparison**: API key validation uses constant-time comparison to prevent timing attacks
 
