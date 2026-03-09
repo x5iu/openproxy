@@ -2,8 +2,11 @@ use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -19,6 +22,83 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     // Length check is not constant-time, but this is acceptable since
     // API key lengths are typically public knowledge (e.g., OpenAI keys are always 51 chars)
     a_bytes.len() == b_bytes.len() && bool::from(a_bytes.ct_eq(b_bytes))
+}
+
+const OAUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[inline]
+fn log_auth_header_debug(provider: &'static str, header_len: usize, auth_header: bool) {
+    #[cfg(debug_assertions)]
+    log::info!(
+        provider = provider,
+        header_len = header_len,
+        auth_header = auth_header;
+        "authentication"
+    );
+}
+
+fn sanitize_header_value(
+    value: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err("OAuth command output contains invalid header characters".into());
+    }
+    Ok(value)
+}
+
+fn execute_oauth_command_with_timeout(
+    command: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("OAuth command timed out after {:?}", timeout).into());
+            }
+        }
+    };
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        pipe.read_to_end(&mut stdout)?;
+    }
+
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        pipe.read_to_end(&mut stderr)?;
+    }
+
+    if !status.success() {
+        let stderr_empty = stderr.is_empty();
+        return Err(format!(
+            "OAuth command failed with status {}{}",
+            status,
+            if stderr_empty {
+                ""
+            } else {
+                " (stderr omitted)"
+            }
+        )
+        .into());
+    }
+
+    let token = String::from_utf8(stdout)?;
+    sanitize_header_value(token.trim().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -395,17 +475,22 @@ impl Provider for OpenAIProvider {
         };
         let Ok(header_str) = std::str::from_utf8(header) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "openai", header:serde = header.to_vec(); "invalid_authentication_header");
+            log::error!(provider = "openai", header_len = header.len(); "invalid_authentication_header");
             return Err(AuthenticationError);
         };
-        #[cfg(debug_assertions)]
-        log::info!(provider = "openai", header = header_str; "authentication");
+        log_auth_header_debug(
+            "openai",
+            header.len(),
+            http::is_header(header_str, http::HEADER_AUTHORIZATION)
+                || http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION),
+        );
         // Accept both Authorization and Proxy-Authorization headers
         // Proxy-Authorization is commonly used by HTTP proxy clients (e.g., CONNECT tunnel)
-        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            self.authenticate_key(&header_str[http::HEADER_AUTHORIZATION.len()..])
-        } else if http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION) {
-            self.authenticate_key(&header_str[http::HEADER_PROXY_AUTHORIZATION.len()..])
+        if let Some(value) = http::header_value(header_str, http::HEADER_AUTHORIZATION) {
+            self.authenticate_key(value)
+        } else if let Some(value) = http::header_value(header_str, http::HEADER_PROXY_AUTHORIZATION)
+        {
+            self.authenticate_key(value)
         } else {
             Err(AuthenticationError)
         }
@@ -623,16 +708,20 @@ impl Provider for GeminiProvider {
         };
         let Ok(mut key_str) = std::str::from_utf8(key) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "gemini", key:serde = key.to_vec(); "invalid_authentication_key");
+            log::error!(provider = "gemini", key_len = key.len(); "invalid_authentication_key");
             return Err(AuthenticationError);
         };
-        #[cfg(debug_assertions)]
-        log::info!(provider = "gemini", key = key_str; "authentication");
-        if http::is_header(key_str, http::HEADER_X_GOOG_API_KEY) {
-            key_str = &key_str[http::HEADER_X_GOOG_API_KEY.len()..];
-        } else if http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION) {
+        log_auth_header_debug(
+            "gemini",
+            key.len(),
+            http::is_header(key_str, http::HEADER_X_GOOG_API_KEY)
+                || http::is_header(key_str, http::HEADER_PROXY_AUTHORIZATION),
+        );
+        if let Some(value) = http::header_value(key_str, http::HEADER_X_GOOG_API_KEY) {
+            key_str = value;
+        } else if let Some(value) = http::header_value(key_str, http::HEADER_PROXY_AUTHORIZATION) {
             // Support Proxy-Authorization for HTTP proxy clients (e.g., CONNECT tunnel)
-            let value = key_str[http::HEADER_PROXY_AUTHORIZATION.len()..].trim();
+            let value = value.trim();
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 key_str = value[7..].trim();
             } else {
@@ -749,18 +838,14 @@ fn extract_oauth_command(api_key: &str) -> Option<&str> {
 fn execute_oauth_command(
     command: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("OAuth command failed: {}", stderr).into());
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                execute_oauth_command_with_timeout(command, OAUTH_COMMAND_TIMEOUT)
+            })
+        }
+        _ => execute_oauth_command_with_timeout(command, OAUTH_COMMAND_TIMEOUT),
     }
-
-    let token = String::from_utf8(output.stdout)?;
-    Ok(token.trim().to_string())
 }
 
 impl AnthropicProvider {
@@ -908,20 +993,24 @@ impl Provider for AnthropicProvider {
         };
         let Ok(header_str) = std::str::from_utf8(header) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
+            log::error!(provider = "anthropic", header_len = header.len(); "invalid_authentication_header");
             return Err(AuthenticationError);
         };
-        #[cfg(debug_assertions)]
-        log::info!(provider = "anthropic", header = header_str; "authentication");
+        log_auth_header_debug(
+            "anthropic",
+            header.len(),
+            http::is_header(header_str, http::HEADER_X_API_KEY)
+                || http::is_header(header_str, http::HEADER_AUTHORIZATION),
+        );
 
         // Check X-API-Key header
-        if http::is_header(header_str, http::HEADER_X_API_KEY) {
-            return self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..]);
+        if let Some(value) = http::header_value(header_str, http::HEADER_X_API_KEY) {
+            return self.authenticate_key(value);
         }
 
         // Check Authorization: Bearer header (case-insensitive prefix matching for "Bearer ")
-        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
+        if let Some(value) = http::header_value(header_str, http::HEADER_AUTHORIZATION) {
+            let value = value.trim();
             // RFC 7235 specifies that auth-scheme is case-insensitive
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
@@ -986,9 +1075,7 @@ impl Provider for AnthropicProvider {
         existing_value: Option<&str>,
     ) -> Option<String> {
         // Only transform headers when using OAuth
-        if self.oauth_command.is_none() {
-            return None;
-        }
+        self.oauth_command.as_ref()?;
 
         if header_key == http::HEADER_ANTHROPIC_BETA {
             const OAUTH_BETA_VALUE: &str = "oauth-2025-04-20";
@@ -997,13 +1084,13 @@ impl Provider for AnthropicProvider {
                 Some(existing) => {
                     // Check if oauth-2025-04-20 is already in the existing header
                     let values: Vec<&str> = existing.split(',').map(|s| s.trim()).collect();
-                    if values.iter().any(|v| *v == OAUTH_BETA_VALUE) {
+                    if values.contains(&OAUTH_BETA_VALUE) {
                         // Already contains the value, keep as is
                         Some(format!("{}{}\r\n", header_key, existing))
                     } else {
                         // Append the oauth beta value to existing header
                         Some(format!(
-                            "{}{},{}\r\n",
+                            "{}{}, {}\r\n",
                             header_key, existing, OAUTH_BETA_VALUE
                         ))
                     }
@@ -1034,19 +1121,19 @@ impl Provider for AnthropicProvider {
         };
         let Ok(header_str) = std::str::from_utf8(header) else {
             #[cfg(debug_assertions)]
-            log::error!(provider = "anthropic", header:serde = header.to_vec(); "invalid_authentication_header");
+            log::error!(provider = "anthropic", header_len = header.len(); "invalid_authentication_header");
             return Err(AuthenticationError);
         };
 
         // Check X-API-Key
-        if http::is_header(header_str, http::HEADER_X_API_KEY) {
-            self.authenticate_key(&header_str[http::HEADER_X_API_KEY.len()..])?;
+        if let Some(value) = http::header_value(header_str, http::HEADER_X_API_KEY) {
+            self.authenticate_key(value)?;
             return Ok(Some("x-api-key"));
         }
 
         // Check Authorization: Bearer (case-insensitive prefix matching for "Bearer ")
-        if http::is_header(header_str, http::HEADER_AUTHORIZATION) {
-            let value = header_str[http::HEADER_AUTHORIZATION.len()..].trim();
+        if let Some(value) = http::header_value(header_str, http::HEADER_AUTHORIZATION) {
+            let value = value.trim();
             // RFC 7235 specifies that auth-scheme is case-insensitive
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
@@ -1056,8 +1143,8 @@ impl Provider for AnthropicProvider {
         }
 
         // Check Proxy-Authorization: Bearer (for HTTP proxy clients like CONNECT tunnel)
-        if http::is_header(header_str, http::HEADER_PROXY_AUTHORIZATION) {
-            let value = header_str[http::HEADER_PROXY_AUTHORIZATION.len()..].trim();
+        if let Some(value) = http::header_value(header_str, http::HEADER_PROXY_AUTHORIZATION) {
+            let value = value.trim();
             if value.len() >= 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
                 let token = value[7..].trim();
                 self.authenticate_key(token)?;
@@ -1309,6 +1396,7 @@ fn replace_path<'a>(prefix: &str, block_str: &'a str) -> Cow<'a, str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1456,6 +1544,10 @@ mod tests {
         // Test valid authentication
         let valid_header = "Authorization: Bearer valid-key";
         assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+        let compact_header = "Authorization:Bearer valid-key";
+        assert!(provider
+            .authenticate(Some(compact_header.as_bytes()))
+            .is_ok());
 
         // Test invalid authentication
         let invalid_header = "Authorization: Bearer invalid-key";
@@ -1697,6 +1789,10 @@ mod tests {
         // Test with X-API-Key header
         let valid_header = "X-API-Key: client-key";
         assert!(provider.authenticate(Some(valid_header.as_bytes())).is_ok());
+        let compact_header = "X-API-Key:client-key";
+        assert!(provider
+            .authenticate(Some(compact_header.as_bytes()))
+            .is_ok());
 
         // Test invalid header key (now Authorization Bearer is also valid)
         let bearer_header = "Authorization: Bearer client-key";
@@ -1729,6 +1825,11 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some("x-api-key"));
 
+        let compact_header = "X-API-Key:valid-key";
+        let result = provider.authenticate_with_type(Some(compact_header.as_bytes()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("x-api-key"));
+
         // Test with invalid key
         let invalid_header = "X-API-Key: invalid-key";
         assert!(provider
@@ -1757,6 +1858,11 @@ mod tests {
         // Test with Authorization: Bearer header
         let header = "Authorization: Bearer valid-key";
         let result = provider.authenticate_with_type(Some(header.as_bytes()));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("bearer"));
+
+        let compact_proxy_header = "Proxy-Authorization:	Bearer valid-key";
+        let result = provider.authenticate_with_type(Some(compact_proxy_header.as_bytes()));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some("bearer"));
 
@@ -2274,6 +2380,22 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_oauth_command_rejects_header_injection() {
+        let result = execute_oauth_command("printf 'token\\r\\nextra'");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_oauth_command_timeout() {
+        let result = execute_oauth_command_with_timeout("sleep 1", Duration::from_millis(50));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("timed out"),
+            "expected timeout error"
+        );
+    }
+
+    #[test]
     fn test_anthropic_provider_oauth_mode() {
         let auth_keys = Arc::new(vec![]);
         let provider = AnthropicProvider::new(
@@ -2369,7 +2491,7 @@ mod tests {
             .transform_extra_header(http::HEADER_ANTHROPIC_BETA, Some("streaming-2024-01-01"));
         assert_eq!(
             result,
-            Some("anthropic-beta: streaming-2024-01-01,oauth-2025-04-20\r\n".to_string())
+            Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string())
         );
 
         // With existing anthropic-beta header (already contains oauth value)
@@ -2388,6 +2510,19 @@ mod tests {
         assert_eq!(
             result,
             Some("anthropic-beta: streaming-2024-01-01, oauth-2025-04-20\r\n".to_string())
+        );
+
+        // With existing duplicate anthropic-beta values collapsed by parser
+        let result = provider.transform_extra_header(
+            http::HEADER_ANTHROPIC_BETA,
+            Some("streaming-2024-01-01, tools-2024-04-04"),
+        );
+        assert_eq!(
+            result,
+            Some(
+                "anthropic-beta: streaming-2024-01-01, tools-2024-04-04, oauth-2025-04-20\r\n"
+                    .to_string()
+            )
         );
     }
 
@@ -2749,6 +2884,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn health_check(
     stream: &mut dyn AsyncReadWrite,
     endpoint: &[u8],

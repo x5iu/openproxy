@@ -54,20 +54,25 @@ impl<'a> Request<'a> {
     pub async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
-        let mut payload_blocks = Vec::new();
+        let mut payload_block_count = 0usize;
+        #[cfg(debug_assertions)]
+        let mut payload_bytes = 0usize;
         loop {
             let Some(block) = self.payload.next_block().await? else {
                 break;
             };
             if !block.is_empty() {
                 #[cfg(debug_assertions)]
-                payload_blocks.push(block.to_vec());
+                {
+                    payload_block_count += 1;
+                    payload_bytes += block.len();
+                }
                 writer.write_all(&block).await?;
             }
         }
         writer.flush().await?;
         #[cfg(debug_assertions)]
-        log::info!(payload:serde = payload_blocks; "http_request_blocks");
+        log::info!(blocks = payload_block_count, bytes = payload_bytes; "http_request_forwarded");
         Ok(())
     }
 
@@ -138,20 +143,25 @@ impl<'a> Response<'a> {
     pub async fn write_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> Result<(), Error> {
         let mut writer = pin!(writer);
         #[cfg(debug_assertions)]
-        let mut payload_blocks = Vec::new();
+        let mut payload_block_count = 0usize;
+        #[cfg(debug_assertions)]
+        let mut payload_bytes = 0usize;
         loop {
             let Some(block) = self.payload.next_block().await? else {
                 break;
             };
             if !block.is_empty() {
                 #[cfg(debug_assertions)]
-                payload_blocks.push(block.to_vec());
+                {
+                    payload_block_count += 1;
+                    payload_bytes += block.len();
+                }
                 writer.write_all(&block).await?;
             }
         }
         writer.flush().await?;
         #[cfg(debug_assertions)]
-        log::info!(payload:serde = payload_blocks; "http_response_blocks");
+        log::info!(blocks = payload_block_count, bytes = payload_bytes; "http_response_forwarded");
         Ok(())
     }
 }
@@ -245,6 +255,7 @@ impl<'a> Payload<'a> {
         let mut header_lines = HeaderLines::new(&crlfs, header);
         let mut content_length: Option<usize> = None;
         let mut transfer_encoding_chunked = false;
+        let mut saw_transfer_encoding = false;
         let mut host_range: Option<Range<usize>> = None;
         let mut auth_range: Option<Range<usize>> = None;
         let mut filtered_headers: Vec<Range<usize>> = Vec::new();
@@ -263,15 +274,21 @@ impl<'a> Payload<'a> {
             let Ok(header) = std::str::from_utf8(line) else {
                 return Err(Error::InvalidHeader);
             };
-            if is_header(header, HEADER_CONTENT_LENGTH) {
-                content_length = match header[HEADER_CONTENT_LENGTH.len()..].parse() {
+            if let Some(value) = header_value(header, HEADER_CONTENT_LENGTH) {
+                if content_length.is_some() {
+                    return Err(Error::InvalidHeader);
+                }
+                content_length = match value.trim().parse() {
                     Ok(length) => Some(length),
                     Err(_) => return Err(Error::InvalidHeader),
+                };
+            } else if let Some(value) = header_value(header, HEADER_TRANSFER_ENCODING) {
+                if saw_transfer_encoding {
+                    return Err(Error::InvalidHeader);
                 }
-            } else if is_header(header, HEADER_TRANSFER_ENCODING) {
-                if header[HEADER_TRANSFER_ENCODING.len()..].contains(TRANSFER_ENCODING_CHUNKED) {
-                    transfer_encoding_chunked = true;
-                }
+                transfer_encoding_chunked =
+                    parse_transfer_encoding(value.trim()).map_err(|()| Error::InvalidHeader)?;
+                saw_transfer_encoding = true;
             } else if is_header(header, HEADER_HOST) {
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
@@ -280,14 +297,13 @@ impl<'a> Payload<'a> {
                 };
                 filtered_headers.push(start..start + line.len());
                 host_range = Some(start..start + line.len());
-            } else if is_header(header, HEADER_CONNECTION) {
+            } else if let Some(connection_value) = header_value(header, HEADER_CONNECTION) {
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
                     let connection_start = &line[0] as *const u8 as usize;
                     connection_start - block_start
                 };
                 filtered_headers.push(start..start + line.len());
-                let connection_value = &header[HEADER_CONNECTION.len()..];
                 if connection_value.eq_ignore_ascii_case(CONNECTION_KEEP_ALIVE) {
                     conn_keep_alive = true;
                 }
@@ -298,8 +314,7 @@ impl<'a> Payload<'a> {
                 {
                     is_connection_upgrade = true;
                 }
-            } else if is_header(header, HEADER_UPGRADE) {
-                let upgrade_value = &header[HEADER_UPGRADE.len()..];
+            } else if let Some(upgrade_value) = header_value(header, HEADER_UPGRADE) {
                 if upgrade_value
                     .split(',')
                     .any(|part| part.trim().eq_ignore_ascii_case(UPGRADE_WEBSOCKET))
@@ -307,40 +322,41 @@ impl<'a> Payload<'a> {
                     is_upgrade_websocket = true;
                 }
             } else if is_header(header, HEADER_SEC_WEBSOCKET_KEY) {
+                let value_offset = header_value_offset(line, HEADER_SEC_WEBSOCKET_KEY)
+                    .ok_or(Error::InvalidHeader)?;
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start = &line[HEADER_SEC_WEBSOCKET_KEY.len()] as *const u8 as usize;
-                    value_start - block_start
+                    let line_start = line.as_ptr() as usize;
+                    line_start + value_offset - block_start
                 };
-                sec_websocket_key =
-                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_KEY.len());
+                sec_websocket_key = Some(start..start + line.len() - value_offset);
             } else if is_header(header, HEADER_SEC_WEBSOCKET_VERSION) {
+                let value_offset = header_value_offset(line, HEADER_SEC_WEBSOCKET_VERSION)
+                    .ok_or(Error::InvalidHeader)?;
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start =
-                        &line[HEADER_SEC_WEBSOCKET_VERSION.len()] as *const u8 as usize;
-                    value_start - block_start
+                    let line_start = line.as_ptr() as usize;
+                    line_start + value_offset - block_start
                 };
-                sec_websocket_version =
-                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_VERSION.len());
+                sec_websocket_version = Some(start..start + line.len() - value_offset);
             } else if is_header(header, HEADER_SEC_WEBSOCKET_PROTOCOL) {
+                let value_offset = header_value_offset(line, HEADER_SEC_WEBSOCKET_PROTOCOL)
+                    .ok_or(Error::InvalidHeader)?;
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start =
-                        &line[HEADER_SEC_WEBSOCKET_PROTOCOL.len()] as *const u8 as usize;
-                    value_start - block_start
+                    let line_start = line.as_ptr() as usize;
+                    line_start + value_offset - block_start
                 };
-                sec_websocket_protocol =
-                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_PROTOCOL.len());
+                sec_websocket_protocol = Some(start..start + line.len() - value_offset);
             } else if is_header(header, HEADER_SEC_WEBSOCKET_EXTENSIONS) {
+                let value_offset = header_value_offset(line, HEADER_SEC_WEBSOCKET_EXTENSIONS)
+                    .ok_or(Error::InvalidHeader)?;
                 let start = {
                     let block_start = &block[0] as *const u8 as usize;
-                    let value_start =
-                        &line[HEADER_SEC_WEBSOCKET_EXTENSIONS.len()] as *const u8 as usize;
-                    value_start - block_start
+                    let line_start = line.as_ptr() as usize;
+                    line_start + value_offset - block_start
                 };
-                sec_websocket_extensions =
-                    Some(start..start + line.len() - HEADER_SEC_WEBSOCKET_EXTENSIONS.len());
+                sec_websocket_extensions = Some(start..start + line.len() - value_offset);
             }
         }
         let Ok(req_line_str) = std::str::from_utf8(req_line) else {
@@ -419,11 +435,7 @@ impl<'a> Payload<'a> {
                                 let auth_start = &line[0] as *const u8 as usize;
                                 auth_start - block_start
                             };
-                            let range = start..start + line.len();
-                            // Only add if not already in filtered_headers
-                            if !filtered_headers.contains(&range) {
-                                filtered_headers.push(range);
-                            }
+                            filtered_headers.push(start..start + line.len());
                         }
                     }
                 }
@@ -461,10 +473,7 @@ impl<'a> Payload<'a> {
                                 let header_start = &line[0] as *const u8 as usize;
                                 header_start - block_start
                             };
-                            let range = start..start + line.len();
-                            if !filtered_headers.contains(&range) {
-                                filtered_headers.push(range);
-                            }
+                            filtered_headers.push(start..start + line.len());
                             // Don't break - filter ALL occurrences
                         }
                     }
@@ -499,7 +508,6 @@ impl<'a> Payload<'a> {
                                 extra_header_start - block_start
                             };
                             filtered_headers.push(start..start + line.len());
-                            break;
                         }
                     }
                 }
@@ -663,21 +671,24 @@ impl<'a> Payload<'a> {
 
     /// Find the value of a header by name (case-insensitive).
     /// Returns the header value without the header name prefix.
+    /// If the header appears multiple times, values are combined with commas.
     pub(crate) fn find_header_value(&self, header_name: &[u8]) -> Option<String> {
         let header = &self.internal_buffer[..self.header_length];
         let header_str = std::str::from_utf8(header).ok()?;
-
-        // Create a search pattern like "anthropic-beta: " (case-insensitive)
-        let search_pattern = format!("{}: ", String::from_utf8_lossy(header_name));
+        let header_name = String::from_utf8_lossy(header_name);
+        let mut values = Vec::new();
 
         for line in header_str.split("\r\n") {
-            if line.len() >= search_pattern.len()
-                && line[..search_pattern.len()].eq_ignore_ascii_case(&search_pattern)
-            {
-                return Some(line[search_pattern.len()..].to_string());
+            if let Some(value) = header_value(line, header_name.as_ref()) {
+                values.push(value);
             }
         }
-        None
+
+        match values.as_slice() {
+            [] => None,
+            [value] => Some((*value).to_string()),
+            _ => Some(values.join(", ")),
+        }
     }
 
     pub(crate) async fn next_block(&mut self) -> Result<Option<Cow<'_, [u8]>>, Error> {
@@ -803,14 +814,11 @@ impl<'a> Payload<'a> {
 fn get_host(header: Option<&[u8]>) -> Option<&str> {
     header
         .and_then(|header| std::str::from_utf8(header).ok())
-        .map(|host| {
-            if host.len() >= HEADER_HOST.len()
-                && host[..HEADER_HOST.len()].eq_ignore_ascii_case(HEADER_HOST)
-            {
-                &host[HEADER_HOST.len()..]
-            } else {
-                host
-            }
+        .and_then(|host| match header_value(host, HEADER_HOST) {
+            // Treat an empty Host header as missing so malformed HTTP/1.1 requests still fail fast.
+            Some("") => None,
+            Some(value) => Some(value),
+            None => Some(host),
         })
 }
 
@@ -965,6 +973,7 @@ pub(crate) fn get_req_path(header: &str) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn test_split_host_path() {
@@ -1261,6 +1270,8 @@ mod tests {
         // Test Content-Length header
         assert!(is_header("Content-Length: 100", HEADER_CONTENT_LENGTH));
         assert!(is_header("content-length: 100", HEADER_CONTENT_LENGTH));
+        assert!(is_header("Content-Length:100", HEADER_CONTENT_LENGTH));
+        assert!(is_header("Content-Length:	100", HEADER_CONTENT_LENGTH));
 
         // Test Authorization header
         assert!(is_header(
@@ -1271,6 +1282,10 @@ mod tests {
             "authorization: Bearer token",
             HEADER_AUTHORIZATION
         ));
+        assert!(is_header(
+            "Authorization:Bearer token",
+            HEADER_AUTHORIZATION
+        ));
 
         // Test non-matching headers
         assert!(!is_header("Content-Type: application/json", HEADER_HOST));
@@ -1279,6 +1294,42 @@ mod tests {
         // Test header that's a prefix of another
         assert!(!is_header("Ho", HEADER_HOST));
         assert!(!is_header("Host", HEADER_HOST)); // Missing colon and space
+    }
+
+    #[test]
+    fn test_header_value_accepts_optional_whitespace_after_colon() {
+        assert_eq!(
+            header_value("Host: example.com", HEADER_HOST),
+            Some("example.com")
+        );
+        assert_eq!(
+            header_value("Host:example.com", HEADER_HOST),
+            Some("example.com")
+        );
+        assert_eq!(
+            header_value("Host:	example.com", HEADER_HOST),
+            Some("example.com")
+        );
+        assert_eq!(
+            header_value(
+                "Proxy-Authorization:Bearer secret",
+                HEADER_PROXY_AUTHORIZATION
+            ),
+            Some("Bearer secret")
+        );
+        assert_eq!(header_value("Invalid", HEADER_HOST), None);
+    }
+
+    #[test]
+    fn test_parse_transfer_encoding() {
+        assert_eq!(parse_transfer_encoding("chunked"), Ok(true));
+        assert_eq!(parse_transfer_encoding("Chunked"), Ok(true));
+        assert_eq!(parse_transfer_encoding("CHUNKED"), Ok(true));
+
+        assert_eq!(parse_transfer_encoding("gzip"), Err(()));
+        assert_eq!(parse_transfer_encoding("gzip, chunked"), Err(()));
+        assert_eq!(parse_transfer_encoding("chunked, chunked"), Err(()));
+        assert_eq!(parse_transfer_encoding(""), Err(()));
     }
 
     #[test]
@@ -1337,7 +1388,7 @@ mod tests {
         assert_eq!(result[0], 0..100);
 
         // Test with one filtered header (Host)
-        let filtered = vec![20..40];
+        let filtered: Vec<Range<usize>> = std::iter::once(20..40).collect();
         let result = split_header_chunks(filtered, 100);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], 0..20);
@@ -1443,10 +1494,12 @@ mod tests {
         assert_eq!(get_host(Some(b"Ho")), Some("Ho"));
         assert_eq!(get_host(Some(b"Hos")), Some("Hos"));
         assert_eq!(get_host(Some(b"Host")), Some("Host"));
-        assert_eq!(get_host(Some(b"Host:")), Some("Host:"));
+        assert_eq!(get_host(Some(b"Host:")), None);
 
         // Test input exactly the length of "Host: " prefix (6 chars)
-        assert_eq!(get_host(Some(b"Host: ")), Some(""));
+        assert_eq!(get_host(Some(b"Host: ")), None);
+        assert_eq!(get_host(Some(b"Host:\t")), None);
+        assert_eq!(get_host(Some(b"Host:   ")), None);
 
         // Test with partial prefix match but shorter
         assert_eq!(get_host(Some(b"host")), Some("host"));
@@ -1467,7 +1520,7 @@ mod tests {
     fn test_read_state_copy_clone() {
         let state = ReadState::Start;
         let state_copy = state;
-        let state_clone = state.clone();
+        let state_clone = state;
 
         // Both should be the same variant
         assert!(matches!(state_copy, ReadState::Start));
@@ -1595,6 +1648,97 @@ mod tests {
         assert!(info.auth_header.is_none());
         assert!(info.extra_headers_transformed.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_request_rejects_duplicate_content_length() {
+        let request = b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_duplicate_transfer_encoding() {
+        let request =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_content_length_with_mixed_case_chunked() {
+        let request =
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: Chunked\r\n\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_content_length_with_chunked_without_space() {
+        let request =
+            b"POST / HTTP/1.1\r\nContent-Length:5\r\nTransfer-Encoding:chunked\r\n\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_rejects_content_length_with_chunked_tab_whitespace() {
+        let request =
+            b"POST / HTTP/1.1\r\nContent-Length:\t5\r\nTransfer-Encoding:\tchunked\r\n\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let err = match Request::new(&mut client, 4096).await {
+            Ok(_) => panic!("expected invalid header"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn test_request_accepts_mixed_case_chunked_transfer_encoding() {
+        let request =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+        let request = Request::new(&mut client, 4096).await.unwrap();
+        assert!(matches!(request.payload.body, Body::Unread(_)));
+    }
+
+    #[tokio::test]
+    async fn test_request_treats_empty_host_header_as_missing() {
+        let request = b"GET / HTTP/1.1\r\nHost:   \r\n\r\n";
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        server.write_all(request).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let request = Request::new(&mut client, 4096).await.unwrap();
+        assert_eq!(request.host(), None);
+    }
 }
 
 pub(crate) fn get_auth_query_range(header: &str, key: &str) -> Option<Range<usize>> {
@@ -1638,10 +1782,59 @@ pub(crate) fn get_auth_query_range(header: &str, key: &str) -> Option<Range<usiz
 }
 
 #[inline]
+fn header_name(key: &str) -> &str {
+    key.trim_end_matches([' ', ':'])
+}
+
+#[inline]
+pub(crate) fn header_value<'a>(header: &'a str, key: &str) -> Option<&'a str> {
+    let (name, value) = header.split_once(':')?;
+    if !name.eq_ignore_ascii_case(header_name(key)) {
+        return None;
+    }
+    Some(value.trim_start_matches([' ', '\t']))
+}
+
+#[inline]
+fn header_value_offset(header: &[u8], key: &str) -> Option<usize> {
+    let colon_idx = header.iter().position(|&b| b == b':')?;
+    let name = std::str::from_utf8(&header[..colon_idx]).ok()?;
+    if !name.eq_ignore_ascii_case(header_name(key)) {
+        return None;
+    }
+    let mut value_idx = colon_idx + 1;
+    while value_idx < header.len() && matches!(header[value_idx], b' ' | b'\t') {
+        value_idx += 1;
+    }
+    Some(value_idx)
+}
+
+#[inline]
 pub(crate) fn is_header(header: &str, key: &str) -> bool {
-    // str could cause `not a char boundary` issue, so we use bytes
-    let (header, key) = (header.as_bytes(), key.as_bytes());
-    header.len() >= key.len() && header[..key.len()].eq_ignore_ascii_case(key)
+    header_value(header, key).is_some()
+}
+
+#[inline]
+fn parse_transfer_encoding(value: &str) -> Result<bool, ()> {
+    let mut is_chunked = false;
+
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(());
+        }
+
+        if part.eq_ignore_ascii_case(TRANSFER_ENCODING_CHUNKED) {
+            if is_chunked {
+                return Err(());
+            }
+            is_chunked = true;
+        } else {
+            return Err(());
+        }
+    }
+
+    Ok(is_chunked)
 }
 
 /// Split the header buffer into chunks, excluding the filtered header ranges.
@@ -1652,11 +1845,12 @@ fn split_header_chunks(
     header_length: usize,
 ) -> Vec<Range<usize>> {
     if filtered_headers.is_empty() {
-        return vec![0..header_length];
+        return std::iter::once(0..header_length).collect();
     }
 
-    // Sort by start position
+    // Sort by start position and deduplicate
     filtered_headers.sort_by_key(|r| r.start);
+    filtered_headers.dedup();
 
     let mut chunks = Vec::with_capacity(filtered_headers.len() + 1);
     let mut current_pos = 0;

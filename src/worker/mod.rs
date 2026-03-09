@@ -163,37 +163,42 @@ where
                 // Use auth-during-selection: try to find a provider that authenticates successfully
                 let auth_key = request.auth_key().map(|k| k.to_vec());
                 let p = p.read().await;
-                let (provider, auth_type) = match p.select_provider_with_auth(
-                    &host,
-                    request.path(),
-                    |provider| provider.authenticate_with_type(auth_key.as_deref()),
-                ) {
-                    Ok((provider, auth_type)) => (provider, auth_type),
-                    Err(_) => {
-                        // Check if any provider (ignoring health) can authenticate
-                        // This handles the case where the matching provider exists but is unhealthy
-                        if p.select_provider_with_auth_ignoring_health(
-                            &host,
-                            request.path(),
-                            |provider| provider.authenticate_with_type(auth_key.as_deref()),
-                        ) {
-                            // Provider exists for this key but is unhealthy -> 404
-                            is_not_found = true;
-                            err_msg = Some(Error::NoProviderFound.to_string().into());
-                        } else if p.select_provider(&host, request.path()).is_some() {
-                            // Healthy providers exist but all failed authentication -> 401
-                            #[cfg(debug_assertions)]
-                            log::error!(host = &host, path = request.path(), header:serde = auth_key; "authentication_failed_all_providers");
-                            is_invalid_key = true;
-                            err_msg = Some("authentication failed".into());
-                        } else {
-                            // No providers match the host/path -> 404
-                            is_not_found = true;
-                            err_msg = Some(Error::NoProviderFound.to_string().into());
+                let (provider, auth_type) =
+                    match p.select_provider_with_auth(&host, request.path(), |provider| {
+                        provider.authenticate_with_type(auth_key.as_deref())
+                    }) {
+                        Ok((provider, auth_type)) => (provider, auth_type),
+                        Err(_) => {
+                            // Check if any provider (ignoring health) can authenticate
+                            // This handles the case where the matching provider exists but is unhealthy
+                            if p.select_provider_with_auth_ignoring_health(
+                                &host,
+                                request.path(),
+                                |provider| provider.authenticate_with_type(auth_key.as_deref()),
+                            ) {
+                                // Provider exists for this key but is unhealthy -> 404
+                                is_not_found = true;
+                                err_msg = Some(Error::NoProviderFound.to_string().into());
+                            } else if p.select_provider(&host, request.path()).is_some() {
+                                // Healthy providers exist but all failed authentication -> 401
+                                #[cfg(debug_assertions)]
+                                log::error!(
+                                    host = &host,
+                                    path = request.path(),
+                                    auth_present = auth_key.is_some(),
+                                    auth_len = auth_key.as_ref().map(Vec::len);
+                                    "authentication_failed_all_providers"
+                                );
+                                is_invalid_key = true;
+                                err_msg = Some("authentication failed".into());
+                            } else {
+                                // No providers match the host/path -> 404
+                                is_not_found = true;
+                                err_msg = Some(Error::NoProviderFound.to_string().into());
+                            }
+                            break;
                         }
-                        break;
-                    }
-                };
+                    };
                 request.set_incoming_auth_type(auth_type);
 
                 // Check if this is a CONNECT tunnel request
@@ -580,6 +585,12 @@ where
                         None
                     };
 
+                    let all_auth_header_keys = {
+                        let providers =
+                            p.get_matching_providers(authority.host(), request.uri().path());
+                        collect_auth_header_keys(&providers)
+                    };
+
                     // Use auth-during-selection: try to find a provider that authenticates successfully
                     // For HTTP/2, we need to extract auth info from headers and query params
                     let (provider, incoming_auth_type) = match p.select_provider_with_auth(
@@ -738,12 +749,7 @@ where
                         }
                     }
 
-                    // Collect all auth header keys to filter (lowercase, without ": ")
-                    let auth_header_keys: Vec<String> = provider
-                        .auth_header_keys()
-                        .iter()
-                        .map(|k| k.trim_end_matches([' ', ':']).to_lowercase())
-                        .collect();
+                    let auth_header_keys = all_auth_header_keys;
 
                     let info = UpstreamInfo {
                         endpoint: provider.endpoint().to_string(),
@@ -813,6 +819,7 @@ where
 
 /// Provider information extracted for upstream request handling.
 /// This struct holds all the necessary provider details to avoid passing many parameters.
+#[derive(Clone)]
 struct UpstreamInfo {
     endpoint: String,
     sock_address: String,
@@ -910,18 +917,12 @@ impl UpstreamInfo {
                 upstream_request = upstream_request.header("host", self.host_header_value.as_str());
                 continue;
             }
-            // Skip all auth headers - will be replaced by provider auth
-            if self
-                .auth_header_keys
-                .iter()
-                .any(|k| key_str.eq_ignore_ascii_case(k))
-            {
-                continue; // Will add auth_header below
-            }
-            // Skip extra headers that will be transformed
-            let key_lower = key_str.to_lowercase();
-            if self.extra_header_keys.iter().any(|k| k == &key_lower) {
-                continue; // Will add transformed extra_headers below
+            if should_filter_forwarded_header(
+                key_str,
+                &self.auth_header_keys,
+                &self.extra_header_keys,
+            ) {
+                continue;
             }
             upstream_request = upstream_request.header(key, value);
         }
@@ -1561,73 +1562,16 @@ where
             <P as PoolTrait>::Item::new(endpoint, stream)
         };
 
-        // Build the WebSocket upgrade request with rewritten headers
-        let header_str = std::str::from_utf8(raw_headers).map_err(|_| Error::InvalidHeader)?;
-
-        // Rewrite Host header and Authentication header
-        let mut modified_request = String::with_capacity(raw_headers.len() + 256);
-        let mut first_line = true;
-        let mut auth_written = false;
-
-        for line in header_str.split("\r\n") {
-            if line.is_empty() {
-                break;
-            }
-
-            if first_line {
-                // Request line - strip path prefix if present
-                if let Some(prefix) = path_prefix {
-                    let path_range = http::get_req_path(line);
-                    let path = &line[path_range.clone()];
-                    if let Some(remaining) = path.strip_prefix(prefix) {
-                        // Rewrite the request line with the path prefix removed
-                        let new_path = if remaining.is_empty() { "/" } else { remaining };
-                        modified_request.push_str(&line[..path_range.start]);
-                        modified_request.push_str(new_path);
-                        modified_request.push_str(&line[path_range.end..]);
-                        modified_request.push_str("\r\n");
-                        first_line = false;
-                        continue;
-                    }
-                }
-                // No prefix to strip, keep as is
-                modified_request.push_str(line);
-                modified_request.push_str("\r\n");
-                first_line = false;
-                continue;
-            }
-
-            // Check if this is a header we want to rewrite
-            if http::is_header(line, http::HEADER_HOST) {
-                // Rewrite Host header to provider's endpoint
-                // Note: host_header already includes trailing \r\n
-                modified_request.push_str(host_header);
-            } else if http::is_header(line, http::HEADER_AUTHORIZATION)
-                || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
-                || http::is_header(line, http::HEADER_X_API_KEY)
-            {
-                // Replace authentication header with provider's auth
-                // Note: auth already includes trailing \r\n
-                if !auth_written {
-                    if let Some(auth) = auth_header {
-                        modified_request.push_str(auth);
-                        auth_written = true;
-                    }
-                }
-            } else {
-                // Keep other headers as is
-                modified_request.push_str(line);
-                modified_request.push_str("\r\n");
-            }
-        }
-        modified_request.push_str("\r\n");
+        // Build the WebSocket upgrade request with rewritten headers.
+        let modified_request =
+            rewrite_websocket_upgrade_request(raw_headers, host_header, auth_header, path_prefix)?;
 
         // Send the modified request to upstream
         outgoing.write_all(modified_request.as_bytes()).await?;
         outgoing.flush().await?;
 
         #[cfg(debug_assertions)]
-        log::info!(request = modified_request; "websocket_upgrade_request_sent");
+        log::info!(endpoint = endpoint, bytes = modified_request.len(); "websocket_upgrade_request_sent");
 
         // Read the response from upstream
         let mut response_buf = vec![0u8; max_header_size];
@@ -1747,7 +1691,7 @@ where
         outgoing.flush().await?;
 
         #[cfg(debug_assertions)]
-        log::info!(request = upgrade_request; "h2_websocket_upgrade_request_sent");
+        log::info!(endpoint = endpoint, bytes = upgrade_request.len(); "h2_websocket_upgrade_request_sent");
 
         // Read response from upstream
         let mut response_buf = vec![0u8; max_header_size];
@@ -2210,6 +2154,17 @@ fn is_http2_invalid_headers(key: &str) -> bool {
         || key.eq_ignore_ascii_case("content-length")
 }
 
+fn collect_auth_header_keys(providers: &[&dyn Provider]) -> Vec<String> {
+    let mut auth_header_keys: Vec<String> = providers
+        .iter()
+        .flat_map(|provider| provider.auth_header_keys())
+        .map(|key| key.trim_end_matches([' ', ':']).to_lowercase())
+        .collect();
+    auth_header_keys.sort();
+    auth_header_keys.dedup();
+    auth_header_keys
+}
+
 /// Build upstream path by stripping prefix and replacing auth query param.
 fn build_upstream_path(
     path: &str,
@@ -2232,6 +2187,102 @@ fn build_upstream_path(
     result
 }
 
+#[inline]
+fn is_proxy_authorization_header(key: &str) -> bool {
+    key.eq_ignore_ascii_case("proxy-authorization")
+}
+
+#[inline]
+fn should_filter_forwarded_header(
+    key: &str,
+    auth_header_keys: &[String],
+    extra_header_keys: &[String],
+) -> bool {
+    if is_proxy_authorization_header(key) {
+        return true;
+    }
+
+    if auth_header_keys.iter().any(|k| key.eq_ignore_ascii_case(k)) {
+        return true;
+    }
+
+    let key_lower = key.to_lowercase();
+    extra_header_keys.iter().any(|k| k == &key_lower)
+}
+
+fn rewrite_websocket_upgrade_request(
+    raw_headers: &[u8],
+    host_header: &str,
+    auth_header: Option<&str>,
+    path_prefix: Option<&str>,
+) -> Result<String, Error> {
+    let header_str = std::str::from_utf8(raw_headers).map_err(|_| Error::InvalidHeader)?;
+    let mut modified_request = String::with_capacity(raw_headers.len() + 256);
+    let mut first_line = true;
+    let mut auth_written = false;
+
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            break;
+        }
+
+        if first_line {
+            if let Some(prefix) = path_prefix {
+                let path_range = http::get_req_path(line);
+                let path = &line[path_range.clone()];
+                if let Some(remaining) = path.strip_prefix(prefix) {
+                    let new_path = if remaining.is_empty() { "/" } else { remaining };
+                    modified_request.push_str(&line[..path_range.start]);
+                    modified_request.push_str(new_path);
+                    modified_request.push_str(&line[path_range.end..]);
+                    modified_request.push_str("\r\n");
+                    first_line = false;
+                    continue;
+                }
+            }
+
+            modified_request.push_str(line);
+            modified_request.push_str("\r\n");
+            first_line = false;
+            continue;
+        }
+
+        if http::is_header(line, http::HEADER_HOST) {
+            modified_request.push_str(host_header);
+            continue;
+        }
+
+        if http::is_header(line, http::HEADER_PROXY_AUTHORIZATION) {
+            continue;
+        }
+
+        if http::is_header(line, http::HEADER_AUTHORIZATION)
+            || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
+            || http::is_header(line, http::HEADER_X_API_KEY)
+        {
+            if !auth_written {
+                if let Some(auth) = auth_header {
+                    modified_request.push_str(auth);
+                    auth_written = true;
+                }
+            }
+            continue;
+        }
+
+        modified_request.push_str(line);
+        modified_request.push_str("\r\n");
+    }
+
+    if !auth_written {
+        if let Some(auth) = auth_header {
+            modified_request.push_str(auth);
+        }
+    }
+
+    modified_request.push_str("\r\n");
+    Ok(modified_request)
+}
+
 /// Build HTTP/1.1 request headers string from an iterator of headers.
 /// Filters out auth headers, extra headers, and replaces Host header with the upstream host.
 fn build_h1_request_headers<'a, I>(
@@ -2250,22 +2301,13 @@ where
 
     for (key, value) in headers {
         let key_str = key.as_str();
-        // Skip all auth headers - will be replaced by provider auth
-        if auth_header_keys
-            .iter()
-            .any(|k| key_str.eq_ignore_ascii_case(k))
-        {
+        if should_filter_forwarded_header(key_str, auth_header_keys, extra_header_keys) {
             continue;
         }
         // Replace Host header
         if key_str.eq_ignore_ascii_case("host") {
             req_headers.push_str(&format!("Host: {}\r\n", host_header_value));
             continue;
-        }
-        // Skip extra headers that will be transformed
-        let key_lower = key_str.to_lowercase();
-        if extra_header_keys.iter().any(|k| k == &key_lower) {
-            continue; // Will add transformed extra_headers below
         }
         req_headers.push_str(key_str);
         req_headers.push_str(": ");
@@ -2652,6 +2694,95 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_auth_header_keys_deduplicates_all_matching_providers() {
+        let auth_keys = Arc::new(vec![]);
+        let providers: Vec<Box<dyn Provider>> = vec![
+            crate::provider::new_provider(
+                "openai",
+                "shared.example.com",
+                "api.openai.com",
+                None,
+                true,
+                1.0,
+                0,
+                Some("sk-test"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            crate::provider::new_provider(
+                "anthropic",
+                "shared.example.com",
+                "api.anthropic.com",
+                None,
+                true,
+                1.0,
+                0,
+                Some("ant-test"),
+                Arc::clone(&auth_keys),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        ];
+        let provider_refs: Vec<&dyn Provider> =
+            providers.iter().map(|provider| &**provider).collect();
+        let auth_keys = collect_auth_header_keys(&provider_refs);
+        assert_eq!(
+            auth_keys,
+            vec!["authorization".to_string(), "x-api-key".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_should_filter_forwarded_header() {
+        let auth_keys = vec!["authorization".to_string()];
+        let extra_keys = vec!["anthropic-beta".to_string()];
+
+        assert!(should_filter_forwarded_header(
+            "authorization",
+            &auth_keys,
+            &extra_keys
+        ));
+        assert!(should_filter_forwarded_header(
+            "Proxy-Authorization",
+            &auth_keys,
+            &extra_keys
+        ));
+        assert!(should_filter_forwarded_header(
+            "anthropic-beta",
+            &auth_keys,
+            &extra_keys
+        ));
+        assert!(!should_filter_forwarded_header(
+            "content-type",
+            &auth_keys,
+            &extra_keys
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_websocket_upgrade_request() {
+        let raw = b"GET /prefix/ws HTTP/1.1\r\nHost: client.example.com\r\nAuthorization: Bearer client\r\nProxy-Authorization: Bearer proxy-secret\r\nSec-WebSocket-Key: key\r\n\r\n";
+        let rewritten = rewrite_websocket_upgrade_request(
+            raw,
+            "Host: upstream.example.com\r\n",
+            Some("Authorization: Bearer upstream\r\n"),
+            Some("/prefix"),
+        )
+        .unwrap();
+
+        assert!(rewritten.starts_with("GET /ws HTTP/1.1\r\n"));
+        assert!(rewritten.contains("Host: upstream.example.com\r\n"));
+        assert!(rewritten.contains("Authorization: Bearer upstream\r\n"));
+        assert!(!rewritten.contains("Bearer client"));
+        assert!(!rewritten.contains("proxy-secret"));
+    }
+
+    #[test]
     fn test_build_h1_request_headers() {
         use httplib::header::{HeaderMap, HeaderName, HeaderValue};
 
@@ -2668,6 +2799,10 @@ mod tests {
         headers.insert(
             HeaderName::from_static("authorization"),
             HeaderValue::from_static("Bearer client_token"),
+        );
+        headers.insert(
+            HeaderName::from_static("proxy-authorization"),
+            HeaderValue::from_static("Bearer proxy_secret"),
         );
 
         // Test with auth header replacement and no content-length
@@ -2688,6 +2823,7 @@ mod tests {
         assert!(result.contains("Transfer-Encoding: chunked\r\n"));
         // Should NOT contain the client's authorization
         assert!(!result.contains("Bearer client_token"));
+        assert!(!result.contains("proxy_secret"));
 
         // Test with content-length (no Transfer-Encoding)
         let result_with_cl = build_h1_request_headers(
@@ -2715,6 +2851,7 @@ mod tests {
         );
 
         assert!(result_no_auth.contains("authorization: Bearer client_token\r\n"));
+        assert!(!result_no_auth.contains("proxy_secret"));
 
         // Test with extra headers filtering and transformation
         let mut headers_with_extra = HeaderMap::new();
@@ -2906,5 +3043,135 @@ providers:
             .unwrap();
         assert!(req_str.starts_with("GET /test HTTP/1.1\r\n"));
         assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_h2_filters_matching_provider_auth_headers_on_h2_upstream() {
+        use std::collections::HashMap;
+
+        use tokio::time::{timeout, Duration};
+
+        // Build an in-memory HTTP/2 upstream so we can verify forwarded headers directly
+        // without depending on TLS trust for a local self-signed certificate.
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(64 * 1024);
+        let (upstream_send_request, upstream_client_conn) =
+            h2::client::handshake(upstream_client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = upstream_client_conn.await;
+        });
+        let h2conn = crate::h2client::H2Connection::new(upstream_send_request, "upstream.local");
+
+        let (captured_tx, captured_rx) =
+            tokio::sync::oneshot::channel::<(String, HashMap<String, Vec<String>>)>();
+        tokio::spawn(async move {
+            let mut upstream = h2::server::handshake(upstream_server_io).await.unwrap();
+            let mut captured_tx = Some(captured_tx);
+            while let Some(next) = upstream.accept().await {
+                let (request, mut respond) = next.unwrap();
+                let tx = captured_tx.take();
+
+                tokio::spawn(async move {
+                    let path = request
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    let mut headers = HashMap::<String, Vec<String>>::new();
+                    for (name, value) in request.headers() {
+                        headers
+                            .entry(name.as_str().to_string())
+                            .or_default()
+                            .push(value.to_str().unwrap().to_string());
+                    }
+                    if let Some(tx) = tx {
+                        let _ = tx.send((path, headers));
+                    }
+
+                    let response = httplib::Response::builder()
+                        .status(200)
+                        .version(httplib::Version::HTTP_2)
+                        .header("content-type", "application/json")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    send.send_data(bytes::Bytes::from_static(b"{}"), true)
+                        .unwrap();
+                });
+            }
+        });
+
+        let info = UpstreamInfo {
+            endpoint: "upstream.local".to_string(),
+            sock_address: "unused".to_string(),
+            use_tls: true,
+            max_header_size: 4096,
+            host_header_value: "upstream.local".to_string(),
+            auth_header: Some("Authorization: Bearer sk-upstream\r\n".to_string()),
+            auth_header_keys: vec!["authorization".to_string(), "x-api-key".to_string()],
+            path_prefix: None,
+            api_key: None,
+            auth_query_key: None,
+            extra_header_keys: vec![],
+            extra_headers_transformed: vec![],
+        };
+
+        let (client_io, proxy_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        tokio::spawn(async move {
+            let mut proxy = h2::server::handshake(proxy_io).await.unwrap();
+            while let Some(next) = proxy.accept().await {
+                let (request, respond) = next.unwrap();
+                let info = info.clone();
+                let h2conn = h2conn.clone();
+                tokio::spawn(async move {
+                    info.proxy_h2(h2conn, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::GET)
+            .uri("https://shared-auth-h2.local/v1/test")
+            .header("host", "shared-auth-h2.local")
+            .header("authorization", "Bearer shared-auth-key")
+            .header("x-api-key", "shared-auth-key")
+            .header("proxy-authorization", "Bearer proxy-secret")
+            .body(())
+            .unwrap();
+        let (response_fut, _send_stream) = client.send_request(request, true).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let mut body = response.into_body();
+        let collected = timeout(Duration::from_secs(2), async {
+            let mut collected = Vec::new();
+            while let Some(chunk) = body.data().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            collected
+        })
+        .await
+        .expect("timeout reading h2 body");
+        assert_eq!(collected, b"{}");
+
+        let (path, headers) = timeout(Duration::from_secs(2), captured_rx)
+            .await
+            .expect("upstream was not contacted")
+            .unwrap();
+        assert_eq!(path, "/v1/test");
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&vec!["Bearer sk-upstream".to_string()])
+        );
+        assert!(!headers.contains_key("x-api-key"));
+        assert!(!headers.contains_key("proxy-authorization"));
     }
 }
