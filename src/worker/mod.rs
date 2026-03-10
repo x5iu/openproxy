@@ -1095,6 +1095,7 @@ impl UpstreamInfo {
         // Build HTTP/1.1 request headers.
         // Security: when falling back from HTTP/2 to HTTP/1.1, we MUST rebuild H1 framing
         // ourselves instead of trusting client-supplied Content-Length/Transfer-Encoding.
+        // Request trailers are intentionally not forwarded on this fallback path.
         let req_headers = build_h1_request_headers(
             request.headers().iter(),
             &self.host_header_value,
@@ -3203,6 +3204,42 @@ providers:
 
         let body_start = find_header_end(&req_bytes).unwrap() + 4;
         assert_eq!(&req_bytes[body_start..], b"a\r\nabcdefghij\r\n0\r\n\r\n");
+    }
+
+    #[test]
+    fn test_build_h1_request_headers_ignores_bogus_client_content_length() {
+        use httplib::header::{HeaderMap, HeaderName, HeaderValue};
+
+        // Coverage intent: HTTP/2 enforces Content-Length consistency before requests reach the
+        // fallback proxy path. This locks the remaining invariant at the header-rebuild layer:
+        // even if a stale or malicious client Content-Length is present, fallback strips it and
+        // derives framing from actual body presence instead.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_static("999"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/octet-stream"),
+        );
+
+        let result = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            &[],
+            None,
+            true,
+            &[],
+            &[],
+        );
+
+        assert!(result.contains("Host: upstream.example.com\r\n"));
+        assert!(result.contains("Connection: keep-alive\r\n"));
+        assert!(result.contains("content-type: application/octet-stream\r\n"));
+        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!result.contains("content-length: 999\r\n"));
+        assert!(!result.contains("content-length:"));
     }
 
     #[tokio::test]
