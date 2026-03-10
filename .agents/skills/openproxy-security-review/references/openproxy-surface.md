@@ -54,7 +54,7 @@ Use this file when you need the project-specific security model instead of gener
 - CONNECT validates requested port against provider port when the client supplied a port.
 - CONNECT may forward preread bytes, including TLS ClientHello.
 - H2 upstream is attempted only over TLS with ALPN `h2`; otherwise fallback is HTTP/1.1.
-- H2 to H1 fallback must preserve auth filtering, rewritten path, and body framing.
+- H2 to H1 fallback must preserve auth filtering and rewritten path, rebuild HTTP/1.1 framing without trusting client-supplied `Content-Length` or `Transfer-Encoding`, and does not forward request trailers on the fallback path.
 - WebSocket is supported in HTTP/1.1 upgrade flow and H2 extended CONNECT flow.
 
 ### Reload and upgrade
@@ -110,7 +110,7 @@ Use this file when you need the project-specific security model instead of gener
 - `src/lib.rs`
   Fallback, priority, weighted selection, auth-during-selection, YAML merge behavior, header-size bounds.
 - `src/worker/mod.rs`
-  H2 fallback request rebuilding, auth-header filtering on H2 upstream, WebSocket request rewrite, auth-header collection.
+  H2 fallback request rebuilding and framing distrust (including stripped client `Content-Length`/`Transfer-Encoding` cases), auth-header filtering on H2 upstream, WebSocket request rewrite, auth-header collection.
 - `src/h2client/mod.rs`
   ALPN fallback behavior and H2 pool behavior.
 

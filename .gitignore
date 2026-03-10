@@ -2,5 +2,6 @@
 /.idea
 /.vscode
 /.claude
-/.script
+/.script/*
+!/.script/run_review_checks.sh
 e2e/__pycache__/

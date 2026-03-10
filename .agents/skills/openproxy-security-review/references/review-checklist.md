@@ -36,6 +36,8 @@
   auth filtering
   extra-header transform
   framing and body integrity
+  stripping of client-supplied `Content-Length`/`Transfer-Encoding`
+  non-forwarding of request trailers unless they are intentionally and safely re-encoded
 - Confirm CONNECT still validates target and only works when enabled.
 - Confirm WebSocket upgrade code preserves handshake requirements without leaking client auth upstream.
 

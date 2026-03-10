@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+**IMPORTANT: if `AskUserQuestion` tool exists, use it to ask me question or confirm anything.**
+
 ## Project Structure & Module Organization
 `openproxy` is a Rust 2021 project centered in `src/`:
 - `src/main.rs`: CLI entrypoint (`openproxy start -c ...`), PID file handling, and signal-driven reload/hot-upgrade.
@@ -10,7 +12,7 @@
 - `src/h2client/`, `src/websocket/`, `src/executor/`: upstream HTTP/2 client/pool, WebSocket proxy helpers, and connection pooling/health checks.
 
 Top-level support files:
-- `README.md`: user-facing config and deployment documentation, including `forward` provider transparency/auth semantics and HTTP/2→HTTP/1.1 fallback framing behavior.
+- `README.md`: user-facing config and deployment documentation, including `forward` provider transparency/auth semantics and HTTP/2→HTTP/1.1 fallback framing/trailer behavior.
 - `Dockerfile`: container image build.
 - `.github/workflows/e2e.yml`: Rust unit tests plus secret-backed E2E coverage.
 - `.github/workflows/security.yml`: cargo-audit, CodeQL, Gitleaks, Semgrep, Scorecard, and Trivy.
@@ -24,6 +26,7 @@ End-to-end tests live in `e2e/` as `test_*.py` files, with helpers like `e2e/web
 - `cargo test --lib --verbose`: run Rust unit/integration tests (CI baseline).
 - `cargo test`: run all Rust tests.
 - `cargo fmt --all` and `cargo clippy --all-targets --all-features`: formatting and lint checks before opening a PR.
+- `.script/run_review_checks.sh .`: local security-review baseline (`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --lib --verbose`, `cargo audit`).
 - `docker build -t openproxy .`: build the local container image from `Dockerfile`.
 
 For E2E tests:
@@ -49,7 +52,7 @@ No explicit coverage threshold is enforced, but PRs should include:
 - targeted E2E coverage for protocol, auth, reload, or hot-upgrade behavior changes
 - for auth/header-filtering regressions, prefer focused E2E scripts in `e2e/` such as `test_proxy_authorization_filtering.py`, `test_h2_auth_header_filtering.py`, `test_duplicate_extra_header_filtering.py`, `test_no_auth_keys_filtering.py`, and `test_strict_http_parsing.py`; cover the HTTP/2 upstream forwarding path with Rust unit tests in `src/worker/mod.rs`
 - for provider selection/path rewrite changes, look at `test_auth_selection.py`, `test_rewrite_auth_selection.py`, `test_provider_priority.py`, and `test_host_path.py`
-- for protocol behavior changes, look at `test_http.py`, `test_https.py`, `test_h2_upstream.py`, `test_h2_large_body.py`, `test_h2_h1_fallback.py`, `test_h2_h1_fallback_framing.py`, `test_connect_tunnel.py`, and `test_websocket.py`
+- for protocol behavior changes, look at `test_http.py`, `test_https.py`, `test_h2_upstream.py`, `test_h2_large_body.py`, `test_h2_h1_fallback.py`, `test_h2_h1_fallback_framing.py`, `test_connect_tunnel.py`, and `test_websocket.py`; pair H2→H1 framing changes with Rust unit tests in `src/worker/mod.rs` that inspect stripped client framing headers and forwarded body bytes
 - for reload, hot-upgrade, or dynamic credential changes, look at `test_sighup_reload.py`, `test_hot_upgrade.py`, `test_openai_dynamic_api_key.py`, `test_anthropic_oauth.py`, and `test_health_check_auth.py`
 
 ## Commit & Pull Request Guidelines
