@@ -54,7 +54,8 @@ Use this file when you need the project-specific security model instead of gener
 - CONNECT validates requested port against provider port when the client supplied a port.
 - CONNECT may forward preread bytes, including TLS ClientHello.
 - H2 upstream is attempted only over TLS with ALPN `h2`; otherwise fallback is HTTP/1.1.
-- H2 to H1 fallback must preserve auth filtering and rewritten path, rebuild HTTP/1.1 framing without trusting client-supplied `Content-Length` or `Transfer-Encoding`, and does not forward request trailers on the fallback path.
+- OpenProxy ignores HTTP request and response trailers across HTTP/1.1 and HTTP/2: it strips `TE` / `Trailer`, drains H1 trailer-part and H2 trailing HEADERS, and never forwards trailer metadata.
+- H2 to H1 fallback must preserve auth filtering and rewritten path, rebuild HTTP/1.1 framing without trusting client-supplied `Content-Length` or `Transfer-Encoding`, and keep the same trailer-ignore behavior.
 - WebSocket is supported in HTTP/1.1 upgrade flow and H2 extended CONNECT flow.
 
 ### Reload and upgrade
@@ -133,6 +134,7 @@ Do not run these locally. Use them to judge whether CI coverage is sufficient.
   `e2e/test_https.py`
   `e2e/test_h2_upstream.py`
   `e2e/test_h2_large_body.py`
+  `e2e/test_h1_trailers.py`
   `e2e/test_h2_h1_fallback.py`
   `e2e/test_h2_h1_fallback_framing.py`
   `e2e/test_connect_tunnel.py`

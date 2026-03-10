@@ -37,7 +37,8 @@
   extra-header transform
   framing and body integrity
   stripping of client-supplied `Content-Length`/`Transfer-Encoding`
-  non-forwarding of request trailers unless they are intentionally and safely re-encoded
+  stripping of `TE` / `Trailer`
+  draining and dropping of request/response trailers rather than forwarding them
 - Confirm CONNECT still validates target and only works when enabled.
 - Confirm WebSocket upgrade code preserves handshake requirements without leaking client auth upstream.
 

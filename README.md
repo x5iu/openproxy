@@ -213,7 +213,8 @@ providers:
 
   # Forward Provider (Transparent Proxy)
   # Forwards requests to the endpoint without any authentication transformation.
-  # Client headers (including Authorization) are passed through as-is.
+  # Client headers (including Authorization) are passed through as-is, except that
+  # HTTP trailer metadata is ignored on all proxy paths.
   # NOTE: `forward` is intentionally transparent and does NOT inherit top-level
   # or provider-level `auth_keys`. Protect it with an external auth layer if needed.
   # Useful for proxying to internal services or custom endpoints.
@@ -250,7 +251,7 @@ This means `priority` decides the tier, while `weight` only distributes traffic 
 
 - Top-level `auth_keys` applies to provider types that perform client authentication: `openai`, `gemini`, and `anthropic`.
 - Provider-level `auth_keys` applies only to that specific authenticating provider.
-- The `forward` provider is intentionally transparent: it forwards client headers as-is and does **not** inherit top-level or provider-level `auth_keys`.
+- The `forward` provider is intentionally transparent for normal request/response headers and bodies: it forwards client headers as-is, does **not** inherit top-level or provider-level `auth_keys`, and still follows the global trailer policy below.
 - During auth-based selection, OpenProxy can still fall back to a lower-priority matching provider if higher-priority providers are unhealthy or reject the presented client credentials.
 
 ## Usage
@@ -426,9 +427,9 @@ ws.close()
 ## Security
 
 - **TLS 1.3**: Modern encryption standards with forward secrecy
-- **Credential Isolation**: Client authentication headers are never forwarded to upstream providers. The proxy strips client credentials and injects the provider's own `api_key` instead, preventing credential leakage. The `forward` provider type is the exception — it passes all client headers through as-is for transparent proxying.
+- **Credential Isolation**: Client authentication headers are never forwarded to upstream providers. The proxy strips client credentials and injects the provider's own `api_key` instead, preventing credential leakage. The `forward` provider type is the exception for normal request/response headers — it stays transparent for those headers while still following the global trailer-ignore policy below.
 - **API Key Validation**: Multi-layer authentication system with global and per-provider keys for `openai`, `gemini`, and `anthropic` providers; `forward` remains transparent by design
-- **Safe H2→H1 Fallback Framing**: When an HTTP/2 client request is forwarded to an HTTP/1.1 upstream, OpenProxy rebuilds the HTTP/1.1 body framing itself, streams body-bearing fallback requests as chunked, does not forward client-supplied `Content-Length` or `Transfer-Encoding`, and does not forward HTTP/2 request trailers on the fallback path.
+- **Trailer-Neutral Proxying**: OpenProxy ignores all HTTP request and response trailers across HTTP/1.1 and HTTP/2. It strips `TE` / `Trailer` declaration headers, drains trailer blocks or H2 trailing HEADERS so keep-alive connections stay clean, and never forwards trailer metadata to either side. On H2→H1 fallback, it also rebuilds the HTTP/1.1 body framing itself instead of trusting client-supplied `Content-Length` or `Transfer-Encoding`.
 - **No Key Logging**: Secure handling of sensitive credentials
 - **Constant-Time Comparison**: API key validation uses constant-time comparison to prevent timing attacks
 

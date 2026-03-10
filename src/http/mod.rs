@@ -23,6 +23,8 @@ pub(crate) const HEADER_PROXY_AUTHORIZATION: &str = "Proxy-Authorization: ";
 pub(crate) const HEADER_X_GOOG_API_KEY: &str = "x-goog-api-key: ";
 pub(crate) const HEADER_X_API_KEY: &str = "X-API-Key: ";
 const HEADER_CONNECTION: &str = "Connection: ";
+const HEADER_TE: &str = "TE: ";
+const HEADER_TRAILER: &str = "Trailer: ";
 const HEADER_UPGRADE: &str = "Upgrade: ";
 const HEADER_SEC_WEBSOCKET_KEY: &str = "Sec-WebSocket-Key: ";
 const HEADER_SEC_WEBSOCKET_VERSION: &str = "Sec-WebSocket-Version: ";
@@ -231,18 +233,17 @@ impl<'a> Payload<'a> {
         ) -> Result<(Vec<usize>, usize), Error> {
             let mut n = 0;
             loop {
-                n += match pin!(&mut *stream).read(&mut block[n..]).await {
+                if n >= block.len() {
+                    return Err(Error::HeaderTooLarge);
+                }
+                n += match pin!(&mut *stream).read(&mut block[n..n + 1]).await {
                     Ok(0) => return Err(Error::InvalidHeader),
                     Ok(n) => n,
                     Err(e) => return Err(e.into()),
                 };
                 if let Some(crlfs) = find_crlfs(&block[..n]) {
                     return Ok((crlfs, n));
-                } else if n >= block.len() {
-                    return Err(Error::HeaderTooLarge);
-                } else {
-                    continue;
-                };
+                }
             }
         }
         let mut block = vec![0; buffer_size].into_boxed_slice();
@@ -314,6 +315,13 @@ impl<'a> Payload<'a> {
                 {
                     is_connection_upgrade = true;
                 }
+            } else if is_header(header, HEADER_TE) || is_header(header, HEADER_TRAILER) {
+                let start = {
+                    let block_start = &block[0] as *const u8 as usize;
+                    let header_start = &line[0] as *const u8 as usize;
+                    header_start - block_start
+                };
+                filtered_headers.push(start..start + line.len());
             } else if let Some(upgrade_value) = header_value(header, HEADER_UPGRADE) {
                 if upgrade_value
                     .split(',')
@@ -973,7 +981,76 @@ pub(crate) fn get_req_path(header: &str) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn load_http_test_program() {
+        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        INIT.get_or_init(|| async {
+            if crate::PROGRAM.get().is_none() {
+                let config = r#"http_port: 8080
+providers:
+  - type: openai
+    host: route.example.com
+    endpoint: api.openai.com
+    api_key: sk-test
+"#;
+                let mut file = NamedTempFile::new().unwrap();
+                file.write_all(config.as_bytes()).unwrap();
+                file.flush().unwrap();
+                crate::load_config(file.path(), true).await.unwrap();
+            }
+        })
+        .await;
+    }
+
+    fn test_provider_info(host_header: &str) -> ProviderInfo {
+        ProviderInfo {
+            first_block_rewrite: None,
+            host_header: host_header.to_string(),
+            auth_header: None,
+            extra_headers_transformed: vec![],
+        }
+    }
+
+    async fn forward_request(raw: &[u8], host_header: &str) -> Vec<u8> {
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        server.write_all(raw).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut request = Request::new(&mut client, 4096).await.unwrap();
+        request.set_provider_info(test_provider_info(host_header));
+
+        let (mut outgoing, mut capture) = tokio::io::duplex(16 * 1024);
+        let capture_task = tokio::spawn(async move {
+            let mut out = Vec::new();
+            capture.read_to_end(&mut out).await.unwrap();
+            out
+        });
+
+        request.write_to(&mut outgoing).await.unwrap();
+        drop(outgoing);
+        capture_task.await.unwrap()
+    }
+
+    async fn forward_response(raw: &[u8]) -> Vec<u8> {
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        server.write_all(raw).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut response = Response::new(&mut client, 4096).await.unwrap();
+        let (mut outgoing, mut capture) = tokio::io::duplex(16 * 1024);
+        let capture_task = tokio::spawn(async move {
+            let mut out = Vec::new();
+            capture.read_to_end(&mut out).await.unwrap();
+            out
+        });
+
+        response.write_to(&mut outgoing).await.unwrap();
+        drop(outgoing);
+        capture_task.await.unwrap()
+    }
 
     #[test]
     fn test_split_host_path() {
@@ -1537,6 +1614,8 @@ mod tests {
         assert_eq!(HEADER_CONTENT_LENGTH, "Content-Length: ");
         assert_eq!(HEADER_TRANSFER_ENCODING, "Transfer-Encoding: ");
         assert_eq!(HEADER_CONNECTION, "Connection: ");
+        assert_eq!(HEADER_TE, "TE: ");
+        assert_eq!(HEADER_TRAILER, "Trailer: ");
         assert_eq!(QUERY_KEY_KEY, "key");
     }
 
@@ -1738,6 +1817,92 @@ mod tests {
 
         let request = Request::new(&mut client, 4096).await.unwrap();
         assert_eq!(request.host(), None);
+    }
+
+    #[tokio::test]
+    async fn test_request_write_to_strips_te_and_trailer_and_drops_chunked_trailers() {
+        load_http_test_program().await;
+        let forwarded = forward_request(
+            b"POST /v1/test HTTP/1.1\r\nHost: route.example.com\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\nTrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n",
+            "Host: upstream.example.com\r\n",
+        )
+        .await;
+        let forwarded = String::from_utf8_lossy(&forwarded);
+
+        assert!(forwarded.starts_with("POST /v1/test HTTP/1.1\r\n"));
+        assert!(forwarded.contains("Host: upstream.example.com\r\n"));
+        assert!(forwarded.contains("Connection: keep-alive\r\n"));
+        assert!(forwarded.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!forwarded.contains("TE: trailers\r\n"));
+        assert!(!forwarded.contains("Trailer: x-checksum\r\n"));
+        assert!(!forwarded.contains("x-checksum: abc123\r\n"));
+        assert!(forwarded.ends_with("5\r\nhello\r\n0\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_response_write_to_strips_te_and_trailer_and_drops_chunked_trailers() {
+        let forwarded = forward_response(
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nTE: trailers\r\nTrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n",
+        )
+        .await;
+        let forwarded = String::from_utf8_lossy(&forwarded);
+
+        assert!(forwarded.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(forwarded.contains("Connection: keep-alive\r\n"));
+        assert!(forwarded.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!forwarded.contains("TE: trailers\r\n"));
+        assert!(!forwarded.contains("Trailer: x-checksum\r\n"));
+        assert!(!forwarded.contains("x-checksum: abc123\r\n"));
+        assert!(forwarded.ends_with("5\r\nhello\r\n0\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_request_chunked_trailers_do_not_pollute_next_request() {
+        load_http_test_program().await;
+        let first = b"POST /first HTTP/1.1\r\nHost: route.example.com\r\nTransfer-Encoding: chunked\r\nTrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: first\r\n\r\n";
+        let second = b"GET /second HTTP/1.1\r\nHost: route.example.com\r\n\r\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(first);
+        raw.extend_from_slice(second);
+
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        server.write_all(&raw).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut first_request = Request::new(&mut client, 4096).await.unwrap();
+        first_request.set_provider_info(test_provider_info("Host: upstream.example.com\r\n"));
+        let mut sink = tokio::io::sink();
+        first_request.write_to(&mut sink).await.unwrap();
+        drop(first_request);
+
+        let second_request = Request::new(&mut client, 4096).await.unwrap();
+        assert_eq!(second_request.method(), "GET");
+        assert_eq!(second_request.path(), "/second");
+        assert_eq!(second_request.host(), Some("route.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_response_chunked_trailers_do_not_pollute_next_response() {
+        let first = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nTrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: first\r\n\r\n";
+        let second = b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(first);
+        raw.extend_from_slice(second);
+
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        server.write_all(&raw).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut first_response = Response::new(&mut client, 4096).await.unwrap();
+        let mut sink = tokio::io::sink();
+        first_response.write_to(&mut sink).await.unwrap();
+        drop(first_response);
+
+        let second_response = Response::new(&mut client, 4096).await.unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut parser = httparse::Response::new(&mut headers);
+        parser.parse(second_response.payload.block()).unwrap();
+        assert_eq!(parser.code, Some(204));
     }
 }
 
