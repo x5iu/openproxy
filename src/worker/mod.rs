@@ -2203,6 +2203,7 @@ fn is_h1_framing_or_hop_by_hop_header(key: &str) -> bool {
         || key.eq_ignore_ascii_case("content-length")
         || key.eq_ignore_ascii_case("transfer-encoding")
         || key.eq_ignore_ascii_case("proxy-connection")
+        || key.eq_ignore_ascii_case("proxy-authorization")
         || key.eq_ignore_ascii_case("keep-alive")
         || key.eq_ignore_ascii_case("te")
         || key.eq_ignore_ascii_case("trailer")
