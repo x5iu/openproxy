@@ -428,7 +428,7 @@ ws.close()
 - **TLS 1.3**: Modern encryption standards with forward secrecy
 - **Credential Isolation**: Client authentication headers are never forwarded to upstream providers. The proxy strips client credentials and injects the provider's own `api_key` instead, preventing credential leakage. The `forward` provider type is the exception — it passes all client headers through as-is for transparent proxying.
 - **API Key Validation**: Multi-layer authentication system with global and per-provider keys for `openai`, `gemini`, and `anthropic` providers; `forward` remains transparent by design
-- **Safe H2→H1 Fallback Framing**: When an HTTP/2 client request is forwarded to an HTTP/1.1 upstream, OpenProxy rebuilds the HTTP/1.1 body framing itself and does not forward client-supplied `Content-Length` or `Transfer-Encoding`.
+- **Safe H2→H1 Fallback Framing**: When an HTTP/2 client request is forwarded to an HTTP/1.1 upstream, OpenProxy rebuilds the HTTP/1.1 body framing itself, streams body-bearing fallback requests as chunked, does not forward client-supplied `Content-Length` or `Transfer-Encoding`, and does not forward HTTP/2 request trailers on the fallback path.
 - **No Key Logging**: Secure handling of sensitive credentials
 - **Constant-Time Comparison**: API key validation uses constant-time comparison to prevent timing attacks
 
