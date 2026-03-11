@@ -4,7 +4,81 @@ use std::task::{Context, Poll};
 
 use super::CRLF;
 
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+
+pub trait AsyncBufReadStream: AsyncRead + AsyncBufRead + Unpin + Send + Sync {}
+
+impl<T> AsyncBufReadStream for T where T: AsyncRead + AsyncBufRead + Unpin + Send + Sync {}
+
+pub struct PrefixBufReader<R> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: R,
+}
+
+impl<R> PrefixBufReader<R> {
+    pub fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for PrefixBufReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.pos < self.prefix.len() {
+            let remaining = self.prefix.len() - self.pos;
+            let to_copy = remaining.min(buf.remaining());
+            let start = self.pos;
+            let end = start + to_copy;
+            buf.put_slice(&self.prefix[start..end]);
+            self.pos = end;
+            if self.pos >= self.prefix.len() {
+                self.prefix.clear();
+                self.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        pin!(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncBufRead + Unpin + Send + Sync> AsyncBufRead for PrefixBufReader<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.get_mut();
+        if me.pos < me.prefix.len() {
+            return Poll::Ready(Ok(&me.prefix[me.pos..]));
+        }
+        Pin::new(&mut me.inner).poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        if me.pos < me.prefix.len() {
+            let remaining = me.prefix.len() - me.pos;
+            let consumed = amt.min(remaining);
+            me.pos += consumed;
+            if me.pos >= me.prefix.len() {
+                me.prefix.clear();
+                me.pos = 0;
+            }
+            if amt > consumed {
+                Pin::new(&mut me.inner).consume(amt - consumed);
+            }
+            return;
+        }
+        Pin::new(&mut me.inner).consume(amt);
+    }
+}
 
 pub struct LimitedReader<R> {
     reader: R,
@@ -175,7 +249,7 @@ pub struct ChunkedReader<R> {
     line_buf: Vec<u8>,
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
+impl<R: AsyncBufRead + Unpin + Send + Sync> ChunkedReader<R> {
     const MAX_LINE_SIZE: usize = 4096;
 
     pub fn new(reader: R) -> Self {
@@ -239,56 +313,55 @@ impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
             .map_err(|_| io::Error::other(format!("invalid chunk length: \"{}\"", length_str)))
     }
 
-    #[inline]
-    fn poll_read_byte(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<u8>> {
-        let mut byte = [0u8; 1];
-        let mut buf = ReadBuf::new(&mut byte);
-        match pin!(&mut self.reader).poll_read(cx, &mut buf)? {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(()) => {
-                if buf.filled().is_empty() {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "unexpected EOF",
-                    )))
-                } else {
-                    Poll::Ready(Ok(byte[0]))
-                }
-            }
-        }
-    }
-
     fn poll_read_line(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
         loop {
-            if self.line_buf.ends_with(CRLF) {
-                let line = self.line_buf[..self.line_buf.len() - CRLF.len()].to_vec();
-                self.line_buf.clear();
-                return Poll::Ready(Ok(line));
-            }
-            if self.line_buf.len() >= Self::MAX_LINE_SIZE {
-                return Poll::Ready(Err(io::Error::other(format!(
-                    "header line too long: scanned {} bytes without CRLF (capacity {})",
-                    self.line_buf.len(),
-                    Self::MAX_LINE_SIZE
-                ))));
-            }
-            let byte = match self.poll_read_byte(cx) {
-                Poll::Ready(Ok(byte)) => byte,
+            let buffer = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+                Poll::Ready(Ok(buffer)) => buffer,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             };
-            self.line_buf.push(byte);
+            if buffer.is_empty() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                )));
+            }
+            if let Some(idx) = buffer.windows(CRLF.len()).position(|window| window == CRLF) {
+                self.line_buf.extend_from_slice(&buffer[..idx]);
+                Pin::new(&mut self.reader).consume(idx + CRLF.len());
+                let line = std::mem::take(&mut self.line_buf);
+                return Poll::Ready(Ok(line));
+            }
+            let total = self.line_buf.len() + buffer.len();
+            if total >= Self::MAX_LINE_SIZE {
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "header line too long: scanned {} bytes without CRLF (capacity {})",
+                    total,
+                    Self::MAX_LINE_SIZE
+                ))));
+            }
+            self.line_buf.extend_from_slice(buffer);
+            let consumed = buffer.len();
+            Pin::new(&mut self.reader).consume(consumed);
         }
     }
 
     fn poll_expect_crlf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.line_buf.len() < CRLF.len() {
-            let byte = match self.poll_read_byte(cx) {
-                Poll::Ready(Ok(byte)) => byte,
+            let buffer = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+                Poll::Ready(Ok(buffer)) => buffer,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             };
-            self.line_buf.push(byte);
+            if buffer.is_empty() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF",
+                )));
+            }
+            let to_copy = (CRLF.len() - self.line_buf.len()).min(buffer.len());
+            self.line_buf.extend_from_slice(&buffer[..to_copy]);
+            Pin::new(&mut self.reader).consume(to_copy);
         }
         if self.line_buf.as_slice() != CRLF {
             self.line_buf.clear();
@@ -393,7 +466,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedReader<R> {
+impl<R: AsyncBufRead + Unpin + Send + Sync> AsyncRead for ChunkedReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -413,13 +486,12 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedReader<R> {
     }
 }
 
-#[cfg(test)]
 pub(crate) mod buf_reader {
     use std::io::{self};
     use std::pin::{pin, Pin};
     use std::task::{Context, Poll};
 
-    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+    use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
     pub(crate) struct BufReader<R: ?Sized> {
         buf: Vec<u8>,
@@ -432,10 +504,12 @@ pub(crate) mod buf_reader {
             Self { buf, inner }
         }
 
+        #[cfg(test)]
         pub(crate) fn capacity(&self) -> usize {
             self.buf.capacity()
         }
 
+        #[cfg(test)]
         pub(crate) fn buffer(&self) -> &[u8] {
             &self.buf[..]
         }
@@ -463,33 +537,45 @@ pub(crate) mod buf_reader {
         }
     }
 
+    impl<R: AsyncWrite + Unpin + Send + Sync> AsyncWrite for BufReader<R> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            pin!(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            pin!(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            pin!(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
     impl<R: AsyncRead + Unpin + Send + Sync> AsyncBufRead for BufReader<R> {
         fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
             let me = self.get_mut();
-            let (len, cap) = (me.buf.len(), me.buf.capacity());
-            if len < cap {
+            if me.buf.is_empty() {
+                let cap = me.buf.capacity();
                 // SAFETY: temporarily extend the buffer, then truncate based on actual bytes read.
                 unsafe {
                     me.buf.set_len(cap);
                 }
-                let mut buf = ReadBuf::new(&mut me.buf[len..cap]);
+                let mut buf = ReadBuf::new(&mut me.buf[..cap]);
                 match pin!(&mut me.inner).poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(())) => {
                         let n = buf.filled().len();
-                        me.buf.truncate(len + n);
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF",
-                            )));
-                        }
+                        me.buf.truncate(n);
                     }
                     Poll::Ready(Err(e)) => {
-                        me.buf.truncate(len);
+                        me.buf.truncate(0);
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
-                        me.buf.truncate(len);
+                        me.buf.truncate(0);
                         return Poll::Pending;
                     }
                 }
@@ -510,7 +596,7 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, ReadBuf};
 
     struct MemReader {
         data: Vec<u8>,
@@ -541,6 +627,17 @@ mod tests {
             buf.advance(to_copy);
             self.pos = end;
             Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncBufRead for MemReader {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            let me = self.get_mut();
+            Poll::Ready(Ok(&me.data[me.pos..]))
+        }
+
+        fn consume(mut self: Pin<&mut Self>, amt: usize) {
+            self.pos = (self.pos + amt).min(self.data.len());
         }
     }
 

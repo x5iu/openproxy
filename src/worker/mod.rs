@@ -6,7 +6,7 @@ use std::pin::{pin, Pin};
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use bytes::Buf;
@@ -118,13 +118,14 @@ where
 
     fn proxy<'a, S>(
         &'a mut self,
-        mut incoming: &'a mut S,
+        incoming: &'a mut S,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send + 'a>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Unpin + Send + Sync,
     {
         Box::pin(async move {
+            let mut incoming = http::reader::buf_reader::BufReader::new(incoming, 4096);
             let mut is_invalid_key = false;
             let mut is_bad_request = false;
             let mut is_not_found = false;
@@ -269,7 +270,7 @@ where
 
                     return self
                         .handle_connect_tunnel(
-                            incoming,
+                            &mut incoming,
                             &endpoint,
                             &sock_address,
                             provider_tls,
@@ -320,7 +321,7 @@ where
                     // Handle WebSocket upgrade
                     match self
                         .proxy_websocket_with_data(
-                            incoming,
+                            &mut incoming,
                             &raw_headers,
                             &endpoint,
                             &sock_address,
@@ -970,6 +971,7 @@ impl UpstreamInfo {
                     Ok(0) => {
                         if let Err(e) = body_reader.discard_trailers().await {
                             log::error!(alpn = "h2", error = e.to_string(); "discard_client_request_trailers_error");
+                            return;
                         }
                         if let Err(e) = upstream_send_body.send_data(bytes::Bytes::new(), true) {
                             log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_end_error");
@@ -1206,7 +1208,9 @@ impl UpstreamInfo {
             let mut take = http::Body::Read(0..0);
             mem::swap(&mut take, &mut response.payload.body);
             let mut body = if let http::Body::Unread(reader) = take {
-                http::Body::Unread(Box::new(http::reader::ChunkedReader::data_only(reader)))
+                http::Body::Unread(Box::new(http::reader::ChunkedReader::data_only(
+                    http::reader::buf_reader::BufReader::new(reader, 4096),
+                )))
             } else {
                 unreachable!();
             };
@@ -1828,7 +1832,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-pub trait ConnTrait: AsyncRead + AsyncWrite {
+pub trait ConnTrait: AsyncRead + AsyncBufRead + AsyncWrite {
     fn new(endpoint: &str, stream: TcpStream) -> Self;
     fn new_tls(
         endpoint: &str,
@@ -1846,14 +1850,14 @@ pub trait ConnTrait: AsyncRead + AsyncWrite {
 
 pub struct Conn {
     endpoint: String,
-    stream: Stream,
+    stream: http::reader::buf_reader::BufReader<Stream>,
 }
 
 impl ConnTrait for Conn {
     fn new(endpoint: &str, stream: TcpStream) -> Self {
         Self {
             endpoint: endpoint.to_string(),
-            stream: Stream::Tcp(stream),
+            stream: http::reader::buf_reader::BufReader::new(Stream::Tcp(stream), 4096),
         }
     }
 
@@ -1871,7 +1875,7 @@ impl ConnTrait for Conn {
             let tls_stream = connector.connect(server_name, stream).await?;
             Ok(Self {
                 endpoint: endpoint.to_string(),
-                stream: Stream::Tls(tls_stream),
+                stream: http::reader::buf_reader::BufReader::new(Stream::Tls(tls_stream), 4096),
             })
         })
     }
@@ -1908,16 +1912,8 @@ impl ConnTrait for Conn {
 
     fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {
-            match &mut self.stream {
-                Stream::Tcp(stream) => {
-                    #[allow(unused)]
-                    stream.shutdown().await;
-                }
-                Stream::Tls(stream) => {
-                    #[allow(unused)]
-                    stream.shutdown().await;
-                }
-            }
+            #[allow(unused)]
+            self.stream.shutdown().await;
         })
     }
 }
@@ -1929,6 +1925,18 @@ impl AsyncRead for Conn {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         pin!(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncBufRead for Conn {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.get_mut();
+        Pin::new(&mut me.stream).poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        Pin::new(&mut me.stream).consume(amt);
     }
 }
 

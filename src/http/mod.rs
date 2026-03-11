@@ -1,15 +1,14 @@
 pub mod reader;
 
 use std::borrow::Cow;
-use std::io::Cursor;
 use std::ops::Range;
 use std::pin::pin;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::Error;
 
-use reader::{ChunkedReader, LimitedReader};
+use reader::{AsyncBufReadStream, ChunkedReader, LimitedReader, PrefixBufReader};
 
 const CRLF: &[u8] = b"\r\n";
 
@@ -44,7 +43,7 @@ pub struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    pub async fn new<S: AsyncRead + Unpin + Send + Sync + 'a>(
+    pub async fn new<S: AsyncRead + AsyncBufRead + Unpin + Send + Sync + 'a>(
         stream: S,
         buffer_size: usize,
     ) -> Result<Request<'a>, Error> {
@@ -133,7 +132,7 @@ pub struct Response<'a> {
 }
 
 impl<'a> Response<'a> {
-    pub async fn new<S: AsyncRead + Unpin + Send + Sync + 'a>(
+    pub async fn new<S: AsyncRead + AsyncBufRead + Unpin + Send + Sync + 'a>(
         stream: S,
         buffer_size: usize,
     ) -> Result<Response<'a>, Error> {
@@ -222,16 +221,17 @@ pub(crate) struct Payload<'a> {
 }
 
 impl<'a> Payload<'a> {
-    async fn read_from<S: AsyncRead + Unpin + Send + Sync + 'a>(
+    async fn read_from<S: AsyncRead + AsyncBufRead + Unpin + Send + Sync + 'a>(
         mut stream: S,
         buffer_size: usize,
     ) -> Result<Payload<'a>, Error> {
         #[inline]
-        async fn find_full_crlfs<S: AsyncRead + Unpin + Send + Sync>(
+        async fn read_until_header_end<S: AsyncRead + Unpin + Send + Sync>(
             stream: &mut S,
             block: &mut [u8],
         ) -> Result<(Vec<usize>, usize), Error> {
             let mut n = 0;
+            let mut crlfs = Vec::new();
             loop {
                 if n >= block.len() {
                     return Err(Error::HeaderTooLarge);
@@ -241,13 +241,18 @@ impl<'a> Payload<'a> {
                     Ok(n) => n,
                     Err(e) => return Err(e.into()),
                 };
-                if let Some(crlfs) = find_crlfs(&block[..n]) {
-                    return Ok((crlfs, n));
+                if n >= CRLF.len() && &block[n - CRLF.len()..n] == CRLF {
+                    let idx = n - CRLF.len();
+                    crlfs.push(idx);
+                    if crlfs.len() >= 2 && crlfs[crlfs.len() - 2] + CRLF.len() == idx {
+                        crlfs.pop();
+                        return Ok((crlfs, n));
+                    }
                 }
             }
         }
         let mut block = vec![0; buffer_size].into_boxed_slice();
-        let (crlfs, advanced) = find_full_crlfs(&mut stream, &mut block).await?;
+        let (crlfs, advanced) = read_until_header_end(&mut stream, &mut block).await?;
         let Some(&first_double_crlf_index) = crlfs.last() else {
             return Err(Error::HeaderTooLarge);
         };
@@ -541,28 +546,25 @@ impl<'a> Payload<'a> {
                 let end = start + real_content_length;
                 Body::Read(start..end)
             }
-        } else {
-            let unread: Box<dyn AsyncRead + Unpin + Send + Sync> = {
+        } else if transfer_encoding_chunked {
+            let unread: Box<dyn AsyncBufReadStream + 'a> = {
                 let (start, end) = (header_length + CRLF.len(), first_block_length);
                 first_block_length = start;
                 if start < end {
-                    let already_read = Cursor::new(block[start..end].to_vec());
-                    Box::new(already_read.chain(stream))
+                    Box::new(PrefixBufReader::new(block[start..end].to_vec(), stream))
                 } else {
                     Box::new(stream)
                 }
             };
-            if transfer_encoding_chunked {
-                Body::Unread(Box::new(ChunkedReader::new(unread)))
-            } else {
-                // If there is neither a Content-Length nor a chunked Transfer-Encoding, we consider
-                // it as not carrying a request body.
-                //
-                // Typically, when the request comes from h2, even if there is no Content-Length, we
-                // will manually add a Transfer-Encoding: chunked header (although in h2,
-                // Transfer-Encoding is not a valid header).
-                Body::Read(0..0)
-            }
+            Body::Unread(Box::new(ChunkedReader::new(unread)))
+        } else {
+            // If there is neither a Content-Length nor a chunked Transfer-Encoding, we consider
+            // it as not carrying a request body.
+            //
+            // Typically, when the request comes from h2, even if there is no Content-Length, we
+            // will manually add a Transfer-Encoding: chunked header (although in h2,
+            // Transfer-Encoding is not a valid header).
+            Body::Read(0..0)
         };
         // Build WebSocket upgrade info if this is a valid WebSocket upgrade request
         let is_websocket_upgrade = is_upgrade_websocket && is_connection_upgrade;
@@ -1015,10 +1017,11 @@ providers:
     }
 
     async fn forward_request(raw: &[u8], host_header: &str) -> Vec<u8> {
-        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
         server.write_all(raw).await.unwrap();
         server.shutdown().await.unwrap();
 
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let mut request = Request::new(&mut client, 4096).await.unwrap();
         request.set_provider_info(test_provider_info(host_header));
 
@@ -1035,10 +1038,11 @@ providers:
     }
 
     async fn forward_response(raw: &[u8]) -> Vec<u8> {
-        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
         server.write_all(raw).await.unwrap();
         server.shutdown().await.unwrap();
 
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let mut response = Response::new(&mut client, 4096).await.unwrap();
         let (mut outgoing, mut capture) = tokio::io::duplex(16 * 1024);
         let capture_task = tokio::spawn(async move {
@@ -1731,9 +1735,10 @@ providers:
     #[tokio::test]
     async fn test_request_rejects_duplicate_content_length() {
         let request = b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let err = match Request::new(&mut client, 4096).await {
             Ok(_) => panic!("expected invalid header"),
             Err(err) => err,
@@ -1745,9 +1750,10 @@ providers:
     async fn test_request_rejects_duplicate_transfer_encoding() {
         let request =
             b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let err = match Request::new(&mut client, 4096).await {
             Ok(_) => panic!("expected invalid header"),
             Err(err) => err,
@@ -1759,9 +1765,10 @@ providers:
     async fn test_request_rejects_content_length_with_mixed_case_chunked() {
         let request =
             b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: Chunked\r\n\r\n0\r\n\r\n";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let err = match Request::new(&mut client, 4096).await {
             Ok(_) => panic!("expected invalid header"),
             Err(err) => err,
@@ -1773,9 +1780,10 @@ providers:
     async fn test_request_rejects_content_length_with_chunked_without_space() {
         let request =
             b"POST / HTTP/1.1\r\nContent-Length:5\r\nTransfer-Encoding:chunked\r\n\r\n0\r\n\r\n";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let err = match Request::new(&mut client, 4096).await {
             Ok(_) => panic!("expected invalid header"),
             Err(err) => err,
@@ -1787,9 +1795,10 @@ providers:
     async fn test_request_rejects_content_length_with_chunked_tab_whitespace() {
         let request =
             b"POST / HTTP/1.1\r\nContent-Length:\t5\r\nTransfer-Encoding:\tchunked\r\n\r\n0\r\n\r\n";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let err = match Request::new(&mut client, 4096).await {
             Ok(_) => panic!("expected invalid header"),
             Err(err) => err,
@@ -1801,9 +1810,10 @@ providers:
     async fn test_request_accepts_mixed_case_chunked_transfer_encoding() {
         let request =
             b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let request = Request::new(&mut client, 4096).await.unwrap();
         assert!(matches!(request.payload.body, Body::Unread(_)));
     }
@@ -1811,10 +1821,11 @@ providers:
     #[tokio::test]
     async fn test_request_treats_empty_host_header_as_missing() {
         let request = b"GET / HTTP/1.1\r\nHost:   \r\n\r\n";
-        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (client, mut server) = tokio::io::duplex(4096);
         server.write_all(request).await.unwrap();
         server.shutdown().await.unwrap();
 
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let request = Request::new(&mut client, 4096).await.unwrap();
         assert_eq!(request.host(), None);
     }
@@ -1865,10 +1876,11 @@ providers:
         raw.extend_from_slice(first);
         raw.extend_from_slice(second);
 
-        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
         server.write_all(&raw).await.unwrap();
         server.shutdown().await.unwrap();
 
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let mut first_request = Request::new(&mut client, 4096).await.unwrap();
         first_request.set_provider_info(test_provider_info("Host: upstream.example.com\r\n"));
         let mut sink = tokio::io::sink();
@@ -1889,10 +1901,11 @@ providers:
         raw.extend_from_slice(first);
         raw.extend_from_slice(second);
 
-        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
         server.write_all(&raw).await.unwrap();
         server.shutdown().await.unwrap();
 
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 4096);
         let mut first_response = Response::new(&mut client, 4096).await.unwrap();
         let mut sink = tokio::io::sink();
         first_response.write_to(&mut sink).await.unwrap();
@@ -2037,6 +2050,7 @@ fn split_header_chunks(
     chunks
 }
 
+#[cfg(test)]
 #[inline]
 fn find_crlfs(buffer: &[u8]) -> Option<Vec<usize>> {
     let mut crlfs: Vec<usize> = buffer
