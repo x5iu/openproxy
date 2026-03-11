@@ -270,6 +270,11 @@ impl<R: AsyncBufRead + Unpin + Send + Sync> ChunkedReader<R> {
         reader
     }
 
+    #[cfg(test)]
+    fn into_inner(self) -> R {
+        self.reader
+    }
+
     #[inline]
     fn emits_data_only(&self) -> bool {
         self.mode == ChunkedReadMode::DataOnly
@@ -313,55 +318,55 @@ impl<R: AsyncBufRead + Unpin + Send + Sync> ChunkedReader<R> {
             .map_err(|_| io::Error::other(format!("invalid chunk length: \"{}\"", length_str)))
     }
 
+    #[inline]
+    fn poll_read_byte(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<u8>> {
+        let buffer = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+            Poll::Ready(Ok(buffer)) => buffer,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        };
+        if buffer.is_empty() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF",
+            )));
+        }
+        let byte = buffer[0];
+        Pin::new(&mut self.reader).consume(1);
+        Poll::Ready(Ok(byte))
+    }
+
     fn poll_read_line(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
         loop {
-            let buffer = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
-                Poll::Ready(Ok(buffer)) => buffer,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-            if buffer.is_empty() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF",
-                )));
-            }
-            if let Some(idx) = buffer.windows(CRLF.len()).position(|window| window == CRLF) {
-                self.line_buf.extend_from_slice(&buffer[..idx]);
-                Pin::new(&mut self.reader).consume(idx + CRLF.len());
+            if self.line_buf.ends_with(CRLF) {
+                self.line_buf.truncate(self.line_buf.len() - CRLF.len());
                 let line = std::mem::take(&mut self.line_buf);
                 return Poll::Ready(Ok(line));
             }
-            let total = self.line_buf.len() + buffer.len();
-            if total >= Self::MAX_LINE_SIZE {
+            if self.line_buf.len() >= Self::MAX_LINE_SIZE {
                 return Poll::Ready(Err(io::Error::other(format!(
                     "header line too long: scanned {} bytes without CRLF (capacity {})",
-                    total,
+                    self.line_buf.len(),
                     Self::MAX_LINE_SIZE
                 ))));
             }
-            self.line_buf.extend_from_slice(buffer);
-            let consumed = buffer.len();
-            Pin::new(&mut self.reader).consume(consumed);
+            let byte = match self.poll_read_byte(cx) {
+                Poll::Ready(Ok(byte)) => byte,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            self.line_buf.push(byte);
         }
     }
 
     fn poll_expect_crlf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.line_buf.len() < CRLF.len() {
-            let buffer = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
-                Poll::Ready(Ok(buffer)) => buffer,
+            let byte = match self.poll_read_byte(cx) {
+                Poll::Ready(Ok(byte)) => byte,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             };
-            if buffer.is_empty() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF",
-                )));
-            }
-            let to_copy = (CRLF.len() - self.line_buf.len()).min(buffer.len());
-            self.line_buf.extend_from_slice(&buffer[..to_copy]);
-            Pin::new(&mut self.reader).consume(to_copy);
+            self.line_buf.push(byte);
         }
         if self.line_buf.as_slice() != CRLF {
             self.line_buf.clear();
@@ -495,13 +500,14 @@ pub(crate) mod buf_reader {
 
     pub(crate) struct BufReader<R: ?Sized> {
         buf: Vec<u8>,
+        pos: usize,
         inner: R,
     }
 
     impl<R> BufReader<R> {
         pub(crate) fn new(inner: R, size: usize) -> Self {
             let buf = Vec::with_capacity(size);
-            Self { buf, inner }
+            Self { buf, pos: 0, inner }
         }
 
         #[cfg(test)]
@@ -511,7 +517,15 @@ pub(crate) mod buf_reader {
 
         #[cfg(test)]
         pub(crate) fn buffer(&self) -> &[u8] {
-            &self.buf[..]
+            &self.buf[self.pos..]
+        }
+
+        #[inline]
+        fn clear_if_consumed(&mut self) {
+            if self.pos >= self.buf.len() {
+                self.buf.clear();
+                self.pos = 0;
+            }
         }
     }
 
@@ -524,15 +538,18 @@ pub(crate) mod buf_reader {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
-            if self.buf.is_empty() {
+            if self.pos >= self.buf.len() {
+                self.buf.clear();
+                self.pos = 0;
                 return pin!(&mut self.inner).poll_read(cx, buf);
             }
-            let mut real_buf = ReadBuf::new(buf.initialize_unfilled());
-            #[allow(unused)]
-            pin!(&self.buf[..]).poll_read(cx, &mut real_buf)?;
-            let n = real_buf.filled().len();
-            self.consume(n);
-            buf.advance(n);
+            let remaining = self.buf.len() - self.pos;
+            let to_copy = remaining.min(buf.remaining());
+            let start = self.pos;
+            let end = start + to_copy;
+            buf.put_slice(&self.buf[start..end]);
+            self.pos = end;
+            self.clear_if_consumed();
             Poll::Ready(Ok(()))
         }
     }
@@ -558,7 +575,9 @@ pub(crate) mod buf_reader {
     impl<R: AsyncRead + Unpin + Send + Sync> AsyncBufRead for BufReader<R> {
         fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
             let me = self.get_mut();
-            if me.buf.is_empty() {
+            if me.pos >= me.buf.len() {
+                me.buf.clear();
+                me.pos = 0;
                 let cap = me.buf.capacity();
                 // SAFETY: temporarily extend the buffer, then truncate based on actual bytes read.
                 unsafe {
@@ -569,22 +588,29 @@ pub(crate) mod buf_reader {
                     Poll::Ready(Ok(())) => {
                         let n = buf.filled().len();
                         me.buf.truncate(n);
+                        me.pos = 0;
                     }
                     Poll::Ready(Err(e)) => {
                         me.buf.truncate(0);
+                        me.pos = 0;
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
                         me.buf.truncate(0);
+                        me.pos = 0;
                         return Poll::Pending;
                     }
                 }
             }
-            Poll::Ready(Ok(&me.buf[..]))
+            Poll::Ready(Ok(&me.buf[me.pos..]))
         }
 
         fn consume(self: Pin<&mut Self>, amt: usize) {
-            self.get_mut().buf.drain(..amt);
+            let me = self.get_mut();
+            let remaining = me.buf.len().saturating_sub(me.pos);
+            let consumed = amt.min(remaining);
+            me.pos += consumed;
+            me.clear_if_consumed();
         }
     }
 }
@@ -1091,6 +1117,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunked_reader_data_only_preserves_next_message_when_crlf_split_across_fill_buf() {
+        use super::buf_reader::BufReader;
+
+        let enc =
+            b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+                .to_vec();
+        let mut rdr = ChunkedReader::data_only(BufReader::new(MemReader::new(enc), 1));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello");
+
+        let mut inner = rdr.into_inner();
+        let mut remaining = Vec::new();
+        inner.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, b"GET /next HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_normalized_preserves_next_message_when_crlf_split_across_fill_buf() {
+        use super::buf_reader::BufReader;
+
+        let enc = b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let mut rdr = ChunkedReader::new(BufReader::new(MemReader::new(enc), 1));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
+
+        let mut inner = rdr.into_inner();
+        let mut remaining = Vec::new();
+        inner.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(
+            remaining,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
     async fn limited_reader_propagates_inner_errors() {
         let inner = ErrorReader;
         let mut limited = LimitedReader::new(inner, 10);
@@ -1199,6 +1262,29 @@ mod tests {
         // Consume more
         reader.consume(4);
         assert_eq!(reader.buffer(), &[8u8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn buf_reader_repeated_single_byte_consume_preserves_remaining_bytes() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufReadExt;
+
+        let data = b"abcdef".to_vec();
+        let mut reader = BufReader::new(MemReader::new(data), 64);
+
+        assert_eq!(reader.fill_buf().await.unwrap(), b"abcdef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"bcdef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"cdef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"def");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"ef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"f");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"");
     }
 
     #[tokio::test]

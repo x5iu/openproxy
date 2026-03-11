@@ -1917,6 +1917,57 @@ providers:
         parser.parse(second_response.payload.block()).unwrap();
         assert_eq!(parser.code, Some(204));
     }
+
+    #[tokio::test]
+    async fn test_request_chunked_trailers_do_not_pollute_next_request_when_body_crlf_is_split() {
+        load_http_test_program().await;
+        let first = b"POST /first HTTP/1.1\r\nHost: route.example.com\r\nTransfer-Encoding: chunked\r\nTrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: first\r\n\r\n";
+        let second = b"GET /second HTTP/1.1\r\nHost: route.example.com\r\n\r\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(first);
+        raw.extend_from_slice(second);
+
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
+        server.write_all(&raw).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 1);
+        let mut first_request = Request::new(&mut client, 4096).await.unwrap();
+        first_request.set_provider_info(test_provider_info("Host: upstream.example.com\r\n"));
+        let mut sink = tokio::io::sink();
+        first_request.write_to(&mut sink).await.unwrap();
+        drop(first_request);
+
+        let second_request = Request::new(&mut client, 4096).await.unwrap();
+        assert_eq!(second_request.method(), "GET");
+        assert_eq!(second_request.path(), "/second");
+        assert_eq!(second_request.host(), Some("route.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_response_chunked_trailers_do_not_pollute_next_response_when_body_crlf_is_split() {
+        let first = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\nTrailer: x-checksum\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: first\r\n\r\n";
+        let second = b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(first);
+        raw.extend_from_slice(second);
+
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
+        server.write_all(&raw).await.unwrap();
+        server.shutdown().await.unwrap();
+
+        let mut client = crate::http::reader::buf_reader::BufReader::new(client, 1);
+        let mut first_response = Response::new(&mut client, 4096).await.unwrap();
+        let mut sink = tokio::io::sink();
+        first_response.write_to(&mut sink).await.unwrap();
+        drop(first_response);
+
+        let second_response = Response::new(&mut client, 4096).await.unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut parser = httparse::Response::new(&mut headers);
+        parser.parse(second_response.payload.block()).unwrap();
+        assert_eq!(parser.code, Some(204));
+    }
 }
 
 pub(crate) fn get_auth_query_range(header: &str, key: &str) -> Option<Range<usize>> {
