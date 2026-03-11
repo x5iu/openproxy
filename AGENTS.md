@@ -26,7 +26,7 @@ End-to-end tests live in `e2e/` as `test_*.py` files, with helpers like `e2e/web
 - `cargo test --lib --verbose`: run Rust unit/integration tests (CI baseline).
 - `cargo test`: run all Rust tests.
 - `cargo fmt --all` and `cargo clippy --all-targets --all-features`: formatting and lint checks before opening a PR.
-- `.script/run_review_checks.sh .`: local security-review baseline (`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --lib --verbose`, `cargo audit`).
+- `.agents/skills/openproxy-security-review/scripts/run_review_checks.sh .`: local security-review baseline (`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --lib --verbose`, `cargo audit`).
 - `docker build -t openproxy .`: build the local container image from `Dockerfile`.
 
 For E2E tests:

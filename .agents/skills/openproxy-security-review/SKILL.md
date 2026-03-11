@@ -14,7 +14,7 @@ Review the change as a security review, not a style pass. Treat regressions in a
 2. Expand from the diff into the affected runtime path.
    Read the touched module plus the adjacent auth, protocol, and tests for the same path.
 3. Run the baseline checks.
-   Use `.script/run_review_checks.sh <repo-root>` unless the user explicitly asked for a narrower pass.
+   Use `.agents/skills/openproxy-security-review/scripts/run_review_checks.sh <repo-root>` unless the user explicitly asked for a narrower pass.
 4. Review attack-surface invariants before reviewing code style.
    Focus on credential leakage, ambiguous parsing, auth bypass, unsafe protocol fallback, shell-command execution, denial-of-service risk, and stale or inconsistent provider selection.
 5. Review test coverage.
@@ -27,14 +27,14 @@ Review the change as a security review, not a style pass. Treat regressions in a
 Run these from the repository root unless the change is docs-only:
 
 ```bash
-.script/run_review_checks.sh .
+.agents/skills/openproxy-security-review/scripts/run_review_checks.sh .
 ```
 
 Use the script flags when needed:
 
 ```bash
-.script/run_review_checks.sh --with-build .
-.script/run_review_checks.sh --all-tests .
+.agents/skills/openproxy-security-review/scripts/run_review_checks.sh --with-build .
+.agents/skills/openproxy-security-review/scripts/run_review_checks.sh --all-tests .
 ```
 
 Interpretation:
