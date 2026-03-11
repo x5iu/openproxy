@@ -2,5 +2,5 @@
 /.idea
 /.vscode
 /.claude
-/.script
+/.script/
 e2e/__pycache__/

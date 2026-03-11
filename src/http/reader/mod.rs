@@ -4,9 +4,81 @@ use std::task::{Context, Poll};
 
 use super::CRLF;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
-use buf_reader::BufReader;
+pub trait AsyncBufReadStream: AsyncRead + AsyncBufRead + Unpin + Send + Sync {}
+
+impl<T> AsyncBufReadStream for T where T: AsyncRead + AsyncBufRead + Unpin + Send + Sync {}
+
+pub struct PrefixBufReader<R> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: R,
+}
+
+impl<R> PrefixBufReader<R> {
+    pub fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for PrefixBufReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.pos < self.prefix.len() {
+            let remaining = self.prefix.len() - self.pos;
+            let to_copy = remaining.min(buf.remaining());
+            let start = self.pos;
+            let end = start + to_copy;
+            buf.put_slice(&self.prefix[start..end]);
+            self.pos = end;
+            if self.pos >= self.prefix.len() {
+                self.prefix.clear();
+                self.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        pin!(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncBufRead + Unpin + Send + Sync> AsyncBufRead for PrefixBufReader<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.get_mut();
+        if me.pos < me.prefix.len() {
+            return Poll::Ready(Ok(&me.prefix[me.pos..]));
+        }
+        Pin::new(&mut me.inner).poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        if me.pos < me.prefix.len() {
+            let remaining = me.prefix.len() - me.pos;
+            let consumed = amt.min(remaining);
+            me.pos += consumed;
+            if me.pos >= me.prefix.len() {
+                me.prefix.clear();
+                me.pos = 0;
+            }
+            if amt > consumed {
+                Pin::new(&mut me.inner).consume(amt - consumed);
+            }
+            return;
+        }
+        Pin::new(&mut me.inner).consume(amt);
+    }
+}
 
 pub struct LimitedReader<R> {
     reader: R,
@@ -63,6 +135,10 @@ impl<R> ChunkedWriter<R> {
             pos: 0,
             finished: false,
         }
+    }
+
+    pub fn into_inner(self) -> R {
+        self.reader
     }
 }
 
@@ -146,123 +222,256 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedWriter<R> {
     }
 }
 
-pub struct ChunkedReader<R> {
-    data_only: bool,
-    reader: BufReader<R>,
-    unread_chunk_length: usize,
-    cleaning: bool,
-    finished: bool,
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ChunkedReadMode {
+    NormalizedChunked,
+    DataOnly,
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> ChunkedReader<R> {
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ChunkedReadState {
+    ReadChunkHeader,
+    ReadChunkData,
+    ReadChunkDataCrlf,
+    DrainTrailers,
+    Finished,
+}
+
+// Decodes or normalizes HTTP/1.1 chunked bodies while draining and discarding trailer-part.
+// It avoids reading past the exact chunked message boundary so keep-alive parsing stays aligned.
+pub struct ChunkedReader<R> {
+    mode: ChunkedReadMode,
+    reader: R,
+    state: ChunkedReadState,
+    chunk_remaining: usize,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    line_buf: Vec<u8>,
+}
+
+impl<R: AsyncBufRead + Unpin + Send + Sync> ChunkedReader<R> {
+    const MAX_LINE_SIZE: usize = 4096;
+
     pub fn new(reader: R) -> Self {
         Self {
-            data_only: false,
-            reader: BufReader::new(reader, 4096),
-            unread_chunk_length: 0,
-            cleaning: false,
-            finished: false,
+            mode: ChunkedReadMode::NormalizedChunked,
+            reader,
+            state: ChunkedReadState::ReadChunkHeader,
+            chunk_remaining: 0,
+            pending: Vec::with_capacity(Self::MAX_LINE_SIZE + CRLF.len()),
+            pending_pos: 0,
+            line_buf: Vec::with_capacity(Self::MAX_LINE_SIZE),
         }
     }
 
     pub fn data_only(reader: R) -> ChunkedReader<R> {
         let mut reader = ChunkedReader::new(reader);
-        reader.data_only = true;
+        reader.mode = ChunkedReadMode::DataOnly;
         reader
     }
 
+    #[cfg(test)]
+    fn into_inner(self) -> R {
+        self.reader
+    }
+
+    #[inline]
+    fn emits_data_only(&self) -> bool {
+        self.mode == ChunkedReadMode::DataOnly
+    }
+
+    #[inline]
+    fn append_pending(&mut self, bytes: &[u8]) {
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        }
+        self.pending.extend_from_slice(bytes);
+    }
+
+    #[inline]
+    fn flush_pending(&mut self, out: &mut ReadBuf<'_>) -> bool {
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+            return false;
+        }
+        let remaining = self.pending.len() - self.pending_pos;
+        let to_copy = remaining.min(out.remaining());
+        let start = self.pending_pos;
+        let end = start + to_copy;
+        out.put_slice(&self.pending[start..end]);
+        self.pending_pos = end;
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        }
+        true
+    }
+
+    #[inline]
+    fn parse_chunk_length(line: &[u8]) -> io::Result<usize> {
+        let Ok(length_str) = std::str::from_utf8(line) else {
+            return Err(io::Error::other("non-utf8 chunk length"));
+        };
+        usize::from_str_radix(length_str, 16)
+            .map_err(|_| io::Error::other(format!("invalid chunk length: \"{}\"", length_str)))
+    }
+
+    #[inline]
+    fn poll_read_byte(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<u8>> {
+        let buffer = match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+            Poll::Ready(Ok(buffer)) => buffer,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        };
+        if buffer.is_empty() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF",
+            )));
+        }
+        let byte = buffer[0];
+        Pin::new(&mut self.reader).consume(1);
+        Poll::Ready(Ok(byte))
+    }
+
+    fn poll_read_line(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
+        loop {
+            if self.line_buf.ends_with(CRLF) {
+                self.line_buf.truncate(self.line_buf.len() - CRLF.len());
+                let line = std::mem::take(&mut self.line_buf);
+                return Poll::Ready(Ok(line));
+            }
+            if self.line_buf.len() >= Self::MAX_LINE_SIZE {
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "header line too long: scanned {} bytes without CRLF (capacity {})",
+                    self.line_buf.len(),
+                    Self::MAX_LINE_SIZE
+                ))));
+            }
+            let byte = match self.poll_read_byte(cx) {
+                Poll::Ready(Ok(byte)) => byte,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            self.line_buf.push(byte);
+        }
+    }
+
+    fn poll_expect_crlf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.line_buf.len() < CRLF.len() {
+            let byte = match self.poll_read_byte(cx) {
+                Poll::Ready(Ok(byte)) => byte,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            self.line_buf.push(byte);
+        }
+        if self.line_buf.as_slice() != CRLF {
+            self.line_buf.clear();
+            return Poll::Ready(Err(io::Error::other("invalid chunk delimiter")));
+        }
+        self.line_buf.clear();
+        Poll::Ready(Ok(()))
+    }
+
     fn internal_poll_read(
-        mut self: Pin<&mut Self>,
+        &mut self,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        #[inline]
-        fn poll_find_next_crlf<R: AsyncRead + Unpin + Send + Sync>(
-            reader: &mut BufReader<R>,
-            cx: &mut Context<'_>,
-        ) -> Poll<io::Result<usize>> {
-            #[inline]
-            fn find_crlf(buffer: &[u8]) -> Option<usize> {
-                buffer.windows(2).position(|window| window == CRLF)
-            }
-            let mut buffer = reader.buffer();
-            if let Some(idx) = find_crlf(buffer) {
-                return Poll::Ready(Ok(idx));
-            }
-            let capacity = reader.capacity();
-            while buffer.len() < capacity {
-                let Poll::Ready(new_buffer) = Pin::new(&mut *reader).poll_fill_buf(cx)? else {
-                    return Poll::Pending;
-                };
-                buffer = new_buffer;
-                if let Some(idx) = find_crlf(buffer) {
-                    return Poll::Ready(Ok(idx));
-                }
-            }
-            Poll::Ready(Err(io::Error::other(format!(
-                "header line too long: scanned {} bytes without CRLF (capacity {})",
-                buffer.len(),
-                capacity
-            ))))
+        if self.flush_pending(out) {
+            return Poll::Ready(Ok(()));
         }
-        if self.cleaning {
-            if self.data_only {
-                let buffer = if self.reader.buffer().len() < CRLF.len() {
-                    let Poll::Ready(buffer) = Pin::new(&mut self.reader).poll_fill_buf(cx)? else {
-                        return Poll::Pending;
+
+        loop {
+            match self.state {
+                ChunkedReadState::ReadChunkHeader => {
+                    let line = match self.poll_read_line(cx) {
+                        Poll::Ready(Ok(line)) => line,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     };
-                    buffer
-                } else {
-                    self.reader.buffer()
-                };
-                debug_assert_eq!(&buffer[..CRLF.len()], CRLF);
-                self.reader.consume(CRLF.len());
-            }
-            self.cleaning = false;
-        }
-        if self.unread_chunk_length == 0 {
-            if self.finished {
-                return Poll::Ready(Ok(()));
-            }
-            let Poll::Ready(idx) = poll_find_next_crlf(&mut self.reader, cx)? else {
-                return Poll::Pending;
-            };
-            let buffer = self.reader.buffer();
-            #[cfg(debug_assertions)]
-            log::info!(buffer:serde = buffer.to_vec(), index = idx; "read_chunk_header_line");
-            self.unread_chunk_length = {
-                let Ok(length_str) = std::str::from_utf8(&buffer[..idx]) else {
-                    return Poll::Ready(Err(io::Error::other("non-utf8 chunk length")));
-                };
-                let Ok(length) = usize::from_str_radix(length_str, 16) else {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "invalid chunk length: \"{}\"",
-                        length_str
-                    ))));
-                };
-                if length == 0 {
-                    self.finished = true;
+                    #[cfg(debug_assertions)]
+                    log::info!(buffer:serde = line.clone(), index = line.len(); "read_chunk_header_line");
+                    let length = match Self::parse_chunk_length(&line) {
+                        Ok(length) => length,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    };
+                    if !self.emits_data_only() {
+                        self.append_pending(&line);
+                        self.append_pending(CRLF);
+                    }
+                    self.chunk_remaining = length;
+                    self.state = if length == 0 {
+                        ChunkedReadState::DrainTrailers
+                    } else {
+                        ChunkedReadState::ReadChunkData
+                    };
+                    if self.flush_pending(out) {
+                        return Poll::Ready(Ok(()));
+                    }
                 }
-                if self.data_only {
-                    self.reader.consume(idx + CRLF.len());
-                    length
-                } else {
-                    idx + CRLF.len() + length + CRLF.len()
+                ChunkedReadState::ReadChunkData => {
+                    let max = std::cmp::min(self.chunk_remaining, out.remaining());
+                    let mut real_buf = ReadBuf::new(&mut out.initialize_unfilled()[..max]);
+                    let poll = pin!(&mut self.reader).poll_read(cx, &mut real_buf)?;
+                    match poll {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(()) => {
+                            let n = real_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "unexpected EOF",
+                                )));
+                            }
+                            self.chunk_remaining -= n;
+                            out.advance(n);
+                            if self.chunk_remaining == 0 {
+                                self.state = ChunkedReadState::ReadChunkDataCrlf;
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
                 }
-            };
+                ChunkedReadState::ReadChunkDataCrlf => match self.poll_expect_crlf(cx) {
+                    Poll::Ready(Ok(())) => {
+                        if !self.emits_data_only() {
+                            self.append_pending(CRLF);
+                        }
+                        self.state = ChunkedReadState::ReadChunkHeader;
+                        if self.flush_pending(out) {
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                },
+                ChunkedReadState::DrainTrailers => {
+                    let line = match self.poll_read_line(cx) {
+                        Poll::Ready(Ok(line)) => line,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    if line.is_empty() {
+                        if !self.emits_data_only() {
+                            self.append_pending(CRLF);
+                        }
+                        self.state = ChunkedReadState::Finished;
+                        if self.flush_pending(out) {
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                }
+                ChunkedReadState::Finished => return Poll::Ready(Ok(())),
+            }
         }
-        let max = std::cmp::min(self.unread_chunk_length, buf.remaining());
-        let mut real_buf = ReadBuf::new(&mut buf.initialize_unfilled()[..max]);
-        let poll = pin!(&mut self.reader).poll_read(cx, &mut real_buf)?;
-        let n = real_buf.filled().len();
-        self.unread_chunk_length -= n;
-        self.cleaning = self.unread_chunk_length == 0;
-        buf.advance(n);
-        poll.map(|_| Ok(()))
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedReader<R> {
+impl<R: AsyncBufRead + Unpin + Send + Sync> AsyncRead for ChunkedReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -271,9 +480,9 @@ impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for ChunkedReader<R> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        match self.internal_poll_read(cx, buf) {
+        let this = self.get_mut();
+        match this.internal_poll_read(cx, buf) {
             Poll::Ready(Err(e)) => {
-                // This log is recorded to diagnose the `illegal chunk header` and `InvalidChunkLength` error.
                 log::error!(error = e.to_string(); "chunked_reader_error");
                 Poll::Ready(Err(e))
             }
@@ -287,25 +496,36 @@ pub(crate) mod buf_reader {
     use std::pin::{pin, Pin};
     use std::task::{Context, Poll};
 
-    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+    use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
     pub(crate) struct BufReader<R: ?Sized> {
         buf: Vec<u8>,
+        pos: usize,
         inner: R,
     }
 
     impl<R> BufReader<R> {
         pub(crate) fn new(inner: R, size: usize) -> Self {
             let buf = Vec::with_capacity(size);
-            Self { buf, inner }
+            Self { buf, pos: 0, inner }
         }
 
+        #[cfg(test)]
         pub(crate) fn capacity(&self) -> usize {
             self.buf.capacity()
         }
 
+        #[cfg(test)]
         pub(crate) fn buffer(&self) -> &[u8] {
-            &self.buf[..]
+            &self.buf[self.pos..]
+        }
+
+        #[inline]
+        fn clear_if_consumed(&mut self) {
+            if self.pos >= self.buf.len() {
+                self.buf.clear();
+                self.pos = 0;
+            }
         }
     }
 
@@ -318,55 +538,79 @@ pub(crate) mod buf_reader {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
-            if self.buf.is_empty() {
+            if self.pos >= self.buf.len() {
+                self.buf.clear();
+                self.pos = 0;
                 return pin!(&mut self.inner).poll_read(cx, buf);
             }
-            let mut real_buf = ReadBuf::new(buf.initialize_unfilled());
-            #[allow(unused)]
-            pin!(&self.buf[..]).poll_read(cx, &mut real_buf)?;
-            let n = real_buf.filled().len();
-            self.consume(n);
-            buf.advance(n);
+            let remaining = self.buf.len() - self.pos;
+            let to_copy = remaining.min(buf.remaining());
+            let start = self.pos;
+            let end = start + to_copy;
+            buf.put_slice(&self.buf[start..end]);
+            self.pos = end;
+            self.clear_if_consumed();
             Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<R: AsyncWrite + Unpin + Send + Sync> AsyncWrite for BufReader<R> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            pin!(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            pin!(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            pin!(&mut self.inner).poll_shutdown(cx)
         }
     }
 
     impl<R: AsyncRead + Unpin + Send + Sync> AsyncBufRead for BufReader<R> {
         fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
             let me = self.get_mut();
-            let (len, cap) = (me.buf.len(), me.buf.capacity());
-            if len < cap {
+            if me.pos >= me.buf.len() {
+                me.buf.clear();
+                me.pos = 0;
+                let cap = me.buf.capacity();
                 // SAFETY: temporarily extend the buffer, then truncate based on actual bytes read.
                 unsafe {
                     me.buf.set_len(cap);
                 }
-                let mut buf = ReadBuf::new(&mut me.buf[len..cap]);
+                let mut buf = ReadBuf::new(&mut me.buf[..cap]);
                 match pin!(&mut me.inner).poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(())) => {
                         let n = buf.filled().len();
-                        me.buf.truncate(len + n);
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF",
-                            )));
-                        }
+                        me.buf.truncate(n);
+                        me.pos = 0;
                     }
                     Poll::Ready(Err(e)) => {
-                        me.buf.truncate(len);
+                        me.buf.truncate(0);
+                        me.pos = 0;
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
-                        me.buf.truncate(len);
+                        me.buf.truncate(0);
+                        me.pos = 0;
                         return Poll::Pending;
                     }
                 }
             }
-            Poll::Ready(Ok(&me.buf[..]))
+            Poll::Ready(Ok(&me.buf[me.pos..]))
         }
 
         fn consume(self: Pin<&mut Self>, amt: usize) {
-            self.get_mut().buf.drain(..amt);
+            let me = self.get_mut();
+            let remaining = me.buf.len().saturating_sub(me.pos);
+            let consumed = amt.min(remaining);
+            me.pos += consumed;
+            me.clear_if_consumed();
         }
     }
 }
@@ -378,7 +622,7 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, ReadBuf};
 
     struct MemReader {
         data: Vec<u8>,
@@ -409,6 +653,17 @@ mod tests {
             buf.advance(to_copy);
             self.pos = end;
             Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncBufRead for MemReader {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            let me = self.get_mut();
+            Poll::Ready(Ok(&me.data[me.pos..]))
+        }
+
+        fn consume(mut self: Pin<&mut Self>, amt: usize) {
+            self.pos = (self.pos + amt).min(self.data.len());
         }
     }
 
@@ -844,6 +1099,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunked_reader_data_only_drops_trailers() {
+        let enc = b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n".to_vec();
+        let mut rdr = ChunkedReader::data_only(MemReader::new(enc));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_normalized_chunked_drops_trailers() {
+        let enc = b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\nfoo: bar\r\n\r\n".to_vec();
+        let mut rdr = ChunkedReader::new(MemReader::new(enc));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_data_only_preserves_next_message_when_crlf_split_across_fill_buf() {
+        use super::buf_reader::BufReader;
+
+        let enc =
+            b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n"
+                .to_vec();
+        let mut rdr = ChunkedReader::data_only(BufReader::new(MemReader::new(enc), 1));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"hello");
+
+        let mut inner = rdr.into_inner();
+        let mut remaining = Vec::new();
+        inner.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, b"GET /next HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_normalized_preserves_next_message_when_crlf_split_across_fill_buf() {
+        use super::buf_reader::BufReader;
+
+        let enc = b"5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let mut rdr = ChunkedReader::new(BufReader::new(MemReader::new(enc), 1));
+        let mut out = Vec::new();
+        rdr.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"5\r\nhello\r\n0\r\n\r\n");
+
+        let mut inner = rdr.into_inner();
+        let mut remaining = Vec::new();
+        inner.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(
+            remaining,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[tokio::test]
     async fn limited_reader_propagates_inner_errors() {
         let inner = ErrorReader;
         let mut limited = LimitedReader::new(inner, 10);
@@ -952,6 +1262,29 @@ mod tests {
         // Consume more
         reader.consume(4);
         assert_eq!(reader.buffer(), &[8u8, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn buf_reader_repeated_single_byte_consume_preserves_remaining_bytes() {
+        use super::buf_reader::BufReader;
+        use tokio::io::AsyncBufReadExt;
+
+        let data = b"abcdef".to_vec();
+        let mut reader = BufReader::new(MemReader::new(data), 64);
+
+        assert_eq!(reader.fill_buf().await.unwrap(), b"abcdef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"bcdef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"cdef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"def");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"ef");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"f");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().await.unwrap(), b"");
     }
 
     #[tokio::test]

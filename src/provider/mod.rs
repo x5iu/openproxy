@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::http;
 
@@ -315,9 +315,9 @@ pub trait Provider: Send + Sync {
     }
 }
 
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+pub trait AsyncReadWrite: AsyncRead + AsyncBufRead + AsyncWrite + Unpin + Send + Sync {}
 
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncBufRead + AsyncWrite + Unpin + Send + Sync {}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct HealthCheckConfig {
@@ -2831,6 +2831,17 @@ mod tests {
             buf.put_slice(&self.response[self.response_pos..end]);
             self.response_pos = end;
             Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncBufRead for MockHealthCheckStream {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            let me = self.get_mut();
+            Poll::Ready(Ok(&me.response[me.response_pos..]))
+        }
+
+        fn consume(mut self: Pin<&mut Self>, amt: usize) {
+            self.response_pos = (self.response_pos + amt).min(self.response.len());
         }
     }
 

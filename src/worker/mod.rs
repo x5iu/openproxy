@@ -6,7 +6,7 @@ use std::pin::{pin, Pin};
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{self, AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use bytes::Buf;
@@ -118,13 +118,14 @@ where
 
     fn proxy<'a, S>(
         &'a mut self,
-        mut incoming: &'a mut S,
+        incoming: &'a mut S,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send + 'a>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
         <P as PoolTrait>::Item: Unpin + Send + Sync,
     {
         Box::pin(async move {
+            let mut incoming = http::reader::buf_reader::BufReader::new(incoming, 4096);
             let mut is_invalid_key = false;
             let mut is_bad_request = false;
             let mut is_not_found = false;
@@ -269,7 +270,7 @@ where
 
                     return self
                         .handle_connect_tunnel(
-                            incoming,
+                            &mut incoming,
                             &endpoint,
                             &sock_address,
                             provider_tls,
@@ -320,7 +321,7 @@ where
                     // Handle WebSocket upgrade
                     match self
                         .proxy_websocket_with_data(
-                            incoming,
+                            &mut incoming,
                             &raw_headers,
                             &endpoint,
                             &sock_address,
@@ -771,7 +772,6 @@ where
                         extra_header_keys,
                         extra_headers_transformed,
                     };
-                    let authority_host = authority.host().to_string();
 
                     // Drop the read lock before async operations
                     drop(p);
@@ -793,8 +793,7 @@ where
                             info.proxy_h2(h2conn, request, respond).await;
                         }
                         H2ConnectResult::FallbackToH1 => {
-                            info.proxy_h1(&mut worker, request, respond, &authority_host)
-                                .await;
+                            info.proxy_h1(&mut worker, request, respond).await;
                         }
                     }
                 });
@@ -970,7 +969,10 @@ impl UpstreamInfo {
             loop {
                 match body_reader.read(&mut buf).await {
                     Ok(0) => {
-                        // End of body
+                        if let Err(e) = body_reader.discard_trailers().await {
+                            log::error!(alpn = "h2", error = e.to_string(); "discard_client_request_trailers_error");
+                            return;
+                        }
                         if let Err(e) = upstream_send_body.send_data(bytes::Bytes::new(), true) {
                             log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_end_error");
                         }
@@ -1047,7 +1049,10 @@ impl UpstreamInfo {
                         return;
                     }
                     None => {
-                        // End of stream
+                        if let Err(e) = discard_h2_recv_trailers(&mut upstream_body).await {
+                            log::error!(alpn = "h2", error = e.to_string(); "discard_upstream_response_trailers_error");
+                            return;
+                        }
                         if let Err(e) = send.send_data(bytes::Bytes::new(), true) {
                             log::error!(alpn = "h2", error = e.to_string(); "send_data_end_error");
                         }
@@ -1064,7 +1069,6 @@ impl UpstreamInfo {
         worker: &mut Worker<P, H2P>,
         request: httplib::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<bytes::Bytes>,
-        authority_host: &str,
     ) where
         P: PoolTrait + Send + Sync + 'static,
         H2P: H2PoolTrait,
@@ -1092,27 +1096,19 @@ impl UpstreamInfo {
             }};
         }
 
-        let mut request = request;
+        let request = request;
+        let has_body = !request.body().is_end_stream();
 
-        // Add default headers
-        request
-            .headers_mut()
-            .entry("Connection")
-            .or_insert(httplib::HeaderValue::from_static("keep-alive"));
-        request
-            .headers_mut()
-            .entry("Host")
-            .or_insert(httplib::HeaderValue::from_str(authority_host).unwrap());
-
-        let has_content_length = request.headers().contains_key("content-length");
-
-        // Build HTTP/1.1 request headers
+        // Build HTTP/1.1 request headers.
+        // Security: OpenProxy ignores HTTP trailers on all proxy paths. For H2 -> H1 fallback,
+        // we additionally MUST rebuild H1 framing ourselves instead of trusting client-supplied
+        // Content-Length/Transfer-Encoding.
         let req_headers = build_h1_request_headers(
             request.headers().iter(),
             &self.host_header_value,
             &self.auth_header_keys,
             self.auth_header.as_deref(),
-            has_content_length,
+            has_body,
             &self.extra_header_keys,
             &self.extra_headers_transformed,
         );
@@ -1137,12 +1133,7 @@ impl UpstreamInfo {
             req_headers,
         );
 
-        let h2stream_reader = H2StreamReader::new(request.into_body());
-        let mut req_body: Box<dyn AsyncRead + Unpin + Send + Sync> = if has_content_length {
-            Box::new(h2stream_reader)
-        } else {
-            Box::new(http::reader::ChunkedWriter::new(h2stream_reader))
-        };
+        let request_body = request.into_body();
 
         let mut outgoing = match worker
             .get_or_create_h1(&self.endpoint, &self.sock_address, self.use_tls)
@@ -1159,9 +1150,17 @@ impl UpstreamInfo {
             invalid!(respond, 502, format!("upstream: {}", e));
             return;
         }
-        if let Err(e) = tokio::io::copy(&mut req_body, &mut outgoing).await {
-            invalid!(respond, 502, format!("upstream: {}", e));
-            return;
+        if has_body {
+            let mut req_body = http::reader::ChunkedWriter::new(H2StreamReader::new(request_body));
+            if let Err(e) = tokio::io::copy(&mut req_body, &mut outgoing).await {
+                invalid!(respond, 502, format!("upstream: {}", e));
+                return;
+            }
+            let mut h2_body = req_body.into_inner();
+            if let Err(e) = h2_body.discard_trailers().await {
+                invalid!(respond, 502, format!("discard client trailers: {}", e));
+                return;
+            }
         }
         if let Err(e) = outgoing.flush().await {
             invalid!(respond, 502, format!("upstream: {}", e));
@@ -1209,7 +1208,9 @@ impl UpstreamInfo {
             let mut take = http::Body::Read(0..0);
             mem::swap(&mut take, &mut response.payload.body);
             let mut body = if let http::Body::Unread(reader) = take {
-                http::Body::Unread(Box::new(http::reader::ChunkedReader::data_only(reader)))
+                http::Body::Unread(Box::new(http::reader::ChunkedReader::data_only(
+                    http::reader::buf_reader::BufReader::new(reader, 4096),
+                )))
             } else {
                 unreachable!();
             };
@@ -1831,7 +1832,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-pub trait ConnTrait: AsyncRead + AsyncWrite {
+pub trait ConnTrait: AsyncRead + AsyncBufRead + AsyncWrite {
     fn new(endpoint: &str, stream: TcpStream) -> Self;
     fn new_tls(
         endpoint: &str,
@@ -1849,14 +1850,14 @@ pub trait ConnTrait: AsyncRead + AsyncWrite {
 
 pub struct Conn {
     endpoint: String,
-    stream: Stream,
+    stream: http::reader::buf_reader::BufReader<Stream>,
 }
 
 impl ConnTrait for Conn {
     fn new(endpoint: &str, stream: TcpStream) -> Self {
         Self {
             endpoint: endpoint.to_string(),
-            stream: Stream::Tcp(stream),
+            stream: http::reader::buf_reader::BufReader::new(Stream::Tcp(stream), 4096),
         }
     }
 
@@ -1874,7 +1875,7 @@ impl ConnTrait for Conn {
             let tls_stream = connector.connect(server_name, stream).await?;
             Ok(Self {
                 endpoint: endpoint.to_string(),
-                stream: Stream::Tls(tls_stream),
+                stream: http::reader::buf_reader::BufReader::new(Stream::Tls(tls_stream), 4096),
             })
         })
     }
@@ -1911,16 +1912,8 @@ impl ConnTrait for Conn {
 
     fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {
-            match &mut self.stream {
-                Stream::Tcp(stream) => {
-                    #[allow(unused)]
-                    stream.shutdown().await;
-                }
-                Stream::Tls(stream) => {
-                    #[allow(unused)]
-                    stream.shutdown().await;
-                }
-            }
+            #[allow(unused)]
+            self.stream.shutdown().await;
         })
     }
 }
@@ -1932,6 +1925,18 @@ impl AsyncRead for Conn {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         pin!(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncBufRead for Conn {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.get_mut();
+        Pin::new(&mut me.stream).poll_fill_buf(cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        Pin::new(&mut me.stream).consume(amt);
     }
 }
 
@@ -2017,6 +2022,29 @@ impl H2StreamReader {
             stream,
         }
     }
+
+    async fn discard_trailers(&mut self) -> io::Result<()> {
+        if self
+            .bytes
+            .as_ref()
+            .map(|cursor| cursor.has_remaining())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        discard_h2_recv_trailers(&mut self.stream)
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
+// OpenProxy's HTTP proxy paths never forward H2 trailers. Drain them explicitly so the
+// stream reaches EOS and the connection state stays clean for reuse.
+async fn discard_h2_recv_trailers(stream: &mut h2::RecvStream) -> Result<(), h2::Error> {
+    if !stream.is_end_stream() {
+        let _ = stream.trailers().await?;
+    }
+    Ok(())
 }
 
 impl AsyncRead for H2StreamReader {
@@ -2152,6 +2180,8 @@ fn is_http2_invalid_headers(key: &str) -> bool {
         || key.eq_ignore_ascii_case("keep-alive")
         || key.eq_ignore_ascii_case("proxy-connection")
         || key.eq_ignore_ascii_case("content-length")
+        || key.eq_ignore_ascii_case("te")
+        || key.eq_ignore_ascii_case("trailer")
 }
 
 fn collect_auth_header_keys(providers: &[&dyn Provider]) -> Vec<String> {
@@ -2210,6 +2240,20 @@ fn should_filter_forwarded_header(
     extra_header_keys.iter().any(|k| k == &key_lower)
 }
 
+#[inline]
+fn is_h1_framing_or_hop_by_hop_header(key: &str) -> bool {
+    key.eq_ignore_ascii_case("host")
+        || key.eq_ignore_ascii_case("connection")
+        || key.eq_ignore_ascii_case("content-length")
+        || key.eq_ignore_ascii_case("transfer-encoding")
+        || key.eq_ignore_ascii_case("proxy-connection")
+        || key.eq_ignore_ascii_case("proxy-authorization")
+        || key.eq_ignore_ascii_case("keep-alive")
+        || key.eq_ignore_ascii_case("te")
+        || key.eq_ignore_ascii_case("trailer")
+        || key.eq_ignore_ascii_case("upgrade")
+}
+
 fn rewrite_websocket_upgrade_request(
     raw_headers: &[u8],
     host_header: &str,
@@ -2256,6 +2300,10 @@ fn rewrite_websocket_upgrade_request(
             continue;
         }
 
+        if http::is_header(line, "TE: ") || http::is_header(line, "Trailer: ") {
+            continue;
+        }
+
         if http::is_header(line, http::HEADER_AUTHORIZATION)
             || http::is_header(line, http::HEADER_X_GOOG_API_KEY)
             || http::is_header(line, http::HEADER_X_API_KEY)
@@ -2283,14 +2331,15 @@ fn rewrite_websocket_upgrade_request(
     Ok(modified_request)
 }
 
-/// Build HTTP/1.1 request headers string from an iterator of headers.
-/// Filters out auth headers, extra headers, and replaces Host header with the upstream host.
+/// Build HTTP/1.1 request headers string from an iterator of HTTP/2 request headers.
+/// Filters out client auth headers, hop-by-hop/framing headers, and applies proxy-controlled
+/// Host/Connection/framing for safe HTTP/2 -> HTTP/1.1 fallback.
 fn build_h1_request_headers<'a, I>(
     headers: I,
     host_header_value: &str,
     auth_header_keys: &[String],
     auth_header: Option<&str>,
-    has_content_length: bool,
+    has_body: bool,
     extra_header_keys: &[String],
     extra_headers_transformed: &[(String, String)],
 ) -> String
@@ -2298,15 +2347,16 @@ where
     I: Iterator<Item = (&'a httplib::HeaderName, &'a httplib::HeaderValue)>,
 {
     let mut req_headers = String::with_capacity(1024);
+    req_headers.push_str("Host: ");
+    req_headers.push_str(host_header_value);
+    req_headers.push_str("\r\n");
+    req_headers.push_str("Connection: keep-alive\r\n");
 
     for (key, value) in headers {
         let key_str = key.as_str();
-        if should_filter_forwarded_header(key_str, auth_header_keys, extra_header_keys) {
-            continue;
-        }
-        // Replace Host header
-        if key_str.eq_ignore_ascii_case("host") {
-            req_headers.push_str(&format!("Host: {}\r\n", host_header_value));
+        if is_h1_framing_or_hop_by_hop_header(key_str)
+            || should_filter_forwarded_header(key_str, auth_header_keys, extra_header_keys)
+        {
             continue;
         }
         req_headers.push_str(key_str);
@@ -2328,8 +2378,8 @@ where
         req_headers.push_str("\r\n");
     }
 
-    // Add Transfer-Encoding if no Content-Length
-    if !has_content_length {
+    // Security: when proxying H2 -> H1, always generate body framing ourselves.
+    if has_body {
         req_headers.push_str("Transfer-Encoding: chunked\r\n");
     }
 
@@ -2489,6 +2539,10 @@ mod tests {
         assert!(is_http2_invalid_headers("Proxy-Connection"));
         assert!(is_http2_invalid_headers("content-length"));
         assert!(is_http2_invalid_headers("Content-Length"));
+        assert!(is_http2_invalid_headers("te"));
+        assert!(is_http2_invalid_headers("TE"));
+        assert!(is_http2_invalid_headers("trailer"));
+        assert!(is_http2_invalid_headers("Trailer"));
 
         // Headers that should NOT be filtered
         assert!(!is_http2_invalid_headers("content-type"));
@@ -2766,7 +2820,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_websocket_upgrade_request() {
-        let raw = b"GET /prefix/ws HTTP/1.1\r\nHost: client.example.com\r\nAuthorization: Bearer client\r\nProxy-Authorization: Bearer proxy-secret\r\nSec-WebSocket-Key: key\r\n\r\n";
+        let raw = b"GET /prefix/ws HTTP/1.1\r\nHost: client.example.com\r\nAuthorization: Bearer client\r\nProxy-Authorization: Bearer proxy-secret\r\nTE: trailers\r\nTrailer: x-checksum\r\nSec-WebSocket-Key: key\r\n\r\n";
         let rewritten = rewrite_websocket_upgrade_request(
             raw,
             "Host: upstream.example.com\r\n",
@@ -2780,21 +2834,48 @@ mod tests {
         assert!(rewritten.contains("Authorization: Bearer upstream\r\n"));
         assert!(!rewritten.contains("Bearer client"));
         assert!(!rewritten.contains("proxy-secret"));
+        assert!(!rewritten.contains("TE: trailers\r\n"));
+        assert!(!rewritten.contains("Trailer: x-checksum\r\n"));
     }
 
     #[test]
     fn test_build_h1_request_headers() {
         use httplib::header::{HeaderMap, HeaderName, HeaderValue};
 
-        // Create test headers
+        // Create test headers, including hop-by-hop and framing headers that must be stripped
+        // during HTTP/2 -> HTTP/1.1 fallback.
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("host"),
             HeaderValue::from_static("client.example.com"),
         );
         headers.insert(
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("close"),
+        );
+        headers.insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_static("123"),
+        );
+        headers.insert(
+            HeaderName::from_static("transfer-encoding"),
+            HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            HeaderName::from_static("te"),
+            HeaderValue::from_static("trailers"),
+        );
+        headers.insert(
+            HeaderName::from_static("trailer"),
+            HeaderValue::from_static("x-checksum"),
+        );
+        headers.insert(
+            HeaderName::from_static("upgrade"),
+            HeaderValue::from_static("websocket"),
         );
         headers.insert(
             HeaderName::from_static("authorization"),
@@ -2805,9 +2886,37 @@ mod tests {
             HeaderValue::from_static("Bearer proxy_secret"),
         );
 
-        // Test with auth header replacement and no content-length
         let auth_keys = vec!["authorization".to_string()];
         let result = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            &auth_keys,
+            Some("Authorization: Bearer server_token\r\n"),
+            true,
+            &[],
+            &[],
+        );
+
+        assert!(result.contains("Host: upstream.example.com\r\n"));
+        assert!(result.contains("Connection: keep-alive\r\n"));
+        assert!(result.contains("content-type: application/json\r\n"));
+        assert!(result.contains("Authorization: Bearer server_token\r\n"));
+        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
+
+        // The proxy must rebuild HTTP/1.1 framing instead of forwarding client framing.
+        assert!(!result.contains("content-length: 123\r\n"));
+        assert!(!result.contains("transfer-encoding: gzip\r\n"));
+        assert!(!result.contains("te: trailers\r\n"));
+        assert!(!result.contains("trailer: x-checksum\r\n"));
+        assert!(!result.contains("upgrade: websocket\r\n"));
+        assert!(!result.contains("connection: close\r\n"));
+
+        // Should NOT contain the client's authorization
+        assert!(!result.contains("Bearer client_token"));
+        assert!(!result.contains("proxy_secret"));
+
+        // No body => no Transfer-Encoding and no forwarded Content-Length.
+        let result_without_body = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
             &auth_keys,
@@ -2816,44 +2925,26 @@ mod tests {
             &[],
             &[],
         );
+        assert!(!result_without_body.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!result_without_body.contains("content-length: 123\r\n"));
 
-        assert!(result.contains("Host: upstream.example.com\r\n"));
-        assert!(result.contains("content-type: application/json\r\n"));
-        assert!(result.contains("Authorization: Bearer server_token\r\n"));
-        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
-        // Should NOT contain the client's authorization
-        assert!(!result.contains("Bearer client_token"));
-        assert!(!result.contains("proxy_secret"));
-
-        // Test with content-length (no Transfer-Encoding)
-        let result_with_cl = build_h1_request_headers(
-            headers.iter(),
-            "upstream.example.com",
-            &auth_keys,
-            Some("Authorization: Bearer server_token\r\n"),
-            true,
-            &[],
-            &[],
-        );
-
-        assert!(!result_with_cl.contains("Transfer-Encoding"));
-
-        // Test without auth header replacement
+        // Test without auth header replacement.
         let no_auth_keys: Vec<String> = vec![];
         let result_no_auth = build_h1_request_headers(
             headers.iter(),
             "upstream.example.com",
             &no_auth_keys,
             None,
-            true,
+            false,
             &[],
             &[],
         );
 
         assert!(result_no_auth.contains("authorization: Bearer client_token\r\n"));
         assert!(!result_no_auth.contains("proxy_secret"));
+        assert!(!result_no_auth.contains("content-length: 123\r\n"));
 
-        // Test with extra headers filtering and transformation
+        // Test with extra headers filtering and transformation.
         let mut headers_with_extra = HeaderMap::new();
         headers_with_extra.insert(
             HeaderName::from_static("host"),
@@ -2885,18 +2976,123 @@ mod tests {
         );
 
         assert!(result_with_extra.contains("Host: upstream.example.com\r\n"));
+        assert!(result_with_extra.contains("Connection: keep-alive\r\n"));
         assert!(result_with_extra.contains("content-type: application/json\r\n"));
-        // Should contain transformed header, not original
+        // Should contain transformed header, not original.
         assert!(result_with_extra.contains("anthropic-beta: existing-value,oauth-2025-04-20\r\n"));
-        // Should NOT contain the original value alone
         assert!(!result_with_extra.contains("anthropic-beta: existing-value\r\n"));
+        assert!(result_with_extra.contains("Transfer-Encoding: chunked\r\n"));
+    }
+
+    async fn read_crlf_line(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if !buffered.is_empty() {
+                line.push(buffered.remove(0));
+            } else {
+                stream.read_exact(&mut byte).await?;
+                line.push(byte[0]);
+            }
+            if line.ends_with(b"\r\n") {
+                return Ok(line);
+            }
+        }
+    }
+
+    async fn read_exact_buffered(
+        stream: &mut tokio::net::TcpStream,
+        buffered: &mut Vec<u8>,
+        size: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(size);
+        while out.len() < size {
+            if !buffered.is_empty() {
+                let take = (size - out.len()).min(buffered.len());
+                out.extend(buffered.drain(..take));
+            } else {
+                let mut chunk = vec![0u8; size - out.len()];
+                stream.read_exact(&mut chunk).await?;
+                out.extend_from_slice(&chunk);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn capture_raw_http1_message(
+        stream: &mut tokio::net::TcpStream,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 1024];
+        let header_end = loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading headers",
+                ));
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(pos) = find_header_end(&raw) {
+                break pos + 4;
+            }
+        };
+
+        let header_text = String::from_utf8_lossy(&raw[..header_end]);
+        let mut transfer_encoding_chunked = false;
+        let mut content_length: Option<usize> = None;
+        for line in header_text.split("\r\n").skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+                {
+                    transfer_encoding_chunked = true;
+                }
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().ok();
+                }
+            }
+        }
+
+        let mut buffered = raw.split_off(header_end);
+
+        if transfer_encoding_chunked {
+            loop {
+                let line = read_crlf_line(stream, &mut buffered).await?;
+                raw.extend_from_slice(&line);
+                let size_text = &line[..line.len() - 2];
+                let size =
+                    usize::from_str_radix(std::str::from_utf8(size_text).unwrap(), 16).unwrap();
+                if size == 0 {
+                    loop {
+                        let trailer_line = read_crlf_line(stream, &mut buffered).await?;
+                        raw.extend_from_slice(&trailer_line);
+                        if trailer_line == b"\r\n" {
+                            return Ok(raw);
+                        }
+                    }
+                }
+                let chunk = read_exact_buffered(stream, &mut buffered, size + 2).await?;
+                raw.extend_from_slice(&chunk);
+            }
+        }
+
+        if let Some(content_length) = content_length {
+            let body = read_exact_buffered(stream, &mut buffered, content_length).await?;
+            raw.extend_from_slice(&body);
+        }
+
+        Ok(raw)
     }
 
     #[tokio::test]
     async fn test_h2_fallback_to_h1_does_not_reselect_provider_by_upstream_host() {
-        use std::io::Write;
-
-        use tempfile::NamedTempFile;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::time::{timeout, Duration};
@@ -2938,24 +3134,8 @@ mod tests {
             let _ = socket.shutdown().await;
         });
 
-        // Initialize PROGRAM (required by the old buggy path that re-parses as http::Request).
-        // Provider host != endpoint to trigger NoProviderFound during the second selection.
-        let config = format!(
-            r#"http_port: 8080
-providers:
-  - type: openai
-    host: route.example.com
-    endpoint: localhost
-    port: {}
-    tls: false
-"#,
-            upstream_port
-        );
-
-        let mut config_file = NamedTempFile::new().unwrap();
-        config_file.write_all(config.as_bytes()).unwrap();
-        config_file.flush().unwrap();
-        crate::load_config(config_file.path(), true).await.unwrap();
+        // Provider host != endpoint to ensure fallback uses the already-selected provider rather
+        // than re-selecting based on the rewritten upstream Host header.
 
         let pool = Arc::new(crate::executor::Pool::<Conn>::new());
         let h2pool = Arc::new(crate::h2client::H2Pool::new());
@@ -2992,8 +3172,7 @@ providers:
                 };
 
                 tokio::spawn(async move {
-                    info.proxy_h1(&mut worker, request, respond, "route.example.com")
-                        .await;
+                    info.proxy_h1(&mut worker, request, respond).await;
                 });
             }
         });
@@ -3043,6 +3222,514 @@ providers:
             .unwrap();
         assert!(req_str.starts_with("GET /test HTTP/1.1\r\n"));
         assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+    }
+
+    #[tokio::test]
+    async fn test_h2_fallback_to_h1_rebuilds_request_framing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let mut n = 0usize;
+            loop {
+                if n == buf.len() {
+                    buf.resize(buf.len() * 2, 0);
+                }
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                n += read;
+
+                if let Some(header_end) = find_header_end(&buf[..n]).map(|pos| pos + 4) {
+                    let body = &buf[header_end..n];
+                    if body.windows(5).any(|window| window == b"0\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+            buf.truncate(n);
+            let _ = req_tx.send(buf);
+
+            let body = "OK";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::POST)
+            .uri("https://route.example.com/upload")
+            .header("content-length", "10")
+            .header("content-type", "application/octet-stream")
+            .body(())
+            .unwrap();
+        let (response_fut, mut send_stream) = client.send_request(request, false).unwrap();
+        send_stream
+            .send_data(bytes::Bytes::from_static(b"abcdefghij"), true)
+            .unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("http/1.1")
+        );
+
+        let req_bytes = timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("upstream request was not captured")
+            .unwrap();
+        let req_str = String::from_utf8_lossy(&req_bytes);
+        assert!(req_str.starts_with("POST /upload HTTP/1.1\r\n"));
+        assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+        assert!(req_str.contains("Connection: keep-alive\r\n"));
+        assert!(req_str.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(req_str.contains("content-type: application/octet-stream\r\n"));
+        assert!(!req_str.contains("content-length: 10\r\n"));
+
+        let body_start = find_header_end(&req_bytes).unwrap() + 4;
+        assert_eq!(&req_bytes[body_start..], b"a\r\nabcdefghij\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_h2_fallback_to_h1_drops_client_trailers() {
+        use httplib::header::{HeaderMap, HeaderValue};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let req = capture_raw_http1_message(&mut socket).await.unwrap();
+            let _ = req_tx.send(req);
+
+            let body = "OK";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::POST)
+            .uri("https://route.example.com/upload")
+            .header("content-type", "application/octet-stream")
+            .header("te", "trailers")
+            .header("trailer", "x-checksum")
+            .body(())
+            .unwrap();
+        let (response_fut, mut send_stream) = client.send_request(request, false).unwrap();
+        send_stream
+            .send_data(bytes::Bytes::from_static(b"abcdefghij"), false)
+            .unwrap();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-checksum", HeaderValue::from_static("abc123"));
+        send_stream.send_trailers(trailers).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let req_bytes = timeout(Duration::from_secs(2), req_rx)
+            .await
+            .expect("upstream request was not captured")
+            .unwrap();
+        let req_str = String::from_utf8_lossy(&req_bytes);
+        assert!(req_str.starts_with("POST /upload HTTP/1.1\r\n"));
+        assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+        assert!(req_str.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!req_str.contains("te: trailers\r\n"));
+        assert!(!req_str.contains("trailer: x-checksum\r\n"));
+        assert!(!req_str.contains("x-checksum: abc123\r\n"));
+        let body_start = find_header_end(&req_bytes).unwrap() + 4;
+        assert_eq!(&req_bytes[body_start..], b"a\r\nabcdefghij\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_h2_fallback_to_h1_drops_upstream_response_trailers() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = capture_raw_http1_message(&mut socket).await.unwrap();
+            let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-checksum\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n";
+            socket.write_all(response).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::GET)
+            .uri("https://route.example.com/response-trailers")
+            .body(())
+            .unwrap();
+        let (response_fut, _send_stream) = client.send_request(request, true).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().get("trailer").is_none());
+
+        let mut body = response.into_body();
+        let collected = timeout(Duration::from_secs(2), async {
+            let mut collected = Vec::new();
+            while let Some(chunk) = body.data().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            collected
+        })
+        .await
+        .expect("timeout reading h2 body");
+        assert_eq!(collected, b"hello");
+        assert!(body.is_end_stream());
+    }
+
+    #[test]
+    fn test_build_h1_request_headers_ignores_bogus_client_content_length() {
+        use httplib::header::{HeaderMap, HeaderName, HeaderValue};
+
+        // Coverage intent: HTTP/2 enforces Content-Length consistency before requests reach the
+        // fallback proxy path. This locks the remaining invariant at the header-rebuild layer:
+        // even if a stale or malicious client Content-Length is present, fallback strips it and
+        // derives framing from actual body presence instead.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-length"),
+            HeaderValue::from_static("999"),
+        );
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/octet-stream"),
+        );
+
+        let result = build_h1_request_headers(
+            headers.iter(),
+            "upstream.example.com",
+            &[],
+            None,
+            true,
+            &[],
+            &[],
+        );
+
+        assert!(result.contains("Host: upstream.example.com\r\n"));
+        assert!(result.contains("Connection: keep-alive\r\n"));
+        assert!(result.contains("content-type: application/octet-stream\r\n"));
+        assert!(result.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!result.contains("content-length: 999\r\n"));
+        assert!(!result.contains("content-length:"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_h2_drops_request_and_response_trailers() {
+        use std::collections::HashMap;
+
+        use httplib::header::{HeaderMap, HeaderValue};
+        use tokio::time::{timeout, Duration};
+
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(64 * 1024);
+        let (upstream_send_request, upstream_client_conn) =
+            h2::client::handshake(upstream_client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = upstream_client_conn.await;
+        });
+        let h2conn = crate::h2client::H2Connection::new(upstream_send_request, "upstream.local");
+
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<(
+            String,
+            HashMap<String, Vec<String>>,
+            Vec<u8>,
+            Option<Vec<(String, String)>>,
+        )>();
+        tokio::spawn(async move {
+            let mut upstream = h2::server::handshake(upstream_server_io).await.unwrap();
+            let mut captured_tx = Some(captured_tx);
+            while let Some(next) = upstream.accept().await {
+                let (request, mut respond) = next.unwrap();
+                let tx = captured_tx.take();
+
+                tokio::spawn(async move {
+                    let path = request
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string());
+                    let mut headers = HashMap::<String, Vec<String>>::new();
+                    for (name, value) in request.headers() {
+                        headers
+                            .entry(name.as_str().to_string())
+                            .or_default()
+                            .push(value.to_str().unwrap().to_string());
+                    }
+
+                    let (_parts, mut body) = request.into_parts();
+                    let mut body_bytes = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        body_bytes.extend_from_slice(&chunk.unwrap());
+                    }
+                    let trailers = if !body.is_end_stream() {
+                        body.trailers().await.unwrap().map(|trailers| {
+                            trailers
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        value.to_str().unwrap().to_string(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(tx) = tx {
+                        let _ = tx.send((path, headers, body_bytes, trailers));
+                    }
+
+                    let response = httplib::Response::builder()
+                        .status(200)
+                        .version(httplib::Version::HTTP_2)
+                        .header("content-type", "application/json")
+                        .header("trailer", "x-upstream-checksum")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    send.send_data(bytes::Bytes::from_static(b"{}"), false)
+                        .unwrap();
+                    let mut response_trailers = HeaderMap::new();
+                    response_trailers.insert(
+                        "x-upstream-checksum",
+                        HeaderValue::from_static("resp-abc123"),
+                    );
+                    send.send_trailers(response_trailers).unwrap();
+                });
+            }
+        });
+
+        let info = UpstreamInfo {
+            endpoint: "upstream.local".to_string(),
+            sock_address: "unused".to_string(),
+            use_tls: true,
+            max_header_size: 4096,
+            host_header_value: "upstream.local".to_string(),
+            auth_header: None,
+            auth_header_keys: vec![],
+            path_prefix: None,
+            api_key: None,
+            auth_query_key: None,
+            extra_header_keys: vec![],
+            extra_headers_transformed: vec![],
+        };
+
+        let (client_io, proxy_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        tokio::spawn(async move {
+            let mut proxy = h2::server::handshake(proxy_io).await.unwrap();
+            while let Some(next) = proxy.accept().await {
+                let (request, respond) = next.unwrap();
+                let info = info.clone();
+                let h2conn = h2conn.clone();
+                tokio::spawn(async move {
+                    info.proxy_h2(h2conn, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::POST)
+            .uri("https://shared-auth-h2.local/v1/test")
+            .header("host", "shared-auth-h2.local")
+            .header("content-type", "application/octet-stream")
+            .header("te", "trailers")
+            .header("trailer", "x-client-checksum")
+            .body(())
+            .unwrap();
+        let (response_fut, mut send_stream) = client.send_request(request, false).unwrap();
+        send_stream
+            .send_data(bytes::Bytes::from_static(b"abcdefghij"), false)
+            .unwrap();
+        let mut request_trailers = HeaderMap::new();
+        request_trailers.insert("x-client-checksum", HeaderValue::from_static("req-abc123"));
+        send_stream.send_trailers(request_trailers).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().get("trailer").is_none());
+
+        let mut body = response.into_body();
+        let collected = timeout(Duration::from_secs(2), async {
+            let mut collected = Vec::new();
+            while let Some(chunk) = body.data().await {
+                collected.extend_from_slice(&chunk.unwrap());
+            }
+            collected
+        })
+        .await
+        .expect("timeout reading h2 body");
+        assert_eq!(collected, b"{}");
+        assert!(body.is_end_stream());
+
+        let (path, headers, body_bytes, trailers) = timeout(Duration::from_secs(2), captured_rx)
+            .await
+            .expect("upstream was not contacted")
+            .unwrap();
+        assert_eq!(path, "/v1/test");
+        assert_eq!(body_bytes, b"abcdefghij");
+        assert!(!headers.contains_key("te"));
+        assert!(!headers.contains_key("trailer"));
+        assert!(trailers.is_none());
     }
 
     #[tokio::test]

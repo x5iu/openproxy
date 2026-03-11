@@ -456,6 +456,20 @@ jobs:
           cd e2e
           python test_h2_h1_fallback.py
 
+      - name: Run H2 to H1 fallback framing test
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          cd e2e
+          python test_h2_h1_fallback_framing.py
+
+      - name: Run HTTP/1.1 trailer ignoring test
+        env:
+          OPENPROXY_BINARY: ${{ github.workspace }}/target/release/openproxy
+        run: |
+          cd e2e
+          python test_h1_trailers.py
+
       - name: Start echo servers for rewrite+auth test
         run: |
           # Start echo server for provider with path rewrite (port 9006)
