@@ -1010,13 +1010,14 @@ impl UpstreamInfo {
 
         // Copy response headers
         for (key, value) in parts.headers.iter() {
-            if !is_http2_invalid_headers(key.as_str()) {
+            if !is_http2_invalid_headers(key.as_str()) && !is_upstream_protocol_header(key.as_str())
+            {
                 builder = builder.header(key, value);
             }
         }
 
         // Add header to indicate upstream protocol
-        builder = builder.header("x-upstream-protocol", "h2");
+        builder = builder.header(UPSTREAM_PROTOCOL_HEADER, "h2");
 
         let response_has_body = !upstream_body.is_end_stream();
 
@@ -1197,7 +1198,7 @@ impl UpstreamInfo {
             {
                 is_transfer_encoding_chunked = true;
             }
-            if !is_http2_invalid_headers(header.name) {
+            if !is_http2_invalid_headers(header.name) && !is_upstream_protocol_header(header.name) {
                 builder = builder.header(header.name, header.value);
             }
         }
@@ -1218,7 +1219,7 @@ impl UpstreamInfo {
         }
 
         // Add header to indicate upstream protocol
-        builder = builder.header("x-upstream-protocol", "http/1.1");
+        builder = builder.header(UPSTREAM_PROTOCOL_HEADER, "http/1.1");
 
         let mut send = match respond.send_response(builder.body(()).unwrap(), false) {
             Ok(send) => send,
@@ -2170,6 +2171,13 @@ fn base64_encode(data: &[u8]) -> String {
     }
 
     result
+}
+
+const UPSTREAM_PROTOCOL_HEADER: &str = "x-upstream-protocol";
+
+#[inline]
+fn is_upstream_protocol_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(UPSTREAM_PROTOCOL_HEADER)
 }
 
 #[inline]
@@ -3222,6 +3230,113 @@ mod tests {
             .unwrap();
         assert!(req_str.starts_with("GET /test HTTP/1.1\r\n"));
         assert!(req_str.contains(&format!("Host: localhost:{}\r\n", upstream_port)));
+    }
+
+    #[tokio::test]
+    async fn test_h2_fallback_to_h1_single_x_upstream_protocol_not_comma_joined() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let mut n = 0usize;
+            loop {
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                n += read;
+                if find_header_end(&buf[..n]).is_some() {
+                    break;
+                }
+                if n >= buf.len() {
+                    break;
+                }
+            }
+
+            let body = "OK";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nX-Upstream-Protocol: h2, h2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::GET)
+            .uri("https://route.example.com/test")
+            .header("content-length", "0")
+            .body(())
+            .unwrap();
+        let (response_fut, _send_stream) = client.send_request(request, true).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let values: Vec<&str> = response
+            .headers()
+            .get_all(UPSTREAM_PROTOCOL_HEADER)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values, vec!["http/1.1"]);
+    }
+
+    // H2->H2 response header copy uses the same `is_upstream_protocol_header` predicate as H2->H1 fallback.
+    #[test]
+    fn test_is_upstream_protocol_header_predicate() {
+        assert!(is_upstream_protocol_header("x-upstream-protocol"));
+        assert!(is_upstream_protocol_header("X-Upstream-Protocol"));
+        assert!(is_upstream_protocol_header("X-UPSTREAM-PROTOCOL"));
+        assert!(!is_upstream_protocol_header("x-upstream-protocol-extra"));
+        assert!(!is_upstream_protocol_header("x-other"));
     }
 
     #[tokio::test]
