@@ -143,22 +143,24 @@ def test_no_provider_found_https_http2():
     ssl_cert = os.environ.get("SSL_CERT_FILE")
 
     # HTTP/2 mode
-    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=10) as client:
         resp = client.get(
             "/models",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                # In HTTP/2, :authority pseudo-header is used instead of Host
-                # httpx will handle this
+                "Host": "no-such-provider.local",
             },
-            extensions={"authority": "no-such-provider.local"},  # Try to override authority
+            extensions={"authority": "no-such-provider.local"},
         )
 
-    print("Status:", resp.status_code)
-    print("Body:", resp.text[:200] if len(resp.text) > 200 else resp.text)
+    print(f"Status: {resp.status_code}")
+    print(f"HTTP Version: {resp.http_version}")
+    print(f"Body: {resp.text[:200] if len(resp.text) > 200 else resp.text}")
 
-    # HTTP/2 may handle this differently, accept 404 or valid response if authority override doesn't work
-    print(f"  -> Status: {resp.status_code}")
+    assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
+    assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+    assert "no provider found" in resp.text.lower(), \
+        f"Expected 'no provider found' in body, got: {resp.text!r}"
 
     print("\u2713 HTTPS HTTP/2 no-provider-found test passed!")
 
