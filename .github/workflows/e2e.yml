@@ -409,7 +409,7 @@ jobs:
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
           cd e2e
-          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
+          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --route-host api.openai.com --timeout 60
 
       - name: Start HTTP echo server for fallback test
         run: |
