@@ -20,6 +20,48 @@ class EntitiesModel(BaseModel):
     animals: List[str]
 
 
+def _chat_completions_payload():
+    """Build a minimal chat/completions JSON payload."""
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    return {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "ping"},
+        ],
+        "max_tokens": 1,
+    }
+
+
+def _h2_chat_completions(client, api_key, extra_headers=None):
+    """POST /chat/completions over the given httpx client with bearer auth."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return client.post(
+        "/chat/completions",
+        headers=headers,
+        json=_chat_completions_payload(),
+    )
+
+
+async def _h2_chat_completions_async(client, api_key, extra_headers=None):
+    """Async POST /chat/completions over the given httpx AsyncClient."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return await client.post(
+        "/chat/completions",
+        headers=headers,
+        json=_chat_completions_payload(),
+    )
+
+
 def test_h2_upstream_basic():
     """Test basic HTTP/2 upstream connectivity."""
     print(f"\n{'='*50}")
@@ -31,13 +73,8 @@ def test_h2_upstream_basic():
     ssl_cert = os.environ.get("SSL_CERT_FILE")
 
     # Use HTTP/2 client
-    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
-        resp = client.get(
-            "/models",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-            },
-        )
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=60) as client:
+        resp = _h2_chat_completions(client, api_key)
         print(f"Status: {resp.status_code}")
         print(f"HTTP Version: {resp.http_version}")
         print(f"x-upstream-protocol: {resp.headers.get('x-upstream-protocol')}")
@@ -106,14 +143,7 @@ def test_h2_upstream_multiplexing():
     # Make multiple concurrent requests over the same HTTP/2 connection
     async def make_async_requests():
         async with httpx.AsyncClient(base_url=base_url, http2=True, verify=ssl_cert, timeout=60) as client:
-            tasks = []
-            for i in range(5):
-                task = client.get(
-                    "/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                tasks.append(task)
-
+            tasks = [_h2_chat_completions_async(client, api_key) for _ in range(5)]
             responses = await asyncio.gather(*tasks)
 
             for i, resp in enumerate(responses):
@@ -180,12 +210,9 @@ def test_h2_upstream_connection_reuse():
 
     # Make sequential requests and verify they succeed
     # HTTP/2 should reuse the same connection
-    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=30) as client:
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=60) as client:
         for i in range(5):
-            resp = client.get(
-                "/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+            resp = _h2_chat_completions(client, api_key)
             print(f"  Request {i+1}: Status {resp.status_code}")
             assert resp.status_code == 200, f"Request {i+1} failed with status {resp.status_code}"
             assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
@@ -194,27 +221,39 @@ def test_h2_upstream_connection_reuse():
 
 
 def test_h2_upstream_error_handling():
-    """Test HTTP/2 upstream error handling (404 from upstream)."""
+    """Test HTTP/2 proxy-side no-provider error handling.
+
+    Avoids depending on upstream /models or /nonexistent-endpoint reliability.
+    Targets a non-existent provider host so the proxy itself returns the
+    no-provider response over HTTP/2.
+    """
     print(f"\n{'='*50}")
-    print("Testing HTTP/2 upstream error handling")
+    print("Testing HTTP/2 proxy no-provider error handling")
     print('='*50)
 
     base_url = os.environ["OPENAI_BASE_URL"]
     api_key = os.environ["OPENAI_API_KEY"]
     ssl_cert = os.environ.get("SSL_CERT_FILE")
 
-    # Test with invalid endpoint - should get 404 from upstream
-    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=30) as client:
         resp = client.get(
-            "/nonexistent-endpoint",
-            headers={"Authorization": f"Bearer {api_key}"},
+            "/models",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Host": "no-such-provider.local",
+            },
+            extensions={"authority": "no-such-provider.local"},
         )
-        print(f"Invalid endpoint: Status {resp.status_code}")
+        print(f"Status: {resp.status_code}")
         print(f"HTTP Version: {resp.http_version}")
+        print(f"Body: {resp.text[:200] if len(resp.text) > 200 else resp.text}")
+
         assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
         assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+        assert "no provider found" in resp.text.lower(), \
+            f"Expected 'no provider found' in body, got: {resp.text!r}"
 
-    print("\u2713 HTTP/2 upstream error handling test passed!")
+    print("\u2713 HTTP/2 proxy no-provider error handling test passed!")
 
 
 def test_h2_invalid_auth_key():
@@ -263,10 +302,7 @@ def test_h2_upstream_concurrent_streams():
 
     def make_request(i):
         with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=60) as client:
-            resp = client.get(
-                "/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+            resp = _h2_chat_completions(client, api_key)
             return i, resp.status_code, resp.http_version
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -294,11 +330,11 @@ def test_h2_upstream_headers_preservation():
     ssl_cert = os.environ.get("SSL_CERT_FILE")
 
     # Add custom headers and verify the request succeeds
-    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert) as client:
-        resp = client.get(
-            "/models",
-            headers={
-                "Authorization": f"Bearer {api_key}",
+    with httpx.Client(base_url=base_url, http2=True, verify=ssl_cert, timeout=60) as client:
+        resp = _h2_chat_completions(
+            client,
+            api_key,
+            extra_headers={
                 "X-Custom-Header": "test-value",
                 "Accept": "application/json",
                 "User-Agent": "openproxy-e2e-test/1.0",
