@@ -297,8 +297,7 @@ jobs:
 
       - name: Start openproxy
         run: |
-          ./target/release/openproxy start -c config.yml > /tmp/openproxy.log 2>&1 &
-          echo $! > openproxy.pid
+          ./target/release/openproxy start -c config.yml &
           sleep 3
           curl -k https://localhost:8443 || true
           curl http://localhost:8080 || true
@@ -952,7 +951,3 @@ jobs:
           cd e2e
           python test_connect_tunnel.py
           echo "CONNECT tunnel upstream unreachable test passed!"
-
-      - name: Print openproxy log on failure
-        if: failure()
-        run: tail -n 400 /tmp/openproxy.log || true

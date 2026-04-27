@@ -77,10 +77,6 @@ def test_h2_upstream_basic():
         resp = _h2_chat_completions(client, api_key)
         print(f"Status: {resp.status_code}")
         print(f"HTTP Version: {resp.http_version}")
-        print(f"x-upstream-protocol: {resp.headers.get('x-upstream-protocol')}")
-        print(f"content-type: {resp.headers.get('content-type')}")
-        print(f"response headers: {dict(resp.headers)}")
-        print(f"body preview: {repr(resp.text[:1000])}")
 
         # Verify we're using HTTP/2 on the client side
         assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
@@ -246,7 +242,6 @@ def test_h2_upstream_error_handling():
         )
         print(f"Status: {resp.status_code}")
         print(f"HTTP Version: {resp.http_version}")
-        print(f"Body: {resp.text[:200] if len(resp.text) > 200 else resp.text}")
 
         assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
         assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
