@@ -839,11 +839,23 @@ struct UpstreamInfo {
 }
 
 #[inline]
+fn is_safe_idempotent_method(method: &httplib::Method) -> bool {
+    matches!(
+        *method,
+        httplib::Method::GET
+            | httplib::Method::HEAD
+            | httplib::Method::OPTIONS
+            | httplib::Method::TRACE
+    )
+}
+
+#[inline]
 fn stale_h2_retry_eligible_for_response_error(
     stale_retry_budget: u8,
     has_request_body: bool,
+    method: &httplib::Method,
 ) -> bool {
-    stale_retry_budget > 0 && !has_request_body
+    stale_retry_budget > 0 && !has_request_body && is_safe_idempotent_method(method)
 }
 
 impl UpstreamInfo {
@@ -1029,7 +1041,11 @@ impl UpstreamInfo {
                     break 'attempt resp;
                 }
                 Err(e) => {
-                    if !stale_h2_retry_eligible_for_response_error(stale_retry_budget, has_body) {
+                    if !stale_h2_retry_eligible_for_response_error(
+                        stale_retry_budget,
+                        has_body,
+                        &parts.method,
+                    ) {
                         worker.h2pool.remove(&self.endpoint).await;
                         invalid!(respond, 502, format!("upstream response: {}", e));
                         return;
@@ -2530,10 +2546,42 @@ mod tests {
 
     #[test]
     fn test_stale_h2_retry_eligible_for_response_error() {
-        assert!(stale_h2_retry_eligible_for_response_error(1, false));
-        assert!(!stale_h2_retry_eligible_for_response_error(1, true));
-        assert!(!stale_h2_retry_eligible_for_response_error(0, false));
-        assert!(!stale_h2_retry_eligible_for_response_error(0, true));
+        let get = httplib::Method::GET;
+        let head = httplib::Method::HEAD;
+        let options = httplib::Method::OPTIONS;
+        let trace = httplib::Method::TRACE;
+        let post = httplib::Method::POST;
+        let patch = httplib::Method::PATCH;
+        let delete = httplib::Method::DELETE;
+        let put = httplib::Method::PUT;
+
+        // Safe + idempotent methods without body and with retry budget: retryable.
+        assert!(stale_h2_retry_eligible_for_response_error(1, false, &get));
+        assert!(stale_h2_retry_eligible_for_response_error(1, false, &head));
+        assert!(stale_h2_retry_eligible_for_response_error(
+            1, false, &options
+        ));
+        assert!(stale_h2_retry_eligible_for_response_error(1, false, &trace));
+
+        // Non-safe methods are never retryable, even bodyless with budget.
+        assert!(!stale_h2_retry_eligible_for_response_error(1, false, &post));
+        assert!(!stale_h2_retry_eligible_for_response_error(
+            1, false, &patch
+        ));
+        assert!(!stale_h2_retry_eligible_for_response_error(
+            1, false, &delete
+        ));
+        assert!(!stale_h2_retry_eligible_for_response_error(1, false, &put));
+
+        // Any request with body is not retryable.
+        assert!(!stale_h2_retry_eligible_for_response_error(1, true, &get));
+        assert!(!stale_h2_retry_eligible_for_response_error(1, true, &head));
+        assert!(!stale_h2_retry_eligible_for_response_error(1, true, &post));
+
+        // Zero retry budget is not retryable.
+        assert!(!stale_h2_retry_eligible_for_response_error(0, false, &get));
+        assert!(!stale_h2_retry_eligible_for_response_error(0, false, &post));
+        assert!(!stale_h2_retry_eligible_for_response_error(0, true, &get));
     }
 
     #[test]
