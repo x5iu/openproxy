@@ -60,7 +60,7 @@ def test_anthropic_messages_x_api_key_http1():
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-3-haiku-20240307",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "Say 'Hello' in one word."}],
             },
@@ -110,7 +110,7 @@ def test_anthropic_chat_completions_bearer_http1():
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-3-haiku-20240307",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "Say 'World' in one word."}],
             },
@@ -164,7 +164,7 @@ def test_anthropic_messages_x_api_key_http2():
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-3-haiku-20240307",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "Say 'HTTP2' in one word."}],
             },
@@ -217,7 +217,7 @@ def test_anthropic_chat_completions_bearer_http2():
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-3-haiku-20240307",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 50,
                 "messages": [{"role": "user", "content": "Say 'Bearer' in one word."}],
             },
@@ -267,7 +267,7 @@ def test_openai_compatible_http1():
 
     print("Sending request via openai SDK (Chat Completions)...")
     response = client.chat.completions.create(
-        model="claude-3-haiku-20240307",
+        model="claude-haiku-4-5-20251001",
         max_tokens=50,
         messages=[{"role": "user", "content": "Say 'OpenAI' in one word."}],
     )
@@ -310,7 +310,7 @@ def test_openai_compatible_http2():
 
     print("Sending request via openai SDK (Chat Completions)...")
     response = client.chat.completions.create(
-        model="claude-3-haiku-20240307",
+        model="claude-haiku-4-5-20251001",
         max_tokens=50,
         messages=[{"role": "user", "content": "Say 'OpenAI' in one word."}],
     )

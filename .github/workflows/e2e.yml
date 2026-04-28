@@ -408,7 +408,7 @@ jobs:
           SSL_CERT_FILE: ${{ github.workspace }}/fullchain.pem
         run: |
           cd e2e
-          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --timeout 60
+          python test_openai_realtime.py --proxy-host localhost --proxy-port 8443 --ssl-cert $SSL_CERT_FILE --route-host api.openai.com --timeout 60
 
       - name: Start HTTP echo server for fallback test
         run: |
@@ -560,7 +560,7 @@ jobs:
             --http2 \
             -H "Host: gemini.localhost:8443" \
             -H "x-goog-api-key: ${PROXY_AUTH_KEY}" \
-            "https://localhost:8443/v1beta/models?key=placeholder&pageSize=1"
+            "https://localhost:8443/v1beta/models?pageSize=1"
 
           HTTP_CODE=$(head -1 /tmp/gemini_headers.txt | grep -oE '[0-9]{3}')
           echo "HTTP Status: $HTTP_CODE"
@@ -603,7 +603,7 @@ jobs:
           HTTP_CODE=$(curl -s -o /tmp/gemini_response_http.json -w "%{http_code}" \
             -H "Host: gemini.localhost:8080" \
             -H "x-goog-api-key: ${PROXY_AUTH_KEY}" \
-            "http://localhost:8080/v1beta/models?key=placeholder&pageSize=1")
+            "http://localhost:8080/v1beta/models?pageSize=1")
 
           echo "HTTP Status: $HTTP_CODE"
           cat /tmp/gemini_response_http.json | head -c 500

@@ -48,6 +48,7 @@ class OpenAIRealtimeTest:
         ssl_cert: Optional[str] = None,
         model: str = "gpt-4o-realtime-preview-2024-12-17",
         timeout: int = 30,
+        route_host: Optional[str] = None,
     ):
         self.api_key = api_key
         self.proxy_host = proxy_host
@@ -55,6 +56,7 @@ class OpenAIRealtimeTest:
         self.ssl_cert = ssl_cert
         self.model = model
         self.timeout = timeout
+        self.route_host = route_host or ("api.openai.com" if proxy_host else None)
 
         self.ws: Optional[websocket.WebSocketApp] = None
         self.connected = False
@@ -80,9 +82,10 @@ class OpenAIRealtimeTest:
             f"Authorization: Bearer {self.api_key}",
             "OpenAI-Beta: realtime=v1",
         ]
-        if self.proxy_host:
-            # Add Host header for proxy to route correctly
-            headers.append("Host: api.openai.com")
+        # Note: Do not append a Host header here. websocket-client manages the
+        # Host header itself; passing one as a custom header can result in
+        # duplicate Host headers and a 400 from strict upstreams. When
+        # proxying, the actual Host is supplied via run_forever(host=...).
         return headers
 
     def on_open(self, ws):
@@ -177,6 +180,8 @@ class OpenAIRealtimeTest:
         print('='*60)
         print(f"URL: {url}")
         print(f"Proxy: {self.proxy_host}:{self.proxy_port}" if self.proxy_host else "Proxy: None (direct)")
+        if self.proxy_host:
+            print(f"Route Host: {self.route_host}")
         print(f"Model: {self.model}")
         print('='*60)
 
@@ -201,8 +206,26 @@ class OpenAIRealtimeTest:
         )
 
         # Run in a separate thread
+        run_kwargs: Dict[str, Any] = {}
+        if sslopt:
+            run_kwargs["sslopt"] = sslopt
+        if self.proxy_host and self.route_host:
+            # Tell websocket-client to use the upstream host as the Host header
+            # instead of the proxy address. This avoids duplicate/incorrect
+            # Host headers reaching upstream.
+            run_kwargs["host"] = self.route_host
+            # Avoid forwarding an Origin based on localhost when proxying, if
+            # the installed websocket-client supports the kwarg.
+            try:
+                import inspect
+                sig = inspect.signature(self.ws.run_forever)
+                if "suppress_origin" in sig.parameters:
+                    run_kwargs["suppress_origin"] = True
+            except (TypeError, ValueError):
+                pass
+
         ws_thread = threading.Thread(
-            target=lambda: self.ws.run_forever(sslopt=sslopt if sslopt else None)
+            target=lambda: self.ws.run_forever(**run_kwargs)
         )
         ws_thread.daemon = True
         ws_thread.start()
@@ -273,8 +296,14 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gpt-4o-realtime-preview-2024-12-17",
-        help="Model to use (default: gpt-4o-realtime-preview-2024-12-17)"
+        default=os.environ.get("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17"),
+        help="Model to use (default: env OPENAI_REALTIME_MODEL or gpt-4o-realtime-preview-2024-12-17)"
+    )
+    parser.add_argument(
+        "--route-host",
+        default=os.environ.get("OPENAI_REALTIME_ROUTE_HOST"),
+        help="Upstream Host header value to send when proxying "
+             "(default: OPENAI_REALTIME_ROUTE_HOST env var or api.openai.com)"
     )
     parser.add_argument(
         "--timeout",
@@ -309,6 +338,7 @@ def main():
         ssl_cert=args.ssl_cert,
         model=args.model,
         timeout=args.timeout,
+        route_host=args.route_host,
     )
 
     success = test.run()

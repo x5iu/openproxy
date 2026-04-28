@@ -776,8 +776,7 @@ where
                     // Drop the read lock before async operations
                     drop(p);
 
-                    // Try to get or create HTTP/2 connection to upstream
-                    let h2result = match worker
+                    let (h2result, reused_from_pool) = match worker
                         .get_or_create_h2(&info.endpoint, &info.sock_address, info.use_tls)
                         .await
                     {
@@ -790,7 +789,8 @@ where
 
                     match h2result {
                         H2ConnectResult::H2(h2conn) => {
-                            info.proxy_h2(h2conn, request, respond).await;
+                            info.proxy_h2(&mut worker, reused_from_pool, h2conn, request, respond)
+                                .await;
                         }
                         H2ConnectResult::FallbackToH1 => {
                             info.proxy_h1(&mut worker, request, respond).await;
@@ -838,14 +838,101 @@ struct UpstreamInfo {
     extra_headers_transformed: Vec<(String, String)>,
 }
 
+#[inline]
+fn is_safe_idempotent_method(method: &httplib::Method) -> bool {
+    matches!(
+        *method,
+        httplib::Method::GET
+            | httplib::Method::HEAD
+            | httplib::Method::OPTIONS
+            | httplib::Method::TRACE
+    )
+}
+
+#[inline]
+fn stale_h2_retry_eligible_for_response_error(
+    stale_retry_budget: u8,
+    has_request_body: bool,
+    method: &httplib::Method,
+) -> bool {
+    stale_retry_budget > 0 && !has_request_body && is_safe_idempotent_method(method)
+}
+
 impl UpstreamInfo {
-    /// Proxy request to upstream using HTTP/2.
-    async fn proxy_h2(
+    fn build_h2_upstream_request_payload(
         &self,
-        h2conn: crate::h2client::H2Connection,
-        request: httplib::Request<h2::RecvStream>,
+        parts: &httplib::request::Parts,
+    ) -> Result<httplib::Request<()>, String> {
+        let raw_path = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let path = build_upstream_path(
+            raw_path,
+            self.path_prefix.as_deref(),
+            self.api_key.as_deref(),
+            self.auth_query_key,
+        );
+
+        let upstream_uri = httplib::Uri::builder()
+            .scheme(if self.use_tls { "https" } else { "http" })
+            .authority(self.host_header_value.as_str())
+            .path_and_query(path.as_str())
+            .build()
+            .map_err(|e| format!("invalid upstream uri: {}", e))?;
+
+        let mut upstream_request = httplib::Request::builder()
+            .method(parts.method.clone())
+            .uri(upstream_uri)
+            .version(httplib::Version::HTTP_2);
+
+        for (key, value) in parts.headers.iter() {
+            let key_str = key.as_str();
+            if key_str.starts_with(':') || is_http2_invalid_headers(key_str) {
+                continue;
+            }
+            if key_str.eq_ignore_ascii_case("host") {
+                upstream_request = upstream_request.header("host", self.host_header_value.as_str());
+                continue;
+            }
+            if should_filter_forwarded_header(
+                key_str,
+                &self.auth_header_keys,
+                &self.extra_header_keys,
+            ) {
+                continue;
+            }
+            upstream_request = upstream_request.header(key, value);
+        }
+
+        if let Some(ref auth) = self.auth_header {
+            if let Some((header_name, header_value)) = parse_auth_header(auth) {
+                upstream_request = upstream_request.header(header_name, header_value);
+            }
+        }
+
+        for (name, value) in &self.extra_headers_transformed {
+            upstream_request = upstream_request.header(name.as_str(), value.as_str());
+        }
+
+        upstream_request
+            .body(())
+            .map_err(|e| format!("build request: {}", e))
+    }
+
+    async fn proxy_h2<P, H2P>(
+        &self,
+        worker: &mut Worker<P, H2P>,
+        reused_from_pool: bool,
+        mut h2conn: crate::h2client::H2Connection,
+        mut request: httplib::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<bytes::Bytes>,
-    ) {
+    ) where
+        P: PoolTrait + Send + Sync + 'static,
+        H2P: H2PoolTrait + Send + Sync + 'static,
+        <P as PoolTrait>::Item: ConnTrait + Unpin + Send + Sync,
+    {
         macro_rules! invalid {
             ($respond:expr, $status:expr, $msg:expr) => {{
                 let msg: Cow<str> = $msg.into();
@@ -868,155 +955,137 @@ impl UpstreamInfo {
             }};
         }
 
-        let mut send_request = h2conn.send_request();
+        let mut stale_retry_budget = u8::from(reused_from_pool);
 
-        // Build the upstream request path
-        let raw_path = request
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let path = build_upstream_path(
-            raw_path,
-            self.path_prefix.as_deref(),
-            self.api_key.as_deref(),
-            self.auth_query_key,
-        );
+        let upstream_response = 'attempt: loop {
+            let (parts, recv) = request.into_parts();
+            let has_body = !recv.is_end_stream();
+            let mut recv_opt = Some(recv);
 
-        // Build upstream URI
-        let upstream_uri = httplib::Uri::builder()
-            .scheme(if self.use_tls { "https" } else { "http" })
-            .authority(self.host_header_value.as_str())
-            .path_and_query(path.as_str())
-            .build();
-
-        let upstream_uri = match upstream_uri {
-            Ok(uri) => uri,
-            Err(e) => {
-                invalid!(respond, 502, format!("invalid upstream uri: {}", e));
-                return;
-            }
-        };
-
-        // Build the request to send to upstream
-        let mut upstream_request = httplib::Request::builder()
-            .method(request.method().clone())
-            .uri(upstream_uri)
-            .version(httplib::Version::HTTP_2);
-
-        // Copy headers, filtering out HTTP/2 pseudo-headers and connection-specific headers
-        for (key, value) in request.headers() {
-            let key_str = key.as_str();
-            // Skip pseudo-headers (they start with :) and connection-specific headers
-            if key_str.starts_with(':') || is_http2_invalid_headers(key_str) {
-                continue;
-            }
-            // Replace Host header with upstream host
-            if key_str.eq_ignore_ascii_case("host") {
-                upstream_request = upstream_request.header("host", self.host_header_value.as_str());
-                continue;
-            }
-            if should_filter_forwarded_header(
-                key_str,
-                &self.auth_header_keys,
-                &self.extra_header_keys,
-            ) {
-                continue;
-            }
-            upstream_request = upstream_request.header(key, value);
-        }
-
-        // Add provider's auth header if present
-        if let Some(ref auth) = self.auth_header {
-            if let Some((header_name, header_value)) = parse_auth_header(auth) {
-                upstream_request = upstream_request.header(header_name, header_value);
-            }
-        }
-
-        // Add transformed extra headers
-        for (name, value) in &self.extra_headers_transformed {
-            upstream_request = upstream_request.header(name.as_str(), value.as_str());
-        }
-
-        let upstream_request = match upstream_request.body(()) {
-            Ok(req) => req,
-            Err(e) => {
-                invalid!(respond, 502, format!("build request: {}", e));
-                return;
-            }
-        };
-
-        // Get the request body
-        let recv_body = request.into_body();
-
-        // Check if request has a body
-        let has_body = !recv_body.is_end_stream();
-
-        // Send the request
-        let (upstream_response, mut upstream_send_body) =
-            match send_request.send_request(upstream_request, !has_body) {
-                Ok(res) => res,
-                Err(e) => {
-                    invalid!(respond, 502, format!("upstream send: {}", e));
+            let upstream_request = match self.build_h2_upstream_request_payload(&parts) {
+                Ok(req) => req,
+                Err(msg) => {
+                    invalid!(respond, 502, msg);
                     return;
                 }
             };
 
-        // Stream the request body to upstream if present
-        if has_body {
-            let mut body_reader = H2StreamReader::new(recv_body);
-            let mut buf = vec![0u8; 16384];
-            loop {
-                match body_reader.read(&mut buf).await {
-                    Ok(0) => {
-                        if let Err(e) = body_reader.discard_trailers().await {
-                            log::error!(alpn = "h2", error = e.to_string(); "discard_client_request_trailers_error");
+            let mut send_request = h2conn.send_request();
+            let (upstream_response, mut upstream_send_body) =
+                match send_request.send_request(upstream_request, !has_body) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        if stale_retry_budget == 0 {
+                            worker.h2pool.remove(&self.endpoint).await;
+                            invalid!(respond, 502, format!("upstream send: {}", e));
                             return;
                         }
-                        if let Err(e) = upstream_send_body.send_data(bytes::Bytes::new(), true) {
-                            log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_end_error");
+                        stale_retry_budget = 0;
+                        request = httplib::Request::from_parts(parts, recv_opt.take().unwrap());
+                        match worker
+                            .refresh_h2_upstream(&self.endpoint, &self.sock_address, self.use_tls)
+                            .await
+                        {
+                            Ok(H2ConnectResult::H2(c)) => {
+                                h2conn = c;
+                                continue 'attempt;
+                            }
+                            Ok(H2ConnectResult::FallbackToH1) => {
+                                return self.proxy_h1(worker, request, respond).await;
+                            }
+                            Err(e2) => {
+                                invalid!(respond, 502, format!("upstream: {}", e2));
+                                return;
+                            }
                         }
-                        break;
                     }
-                    Ok(n) => {
-                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                        if let Err(e) = upstream_send_body.send_data(data, false) {
-                            log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_error");
+                };
+
+            if has_body {
+                let recv = recv_opt.take().unwrap();
+                let mut body_reader = H2StreamReader::new(recv);
+                let mut buf = vec![0u8; 16384];
+                loop {
+                    match body_reader.read(&mut buf).await {
+                        Ok(0) => {
+                            if let Err(e) = body_reader.discard_trailers().await {
+                                log::error!(alpn = "h2", error = e.to_string(); "discard_client_request_trailers_error");
+                                return;
+                            }
+                            if let Err(e) = upstream_send_body.send_data(bytes::Bytes::new(), true)
+                            {
+                                log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_end_error");
+                            }
+                            break;
+                        }
+                        Ok(n) => {
+                            let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                            if let Err(e) = upstream_send_body.send_data(data, false) {
+                                log::error!(alpn = "h2", error = e.to_string(); "upstream_send_body_error");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(alpn = "h2", error = e.to_string(); "read_client_body_error");
                             break;
                         }
                     }
-                    Err(e) => {
-                        log::error!(alpn = "h2", error = e.to_string(); "read_client_body_error");
-                        break;
+                }
+            }
+
+            match upstream_response.await {
+                Ok(resp) => {
+                    if let Some(r) = recv_opt.take() {
+                        drop(r);
+                    }
+                    break 'attempt resp;
+                }
+                Err(e) => {
+                    if !stale_h2_retry_eligible_for_response_error(
+                        stale_retry_budget,
+                        has_body,
+                        &parts.method,
+                    ) {
+                        worker.h2pool.remove(&self.endpoint).await;
+                        invalid!(respond, 502, format!("upstream response: {}", e));
+                        return;
+                    }
+                    stale_retry_budget = 0;
+                    request = httplib::Request::from_parts(parts, recv_opt.take().unwrap());
+                    match worker
+                        .refresh_h2_upstream(&self.endpoint, &self.sock_address, self.use_tls)
+                        .await
+                    {
+                        Ok(H2ConnectResult::H2(c)) => {
+                            h2conn = c;
+                            continue 'attempt;
+                        }
+                        Ok(H2ConnectResult::FallbackToH1) => {
+                            return self.proxy_h1(worker, request, respond).await;
+                        }
+                        Err(e2) => {
+                            invalid!(respond, 502, format!("upstream: {}", e2));
+                            return;
+                        }
                     }
                 }
             }
-        }
-
-        // Wait for the response
-        let upstream_response = match upstream_response.await {
-            Ok(resp) => resp,
-            Err(e) => {
-                invalid!(respond, 502, format!("upstream response: {}", e));
-                return;
-            }
         };
 
-        // Build response to send back to client
-        let (parts, mut upstream_body) = upstream_response.into_parts();
+        let (res_parts, mut upstream_body) = upstream_response.into_parts();
         let mut builder = httplib::Response::builder()
             .version(httplib::Version::HTTP_2)
-            .status(parts.status);
+            .status(res_parts.status);
 
-        // Copy response headers
-        for (key, value) in parts.headers.iter() {
-            if !is_http2_invalid_headers(key.as_str()) {
+        for (key, value) in res_parts.headers.iter() {
+            if !is_http2_invalid_headers(key.as_str()) && !is_upstream_protocol_header(key.as_str())
+            {
                 builder = builder.header(key, value);
             }
         }
 
         // Add header to indicate upstream protocol
-        builder = builder.header("x-upstream-protocol", "h2");
+        builder = builder.header(UPSTREAM_PROTOCOL_HEADER, "h2");
 
         let response_has_body = !upstream_body.is_end_stream();
 
@@ -1197,7 +1266,7 @@ impl UpstreamInfo {
             {
                 is_transfer_encoding_chunked = true;
             }
-            if !is_http2_invalid_headers(header.name) {
+            if !is_http2_invalid_headers(header.name) && !is_upstream_protocol_header(header.name) {
                 builder = builder.header(header.name, header.value);
             }
         }
@@ -1218,7 +1287,7 @@ impl UpstreamInfo {
         }
 
         // Add header to indicate upstream protocol
-        builder = builder.header("x-upstream-protocol", "http/1.1");
+        builder = builder.header(UPSTREAM_PROTOCOL_HEADER, "http/1.1");
 
         let mut send = match respond.send_response(builder.body(()).unwrap(), false) {
             Ok(send) => send,
@@ -1345,26 +1414,35 @@ where
         self.pool.add(endpoint, conn).await;
     }
 
-    /// Gets an existing HTTP/2 connection from the pool or creates a new one.
-    /// Returns `H2ConnectResult::FallbackToH1` if upstream doesn't support HTTP/2.
-    async fn get_or_create_h2(
+    async fn refresh_h2_upstream(
         &self,
         endpoint: &str,
         sock_address: &str,
         use_tls: bool,
     ) -> Result<H2ConnectResult, Error> {
-        // Try to get an existing connection
-        if let Some(conn) = self.h2pool.get(endpoint).await {
-            return Ok(H2ConnectResult::H2(conn));
-        }
-
-        // Try to create a new connection
+        self.h2pool.remove(endpoint).await;
         let result = h2client::connect_h2(endpoint, sock_address, use_tls).await?;
         if let H2ConnectResult::H2(ref conn) = result {
-            // Store it in the pool for future use (H2 connections are multiplexed)
             self.h2pool.insert(endpoint, conn.clone()).await;
         }
         Ok(result)
+    }
+
+    async fn get_or_create_h2(
+        &self,
+        endpoint: &str,
+        sock_address: &str,
+        use_tls: bool,
+    ) -> Result<(H2ConnectResult, bool), Error> {
+        if let Some(conn) = self.h2pool.get(endpoint).await {
+            return Ok((H2ConnectResult::H2(conn), true));
+        }
+
+        let result = h2client::connect_h2(endpoint, sock_address, use_tls).await?;
+        if let H2ConnectResult::H2(ref conn) = result {
+            self.h2pool.insert(endpoint, conn.clone()).await;
+        }
+        Ok((result, false))
     }
 
     /// Gets an existing HTTP/1.1 connection from the pool or creates a new one.
@@ -2172,6 +2250,13 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+const UPSTREAM_PROTOCOL_HEADER: &str = "x-upstream-protocol";
+
+#[inline]
+fn is_upstream_protocol_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(UPSTREAM_PROTOCOL_HEADER)
+}
+
 #[inline]
 fn is_http2_invalid_headers(key: &str) -> bool {
     key.eq_ignore_ascii_case(httplib::header::CONNECTION.as_str())
@@ -2458,6 +2543,46 @@ fn replace_query_param_value(path: &str, query_key: &str, new_value: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stale_h2_retry_eligible_for_response_error() {
+        let get = httplib::Method::GET;
+        let head = httplib::Method::HEAD;
+        let options = httplib::Method::OPTIONS;
+        let trace = httplib::Method::TRACE;
+        let post = httplib::Method::POST;
+        let patch = httplib::Method::PATCH;
+        let delete = httplib::Method::DELETE;
+        let put = httplib::Method::PUT;
+
+        // Safe + idempotent methods without body and with retry budget: retryable.
+        assert!(stale_h2_retry_eligible_for_response_error(1, false, &get));
+        assert!(stale_h2_retry_eligible_for_response_error(1, false, &head));
+        assert!(stale_h2_retry_eligible_for_response_error(
+            1, false, &options
+        ));
+        assert!(stale_h2_retry_eligible_for_response_error(1, false, &trace));
+
+        // Non-safe methods are never retryable, even bodyless with budget.
+        assert!(!stale_h2_retry_eligible_for_response_error(1, false, &post));
+        assert!(!stale_h2_retry_eligible_for_response_error(
+            1, false, &patch
+        ));
+        assert!(!stale_h2_retry_eligible_for_response_error(
+            1, false, &delete
+        ));
+        assert!(!stale_h2_retry_eligible_for_response_error(1, false, &put));
+
+        // Any request with body is not retryable.
+        assert!(!stale_h2_retry_eligible_for_response_error(1, true, &get));
+        assert!(!stale_h2_retry_eligible_for_response_error(1, true, &head));
+        assert!(!stale_h2_retry_eligible_for_response_error(1, true, &post));
+
+        // Zero retry budget is not retryable.
+        assert!(!stale_h2_retry_eligible_for_response_error(0, false, &get));
+        assert!(!stale_h2_retry_eligible_for_response_error(0, false, &post));
+        assert!(!stale_h2_retry_eligible_for_response_error(0, true, &get));
+    }
 
     #[test]
     fn test_base64_encode_empty() {
@@ -3225,6 +3350,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_h2_fallback_to_h1_single_x_upstream_protocol_not_comma_joined() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{timeout, Duration};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let mut n = 0usize;
+            loop {
+                let read = socket.read(&mut buf[n..]).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                n += read;
+                if find_header_end(&buf[..n]).is_some() {
+                    break;
+                }
+                if n >= buf.len() {
+                    break;
+                }
+            }
+
+            let body = "OK";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nX-Upstream-Protocol: h2, h2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut client, client_conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let pool_for_server = pool.clone();
+        let h2pool_for_server = h2pool.clone();
+        tokio::spawn(async move {
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(next) = server.accept().await {
+                let (request, respond) = next.unwrap();
+                let mut worker = Worker::new(pool_for_server.clone(), h2pool_for_server.clone());
+                let info = UpstreamInfo {
+                    endpoint: "localhost".to_string(),
+                    sock_address: format!("127.0.0.1:{}", upstream_port),
+                    use_tls: false,
+                    max_header_size: 4096,
+                    host_header_value: format!("localhost:{}", upstream_port),
+                    auth_header: None,
+                    auth_header_keys: vec![],
+                    path_prefix: None,
+                    api_key: None,
+                    auth_query_key: None,
+                    extra_header_keys: vec![],
+                    extra_headers_transformed: vec![],
+                };
+
+                tokio::spawn(async move {
+                    info.proxy_h1(&mut worker, request, respond).await;
+                });
+            }
+        });
+
+        let request = httplib::Request::builder()
+            .method(httplib::Method::GET)
+            .uri("https://route.example.com/test")
+            .header("content-length", "0")
+            .body(())
+            .unwrap();
+        let (response_fut, _send_stream) = client.send_request(request, true).unwrap();
+
+        let response = timeout(Duration::from_secs(2), response_fut)
+            .await
+            .expect("timeout waiting for h2 response")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let values: Vec<&str> = response
+            .headers()
+            .get_all(UPSTREAM_PROTOCOL_HEADER)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values, vec!["http/1.1"]);
+    }
+
+    // H2->H2 response header copy uses the same `is_upstream_protocol_header` predicate as H2->H1 fallback.
+    #[test]
+    fn test_is_upstream_protocol_header_predicate() {
+        assert!(is_upstream_protocol_header("x-upstream-protocol"));
+        assert!(is_upstream_protocol_header("X-Upstream-Protocol"));
+        assert!(is_upstream_protocol_header("X-UPSTREAM-PROTOCOL"));
+        assert!(!is_upstream_protocol_header("x-upstream-protocol-extra"));
+        assert!(!is_upstream_protocol_header("x-other"));
+    }
+
+    #[tokio::test]
     async fn test_h2_fallback_to_h1_rebuilds_request_framing() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -3672,14 +3904,20 @@ mod tests {
             let _ = client_conn.await;
         });
 
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
         tokio::spawn(async move {
             let mut proxy = h2::server::handshake(proxy_io).await.unwrap();
             while let Some(next) = proxy.accept().await {
                 let (request, respond) = next.unwrap();
                 let info = info.clone();
                 let h2conn = h2conn.clone();
+                let pool = pool.clone();
+                let h2pool = h2pool.clone();
                 tokio::spawn(async move {
-                    info.proxy_h2(h2conn, request, respond).await;
+                    let mut worker = Worker::new(pool, h2pool);
+                    info.proxy_h2(&mut worker, false, h2conn, request, respond)
+                        .await;
                 });
             }
         });
@@ -3808,14 +4046,20 @@ mod tests {
             let _ = client_conn.await;
         });
 
+        let pool = Arc::new(crate::executor::Pool::<Conn>::new());
+        let h2pool = Arc::new(crate::h2client::H2Pool::new());
         tokio::spawn(async move {
             let mut proxy = h2::server::handshake(proxy_io).await.unwrap();
             while let Some(next) = proxy.accept().await {
                 let (request, respond) = next.unwrap();
                 let info = info.clone();
                 let h2conn = h2conn.clone();
+                let pool = pool.clone();
+                let h2pool = h2pool.clone();
                 tokio::spawn(async move {
-                    info.proxy_h2(h2conn, request, respond).await;
+                    let mut worker = Worker::new(pool, h2pool);
+                    info.proxy_h2(&mut worker, false, h2conn, request, respond)
+                        .await;
                 });
             }
         });
